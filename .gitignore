@@ -1,0 +1,6 @@
+/target
+*.db
+*.sqlite
+config.toml
+gallery-dl.conf
+.env

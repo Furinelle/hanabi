@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::process::Command;
 
+use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::model::{Author, ImageRef, MediaItem, PixivType, SourceKind};
@@ -103,6 +106,62 @@ pub fn parse_pixiv(root: &Value, origin: &str) -> Vec<MediaItem> {
     }
 
     order.into_iter().filter_map(|id| by_id.remove(&id)).collect()
+}
+
+pub struct GalleryDl {
+    pub config_path: String,
+    pub probe_range: String,
+}
+
+impl GalleryDl {
+    /// `-j` 拉元数据(不下载),返回顶层 JSON。
+    pub fn probe(&self, target: &str) -> Result<Value> {
+        let out = Command::new("gallery-dl")
+            .args([
+                "--config", &self.config_path,
+                "-j",
+                "--range", &self.probe_range,
+                target,
+            ])
+            .output()
+            .context("启动 gallery-dl 失败,确认已安装并在 PATH")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "gallery-dl probe 失败 ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let val: Value = serde_json::from_slice(&out.stdout)
+            .context("解析 gallery-dl JSON 失败")?;
+        Ok(val)
+    }
+
+    /// 下载指定作品到 dir,返回该次落地的文件路径。
+    pub fn download(&self, work_url: &str, dir: &std::path::Path, extra: &[String]) -> Result<Vec<PathBuf>> {
+        let before = list_files(dir);
+        let mut cmd = Command::new("gallery-dl");
+        cmd.args(["--config", &self.config_path, "-D"])
+            .arg(dir)
+            .args(extra)
+            .arg(work_url);
+        let out = cmd.output().context("启动 gallery-dl 下载失败")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "gallery-dl download 失败 ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let after = list_files(dir);
+        Ok(after.into_iter().filter(|p| !before.contains(p)).collect())
+    }
+}
+
+fn list_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

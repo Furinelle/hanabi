@@ -48,13 +48,22 @@ async fn main() -> Result<()> {
     // 下载闭包:按来源决定 gallery-dl 额外参数(X 用 size=orig)。
     let gdl_dl = gdl.clone();
     let download = move |item: &MediaItem| -> Vec<PathBuf> {
-        let dir = std::env::temp_dir().join(format!("hanabi_{}_{}", item.source.as_str(), item.source_id));
+        let dir = std::env::temp_dir().join(format!(
+            "hanabi_{}_{}",
+            item.source.as_str(),
+            item.source_id
+        ));
         let _ = std::fs::create_dir_all(&dir);
         let extra = match item.source {
             SourceKind::X => download_extra(x_size.as_deref()),
             SourceKind::Pixiv => vec![],
         };
-        gdl_dl.download(&item.url, &dir, &extra).unwrap_or_default()
+        gdl_dl
+            .download(&item.url, &dir, &extra)
+            .unwrap_or_else(|e| {
+                tracing::warn!(id = %item.source_id, error = %e, "gallery-dl 下载失败");
+                Vec::new()
+            })
     };
 
     let interval = Duration::from_secs(cfg.poll_interval_secs);

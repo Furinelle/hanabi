@@ -1,6 +1,6 @@
 use crate::config::SourceFilterCfg;
 use crate::filter::Filter;
-use crate::model::{MediaItem, PixivType};
+use crate::model::{MediaItem, PixivType, SourceKind};
 
 /// r18=false → 只留全年龄;r18=true → 放行 R18。
 pub struct R18Filter;
@@ -17,10 +17,7 @@ impl Filter for PixivTypeFilter {
         if !cfg.illust_only {
             return true;
         }
-        match item.pixiv_type {
-            Some(PixivType::Illust) | None => true,
-            _ => false,
-        }
+        matches!(item.pixiv_type, Some(PixivType::Illust) | None)
     }
 }
 
@@ -35,23 +32,19 @@ impl Filter for PageCountFilter {
     }
 }
 
-/// bookmark_count 存 Pixiv 收藏数 / X 点赞数。min_bookmarks 与 min_likes
-/// 任一被设且不满足即拦;阈值已设但分数缺失 → 拦(保守)。
+/// bookmark_count 存 Pixiv 收藏数 / X 点赞数。按来源选阈值:Pixiv 用 min_bookmarks,
+/// X 用 min_likes(两者语义不同,不可交叉套用)。阈值已设但分数缺失 → 拦(保守)。
 pub struct ScoreThreshold;
 impl Filter for ScoreThreshold {
     fn keep(&self, item: &MediaItem, cfg: &SourceFilterCfg) -> bool {
-        let score = item.bookmark_count;
-        if let Some(min) = cfg.min_bookmarks {
-            if !score.map_or(false, |s| s >= min) {
-                return false;
-            }
+        let min = match item.source {
+            SourceKind::Pixiv => cfg.min_bookmarks,
+            SourceKind::X => cfg.min_likes,
+        };
+        match min {
+            Some(m) => item.bookmark_count.is_some_and(|s| s >= m),
+            None => true,
         }
-        if let Some(min) = cfg.min_likes {
-            if !score.map_or(false, |s| s >= min) {
-                return false;
-            }
-        }
-        true
     }
 }
 
@@ -63,7 +56,8 @@ impl Filter for RequireMedia {
     }
 }
 
-/// tag 白名单:作品 tag 与白名单有交集(大小写不敏感 + 精确)才留。
+/// tag 白名单:作品 tag 与白名单有交集才留(精确匹配;ASCII 额外大小写不敏感,
+/// 中日文标签按精确匹配)。
 pub struct TagWhitelist;
 impl Filter for TagWhitelist {
     fn keep(&self, item: &MediaItem, cfg: &SourceFilterCfg) -> bool {
@@ -87,7 +81,10 @@ mod tests {
         MediaItem {
             source: SourceKind::Pixiv,
             source_id: "1".into(),
-            author: Author { name: "a".into(), url: "u".into() },
+            author: Author {
+                name: "a".into(),
+                url: "u".into(),
+            },
             title: None,
             url: "w".into(),
             tags: vec!["原神".into(), "風景".into()],
@@ -95,7 +92,10 @@ mod tests {
             is_r18: false,
             pixiv_type: Some(PixivType::Illust),
             page_count: 2,
-            images: vec![ImageRef { url: "i".into(), referer: None }],
+            images: vec![ImageRef {
+                url: "i".into(),
+                referer: None,
+            }],
             origin: "s".into(),
         }
     }
@@ -104,15 +104,24 @@ mod tests {
     fn r18_filtered_when_cfg_false() {
         let mut it = base();
         it.is_r18 = true;
-        let cfg = SourceFilterCfg { r18: false, ..Default::default() };
+        let cfg = SourceFilterCfg {
+            r18: false,
+            ..Default::default()
+        };
         assert!(!R18Filter.keep(&it, &cfg));
-        let cfg_allow = SourceFilterCfg { r18: true, ..Default::default() };
+        let cfg_allow = SourceFilterCfg {
+            r18: true,
+            ..Default::default()
+        };
         assert!(R18Filter.keep(&it, &cfg_allow));
     }
 
     #[test]
     fn illust_only_rejects_manga_keeps_x() {
-        let cfg = SourceFilterCfg { illust_only: true, ..Default::default() };
+        let cfg = SourceFilterCfg {
+            illust_only: true,
+            ..Default::default()
+        };
         let mut manga = base();
         manga.pixiv_type = Some(PixivType::Manga);
         assert!(!PixivTypeFilter.keep(&manga, &cfg));
@@ -124,7 +133,10 @@ mod tests {
 
     #[test]
     fn page_count_below_max_kept() {
-        let cfg = SourceFilterCfg { max_pages: Some(5), ..Default::default() };
+        let cfg = SourceFilterCfg {
+            max_pages: Some(5),
+            ..Default::default()
+        };
         let mut ok = base();
         ok.page_count = 4;
         assert!(PageCountFilter.keep(&ok, &cfg));
@@ -135,23 +147,38 @@ mod tests {
 
     #[test]
     fn score_threshold_bookmarks_and_likes() {
-        let cfg = SourceFilterCfg { min_bookmarks: Some(1000), ..Default::default() };
+        let cfg = SourceFilterCfg {
+            min_bookmarks: Some(1000),
+            ..Default::default()
+        };
         assert!(!ScoreThreshold.keep(&base(), &cfg));
-        let cfg_likes = SourceFilterCfg { min_likes: Some(500), ..Default::default() };
+        let cfg_likes = SourceFilterCfg {
+            min_likes: Some(500),
+            ..Default::default()
+        };
         assert!(ScoreThreshold.keep(&base(), &cfg_likes));
     }
 
     #[test]
     fn tag_whitelist_intersection() {
-        let cfg = SourceFilterCfg { tags: Some(vec!["原神".into()]), ..Default::default() };
+        let cfg = SourceFilterCfg {
+            tags: Some(vec!["原神".into()]),
+            ..Default::default()
+        };
         assert!(TagWhitelist.keep(&base(), &cfg));
-        let cfg_miss = SourceFilterCfg { tags: Some(vec!["東方".into()]), ..Default::default() };
+        let cfg_miss = SourceFilterCfg {
+            tags: Some(vec!["東方".into()]),
+            ..Default::default()
+        };
         assert!(!TagWhitelist.keep(&base(), &cfg_miss));
     }
 
     #[test]
     fn require_media_rejects_empty() {
-        let cfg = SourceFilterCfg { require_media: true, ..Default::default() };
+        let cfg = SourceFilterCfg {
+            require_media: true,
+            ..Default::default()
+        };
         let mut empty = base();
         empty.images.clear();
         assert!(!RequireMedia.keep(&empty, &cfg));

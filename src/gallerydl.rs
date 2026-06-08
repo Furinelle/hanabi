@@ -19,7 +19,9 @@ fn pixiv_type(s: &str) -> Option<PixivType> {
 }
 
 fn str_field(meta: &Value, key: &str) -> Option<String> {
-    meta.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    meta.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 fn u32_field(meta: &Value, key: &str) -> Option<u32> {
@@ -90,12 +92,15 @@ pub fn parse_pixiv(root: &Value, origin: &str) -> Vec<MediaItem> {
         let item = MediaItem {
             source: SourceKind::Pixiv,
             source_id: id.clone(),
-            author: Author { name: author_name, url: author_url },
+            author: Author {
+                name: author_name,
+                url: author_url,
+            },
             title: str_field(meta, "title"),
             url: format!("https://www.pixiv.net/artworks/{id}"),
             tags: tags_field(meta),
             bookmark_count: u32_field(meta, "total_bookmarks"),
-            is_r18: u32_field(meta, "x_restrict").map_or(false, |x| x > 0),
+            is_r18: u32_field(meta, "x_restrict").is_some_and(|x| x > 0),
             pixiv_type: str_field(meta, "type").and_then(|s| pixiv_type(&s)),
             page_count: u32_field(meta, "page_count").unwrap_or(1),
             images: vec![image],
@@ -105,7 +110,19 @@ pub fn parse_pixiv(root: &Value, origin: &str) -> Vec<MediaItem> {
         by_id.insert(id, item);
     }
 
-    order.into_iter().filter_map(|id| by_id.remove(&id)).collect()
+    let mut items: Vec<MediaItem> = order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect();
+    // page_count 字段缺失或低于实际抓到的图片数时,以实际图片数为准,
+    // 避免多图作品因字段不准绕过 PageCountFilter。
+    for it in &mut items {
+        let n = it.images.len() as u32;
+        if it.page_count < n {
+            it.page_count = n;
+        }
+    }
+    items
 }
 
 pub struct GalleryDl {
@@ -118,9 +135,11 @@ impl GalleryDl {
     pub fn probe(&self, target: &str) -> Result<Value> {
         let out = Command::new("gallery-dl")
             .args([
-                "--config", &self.config_path,
+                "--config",
+                &self.config_path,
                 "-j",
-                "--range", &self.probe_range,
+                "--range",
+                &self.probe_range,
                 target,
             ])
             .output()
@@ -132,13 +151,18 @@ impl GalleryDl {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        let val: Value = serde_json::from_slice(&out.stdout)
-            .context("解析 gallery-dl JSON 失败")?;
+        let val: Value =
+            serde_json::from_slice(&out.stdout).context("解析 gallery-dl JSON 失败")?;
         Ok(val)
     }
 
     /// 下载指定作品到 dir,返回该次落地的文件路径。
-    pub fn download(&self, work_url: &str, dir: &std::path::Path, extra: &[String]) -> Result<Vec<PathBuf>> {
+    pub fn download(
+        &self,
+        work_url: &str,
+        dir: &std::path::Path,
+        extra: &[String],
+    ) -> Result<Vec<PathBuf>> {
         let before = list_files(dir);
         let mut cmd = Command::new("gallery-dl");
         cmd.args(["--config", &self.config_path, "-D"])
@@ -189,7 +213,10 @@ mod tests {
         assert_eq!(a.author.name, "画师A");
         assert_eq!(a.author.url, "https://www.pixiv.net/users/555");
         assert_eq!(a.url, "https://www.pixiv.net/artworks/123");
-        assert_eq!(a.images[0].referer.as_deref(), Some("https://www.pixiv.net/"));
+        assert_eq!(
+            a.images[0].referer.as_deref(),
+            Some("https://www.pixiv.net/")
+        );
 
         let b = items.iter().find(|i| i.source_id == "124").unwrap();
         assert_eq!(b.pixiv_type, Some(PixivType::Manga));

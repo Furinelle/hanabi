@@ -11,14 +11,22 @@ pub trait Sink: Send + Sync {
 }
 
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// caption:标题 / 画师(超链)/ 原作品链接 / 前 5 个 tag。HTML 格式。
 pub fn render_caption(item: &MediaItem) -> String {
     let mut s = String::new();
     if let Some(t) = &item.title {
-        s.push_str(&html_escape(t));
+        // 限制标题长度,叠加 ≤5 个 tag,保证整条 caption 远低于 Telegram 1024 字符上限。
+        let t = if t.chars().count() > 200 {
+            t.chars().take(200).collect::<String>() + "…"
+        } else {
+            t.clone()
+        };
+        s.push_str(&html_escape(&t));
         s.push('\n');
     }
     s.push_str(&format!(
@@ -54,7 +62,10 @@ mod tests {
         MediaItem {
             source: SourceKind::Pixiv,
             source_id: "123".into(),
-            author: Author { name: "画师A".into(), url: "https://www.pixiv.net/users/555".into() },
+            author: Author {
+                name: "画师A".into(),
+                url: "https://www.pixiv.net/users/555".into(),
+            },
             title: Some("湖と少女".into()),
             url: "https://www.pixiv.net/artworks/123".into(),
             tags: vec!["原神".into(), "風景".into()],
@@ -62,7 +73,10 @@ mod tests {
             is_r18: false,
             pixiv_type: Some(PixivType::Illust),
             page_count: 2,
-            images: vec![ImageRef { url: "i".into(), referer: None }],
+            images: vec![ImageRef {
+                url: "i".into(),
+                referer: None,
+            }],
             origin: "fav_artists".into(),
         }
     }

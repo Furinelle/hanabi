@@ -63,7 +63,10 @@ mod tests {
         MediaItem {
             source: SourceKind::Pixiv,
             source_id: "123".into(),
-            author: Author { name: "a".into(), url: "u".into() },
+            author: Author {
+                name: "a".into(),
+                url: "u".into(),
+            },
             title: Some("t".into()),
             url: "w".into(),
             tags: vec!["原神".into()],
@@ -71,7 +74,10 @@ mod tests {
             is_r18: false,
             pixiv_type: Some(PixivType::Illust),
             page_count: 1,
-            images: vec![ImageRef { url: "i".into(), referer: None }],
+            images: vec![ImageRef {
+                url: "i".into(),
+                referer: None,
+            }],
             origin: "fav_artists".into(),
         }
     }

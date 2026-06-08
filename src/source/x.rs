@@ -23,7 +23,8 @@ pub fn parse_twitter(root: &Value, origin: &str) -> Vec<MediaItem> {
         Some(a) => a,
         None => return Vec::new(),
     };
-    let mut by_id: std::collections::BTreeMap<String, MediaItem> = std::collections::BTreeMap::new();
+    let mut by_id: std::collections::BTreeMap<String, MediaItem> =
+        std::collections::BTreeMap::new();
     let mut order: Vec<String> = Vec::new();
 
     for elem in arr {
@@ -61,7 +62,11 @@ pub fn parse_twitter(root: &Value, origin: &str) -> Vec<MediaItem> {
         let tags = meta
             .get("hashtags")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let item = MediaItem {
             source: SourceKind::X,
@@ -70,10 +75,16 @@ pub fn parse_twitter(root: &Value, origin: &str) -> Vec<MediaItem> {
                 name: author_name,
                 url: format!("https://x.com/{handle}"),
             },
-            title: meta.get("content").and_then(|v| v.as_str()).map(String::from),
+            title: meta
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             url: format!("https://x.com/i/status/{id}"),
             tags,
-            bookmark_count: meta.get("favorite_count").and_then(|v| v.as_u64()).map(|n| n as u32),
+            bookmark_count: meta
+                .get("favorite_count")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32),
             is_r18: false,
             pixiv_type: None,
             page_count: 1,
@@ -83,7 +94,10 @@ pub fn parse_twitter(root: &Value, origin: &str) -> Vec<MediaItem> {
         order.push(id.clone());
         by_id.insert(id, item);
     }
-    let mut items: Vec<MediaItem> = order.into_iter().filter_map(|id| by_id.remove(&id)).collect();
+    let mut items: Vec<MediaItem> = order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect();
     for it in &mut items {
         it.page_count = it.images.len() as u32;
     }

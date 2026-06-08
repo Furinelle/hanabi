@@ -19,7 +19,10 @@ pub trait Source: Send + Sync {
 mod tests {
     #[test]
     fn pixiv_user_target_is_passthrough() {
-        let urls = crate::source::pixiv::targets_for("pixiv_user", &["https://www.pixiv.net/users/123".into()]);
+        let urls = crate::source::pixiv::targets_for(
+            "pixiv_user",
+            &["https://www.pixiv.net/users/123".into()],
+        );
         assert_eq!(urls, vec!["https://www.pixiv.net/users/123".to_string()]);
     }
 

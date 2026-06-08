@@ -1,5 +1,11 @@
 # Hanabi 🎆
 
+<p align="center">
+  <img src="docs/cover.png" alt="cover" width="400">
+  <br>
+  <sub>Illustration: <a href="https://www.pixiv.net/artworks/141191404">pixiv #141191404</a></sub>
+</p>
+
 二次元图片 Telegram 推送 bot，带**人工审批制**。从 Pixiv（关注画师新作 / 排行榜）和 X（List）抓取插画，先发到你的私聊等审批，你点按钮决定是否发布到频道。
 
 ## 特性

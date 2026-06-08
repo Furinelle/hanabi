@@ -16,35 +16,51 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// caption:标题 / 画师(超链)/ 原作品链接 / 前 5 个 tag。HTML 格式。
+/// caption 格式(HTML):
+/// ```text
+/// 🔞 R18            (仅 is_r18 时)
+/// Title: 标题
+/// Tag: #标签 #标签
+/// From <Pixiv|X>(作品链接) By 作者名(作者链接)
+/// ```
 pub fn render_caption(item: &MediaItem) -> String {
     let mut s = String::new();
-    if let Some(t) = &item.title {
-        // 限制标题长度,叠加 ≤5 个 tag,保证整条 caption 远低于 Telegram 1024 字符上限。
-        let t = if t.chars().count() > 200 {
-            t.chars().take(200).collect::<String>() + "…"
-        } else {
-            t.clone()
-        };
-        s.push_str(&html_escape(&t));
-        s.push('\n');
+    if item.is_r18 {
+        s.push_str("🔞 R18\n");
     }
-    s.push_str(&format!(
-        "<a href=\"{}\">{}</a>\n",
-        item.author.url,
-        html_escape(&item.author.name)
-    ));
-    s.push_str(&format!("<a href=\"{}\">原作品</a>", item.url));
-    if !item.tags.is_empty() {
+    // Title(截断防止整条 caption 超 Telegram 1024 上限)
+    let title = item.title.as_deref().unwrap_or("(无标题)");
+    let title = if title.chars().count() > 150 {
+        title.chars().take(150).collect::<String>() + "…"
+    } else {
+        title.to_string()
+    };
+    s.push_str(&format!("Title: {}\n", html_escape(&title)));
+    // Tag(取前 6 个)
+    if item.tags.is_empty() {
+        s.push_str("Tag: -\n");
+    } else {
         let tags = item
             .tags
             .iter()
-            .take(5)
+            .take(6)
             .map(|t| format!("#{}", t.replace(' ', "_")))
             .collect::<Vec<_>>()
             .join(" ");
-        s.push_str(&format!("\n{tags}"));
+        s.push_str(&format!("Tag: {}\n", html_escape(&tags)));
     }
+    // From <来源>(作品链接) By 作者名(作者链接)
+    let src = match item.source {
+        crate::model::SourceKind::Pixiv => "Pixiv",
+        crate::model::SourceKind::X => "X",
+    };
+    s.push_str(&format!(
+        "From <a href=\"{}\">{}</a> By <a href=\"{}\">{}</a>",
+        item.url,
+        src,
+        item.author.url,
+        html_escape(&item.author.name)
+    ));
     s
 }
 

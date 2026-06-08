@@ -13,7 +13,11 @@ pub struct Config {
 
 #[derive(Debug, Deserialize)]
 pub struct TelegramCfg {
+    /// 审批私聊:抓到的作品先发到这里等人工审批。
     pub channel_id: String,
+    /// 批准后发布的目标频道(@username 或数字 id)。
+    #[serde(default)]
+    pub publish_channel: String,
 }
 
 #[derive(Debug, Deserialize)]

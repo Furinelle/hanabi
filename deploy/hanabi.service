@@ -1,0 +1,31 @@
+[Unit]
+Description=Hanabi Telegram image push bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 改成实际 clone 路径与运行用户
+WorkingDirectory=/root/hanabi
+# gallery-dl 装在 ~/.local/bin（pipx），需加入 PATH
+Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HANABI_CONFIG=/root/hanabi/config.toml
+Environment=RUST_LOG=info
+# bot token 不入库：部署时用 drop-in 覆盖文件注入，见下方说明
+Environment=HANABI_BOT_TOKEN=REPLACE_WITH_TOKEN
+ExecStart=/root/hanabi/target/release/hanabi
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+
+# ── 部署说明 ───────────────────────────────────────────────
+# 1. 把本文件放到 /etc/systemd/system/hanabi.service
+# 2. token 不要写进版本库：用 drop-in 覆盖，权限 600
+#      mkdir -p /etc/systemd/system/hanabi.service.d
+#      printf '[Service]\nEnvironment=HANABI_BOT_TOKEN=<真实token>\n' \
+#        > /etc/systemd/system/hanabi.service.d/token.conf
+#      chmod 600 /etc/systemd/system/hanabi.service.d/token.conf
+# 3. systemctl daemon-reload && systemctl enable --now hanabi
+# 4. journalctl -u hanabi -f   # 看日志

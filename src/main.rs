@@ -26,7 +26,18 @@ async fn main() -> Result<()> {
 
     let store = Store::open("hanabi.db")?;
     let chain = FilterChain::standard();
-    let sink = TelegramSink::new(token, cfg.telegram.channel_id.clone());
+    let sink = TelegramSink::new(
+        token,
+        cfg.telegram.channel_id.clone(),
+        cfg.telegram.publish_channel.clone(),
+    );
+    // 手动触发通道:/run 命令经此通知抓取循环立即跑一轮。
+    let (trigger_tx, mut trigger_rx) = tokio::sync::mpsc::channel::<()>(8);
+    // 启动审批回调 + 命令轮询任务(监听按钮/命令,与抓取循环并发运行)。
+    tokio::spawn(hanabi::sink::telegram::run_review_loop(
+        sink.state(),
+        trigger_tx,
+    ));
     let gdl = Arc::new(GalleryDl {
         config_path: cfg.gallery_dl.config_path.clone(),
         probe_range: cfg.gallery_dl.probe_range.clone(),
@@ -71,6 +82,12 @@ async fn main() -> Result<()> {
         if let Err(e) = run_once(&store, &sources, &chain, &sink as &dyn Sink, &download).await {
             tracing::error!(error = %e, "本轮异常");
         }
-        tokio::time::sleep(interval).await;
+        // 等下一轮:定时到点 或 收到 /run 手动触发,任一就绪即开始。
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = trigger_rx.recv() => {
+                tracing::info!("收到 /run 手动触发,立即抓取");
+            }
+        }
     }
 }

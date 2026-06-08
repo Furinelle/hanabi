@@ -85,7 +85,11 @@ pub fn parse_twitter(root: &Value, origin: &str) -> Vec<MediaItem> {
                 .get("favorite_count")
                 .and_then(|v| v.as_u64())
                 .map(|n| n as u32),
-            is_r18: false,
+            // X 的 sensitive=true 即敏感/R18 内容;此前写死 false 会让敏感推文漏过滤。
+            is_r18: meta
+                .get("sensitive")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             pixiv_type: None,
             page_count: 1,
             images: vec![image],

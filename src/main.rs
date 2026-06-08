@@ -16,6 +16,20 @@ use hanabi::source::x::{download_extra, XSource};
 use hanabi::source::Source;
 use hanabi::store::Store;
 
+/// 计算距下一个整点时间槽的秒数（CST = UTC+8）。
+/// poll_interval_secs 须能整除 86400，例如 28800 → 00:00 / 08:00 / 16:00。
+fn secs_until_next_slot(interval_secs: u64) -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let utc = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let local = utc + 8 * 3600; // CST (UTC+8)
+    let secs_into_day = local % 86400;
+    let next_slot = ((secs_into_day / interval_secs) + 1) * interval_secs;
+    next_slot - secs_into_day
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -77,14 +91,15 @@ async fn main() -> Result<()> {
             })
     };
 
-    let interval = Duration::from_secs(cfg.poll_interval_secs);
     loop {
         if let Err(e) = run_once(&store, &sources, &chain, &sink as &dyn Sink, &download).await {
             tracing::error!(error = %e, "本轮异常");
         }
-        // 等下一轮:定时到点 或 收到 /run 手动触发,任一就绪即开始。
+        let wait = secs_until_next_slot(cfg.poll_interval_secs);
+        tracing::info!(wait_secs = wait, "下次抓取在 {:.1} 小时后", wait as f64 / 3600.0);
+        // 等下一轮:整点时间槽到点 或 收到 /run 手动触发,任一就绪即开始。
         tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
             _ = trigger_rx.recv() => {
                 tracing::info!("收到 /run 手动触发,立即抓取");
             }

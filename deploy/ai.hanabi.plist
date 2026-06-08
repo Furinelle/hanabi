@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>ai.hanabi</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/furina/Documents/Github/hanabi/target/release/hanabi</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HANABI_BOT_TOKEN</key><string>REPLACE_ME</string>
+    <key>HANABI_CONFIG</key><string>/Users/furina/Documents/Github/hanabi/config.toml</string>
+  </dict>
+  <key>WorkingDirectory</key><string>/Users/furina/Documents/Github/hanabi</string>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/tmp/hanabi.out.log</string>
+  <key>StandardErrorPath</key><string>/tmp/hanabi.err.log</string>
+</dict>
+</plist>

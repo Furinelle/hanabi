@@ -1,0 +1,41 @@
+poll_interval_secs = 1800
+
+[telegram]
+channel_id = "@my_channel"     # bot_token 走环境变量 HANABI_BOT_TOKEN
+
+[gallery_dl]
+config_path = "gallery-dl.conf"
+probe_range = "1-20"
+
+[x_image]
+size = "orig"
+
+[[source]]
+name = "fav_artists"
+kind = "pixiv_user"
+targets = ["https://www.pixiv.net/users/123"]
+filters = { r18 = false }
+
+[[source]]
+name = "my_bookmarks"
+kind = "pixiv_bookmarks"
+targets = ["https://www.pixiv.net/users/0/bookmarks/artworks"]
+filters = { r18 = false, min_bookmarks = 500, tags = ["原神"], illust_only = true, max_pages = 5 }
+
+[[source]]
+name = "pixiv_ranking"
+kind = "pixiv_ranking"
+targets = ["https://www.pixiv.net/ranking.php?mode=daily&content=illust"]
+filters = { r18 = false, min_bookmarks = 1000, tags = ["原神"], illust_only = true, max_pages = 5 }
+
+[[source]]
+name = "x_artists_list"
+kind = "x_list"
+targets = ["https://x.com/i/lists/0000000000000000000"]
+filters = { r18 = false, min_likes = 1000 }
+
+[[source]]
+name = "x_foryou"
+kind = "x_foryou"
+targets = ["https://x.com/home"]
+filters = { r18 = false, min_likes = 2000, require_media = true, tags = ["イラスト"] }

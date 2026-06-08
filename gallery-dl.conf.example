@@ -1,0 +1,14 @@
+{
+  "extractor": {
+    "pixiv": {
+      "refresh-token": "<your_pixiv_refresh_token>"
+    },
+    "twitter": {
+      "cookies": {
+        "auth_token": "<your_x_auth_token>",
+        "ct0": "<your_x_ct0>"
+      },
+      "size": "orig"
+    }
+  }
+}

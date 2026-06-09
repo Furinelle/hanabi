@@ -47,10 +47,13 @@ async fn main() -> Result<()> {
     );
     // 手动触发通道:/run 命令经此通知抓取循环立即跑一轮。
     let (trigger_tx, mut trigger_rx) = tokio::sync::mpsc::channel::<()>(8);
-    // 启动审批回调 + 命令轮询任务(监听按钮/命令,与抓取循环并发运行)。
+    // 手动链接通道:发来的 Pixiv/X 作品链接经此交抓取循环直发频道。
+    let (link_tx, mut link_rx) = tokio::sync::mpsc::channel::<String>(16);
+    // 启动审批回调 + 命令/链接轮询任务(与抓取循环并发运行)。
     tokio::spawn(hanabi::sink::telegram::run_review_loop(
         sink.state(),
         trigger_tx,
+        link_tx,
     ));
     let gdl = Arc::new(GalleryDl {
         config_path: cfg.gallery_dl.config_path.clone(),
@@ -91,18 +94,66 @@ async fn main() -> Result<()> {
             })
     };
 
+    // 启动立即跑首轮。
+    if let Err(e) = run_once(&store, &sources, &chain, &sink as &dyn Sink, &download).await {
+        tracing::error!(error = %e, "本轮异常");
+    }
     loop {
-        if let Err(e) = run_once(&store, &sources, &chain, &sink as &dyn Sink, &download).await {
-            tracing::error!(error = %e, "本轮异常");
-        }
         let wait = secs_until_next_slot(cfg.poll_interval_secs);
         tracing::info!(wait_secs = wait, "下次抓取在 {:.1} 小时后", wait as f64 / 3600.0);
-        // 等下一轮:整点时间槽到点 或 收到 /run 手动触发,任一就绪即开始。
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
+        // 整点时间槽到点 / /run 手动触发 → 跑一轮;手动链接 → 直发频道(不跑全量)。
+        let do_fetch = tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(wait)) => true,
             _ = trigger_rx.recv() => {
                 tracing::info!("收到 /run 手动触发,立即抓取");
+                true
+            }
+            Some(url) = link_rx.recv() => {
+                tracing::info!(url = %url, "收到手动链接,直发频道");
+                if let Err(e) = handle_link(&url, &gdl, &sink, &store, &download).await {
+                    tracing::warn!(error = %e, "手动链接处理失败");
+                }
+                false
+            }
+        };
+        if do_fetch {
+            if let Err(e) = run_once(&store, &sources, &chain, &sink as &dyn Sink, &download).await {
+                tracing::error!(error = %e, "本轮异常");
             }
         }
     }
+}
+
+/// 处理手动发来的作品链接:probe + 解析 + 下载,直接发布到频道(跳过审批)。
+async fn handle_link<F>(
+    url: &str,
+    gdl: &Arc<GalleryDl>,
+    sink: &TelegramSink,
+    store: &Store,
+    download: &F,
+) -> Result<()>
+where
+    F: Fn(&MediaItem) -> Vec<PathBuf>,
+{
+    let is_pixiv = url.contains("pixiv");
+    let g = gdl.clone();
+    let u = url.to_string();
+    let val = tokio::task::spawn_blocking(move || g.probe(&u)).await??;
+    let items = if is_pixiv {
+        hanabi::gallerydl::parse_pixiv(&val, "manual")
+    } else {
+        hanabi::source::x::parse_twitter(&val, "manual")
+    };
+    if items.is_empty() {
+        anyhow::bail!("链接未解析出作品(确认是作品/推文页)");
+    }
+    for item in &items {
+        let files = download(item);
+        if files.is_empty() {
+            continue;
+        }
+        sink.publish_direct(item, &files).await?;
+        let _ = store.mark_pushed(item);
+    }
+    Ok(())
 }

@@ -59,6 +59,19 @@ impl TelegramSink {
     pub fn state(&self) -> Arc<ReviewState> {
         self.state.clone()
     }
+
+    /// 直接发布到频道(跳过审批):用于手动发来的链接,作品即时发布。
+    pub async fn publish_direct(&self, item: &MediaItem, files: &[PathBuf]) -> Result<()> {
+        if files.is_empty() {
+            anyhow::bail!("无图片可发: {}", item.source_id);
+        }
+        let caption = render_caption(item);
+        let files_owned: Vec<PathBuf> = files.to_vec();
+        let prepared = tokio::task::spawn_blocking(move || prepare_all(&files_owned)).await??;
+        send_group(&self.state.bot, &self.state.publish_channel, &prepared, &caption).await?;
+        cleanup(files);
+        Ok(())
+    }
 }
 
 fn to_recipient(id: String) -> Recipient {
@@ -206,6 +219,7 @@ impl Sink for TelegramSink {
 pub async fn run_review_loop(
     state: Arc<ReviewState>,
     trigger: tokio::sync::mpsc::Sender<()>,
+    link: tokio::sync::mpsc::Sender<String>,
 ) {
     let mut offset: i32 = 0;
     loop {
@@ -231,7 +245,7 @@ pub async fn run_review_loop(
                             }
                         }
                         UpdateKind::Message(msg) => {
-                            if let Err(e) = handle_command(&state, &msg, &trigger).await {
+                            if let Err(e) = handle_command(&state, &msg, &trigger, &link).await {
                                 tracing::warn!(error = %e, "处理命令失败");
                             }
                         }
@@ -253,9 +267,18 @@ async fn handle_command(
     state: &Arc<ReviewState>,
     msg: &Message,
     trigger: &tokio::sync::mpsc::Sender<()>,
+    link: &tokio::sync::mpsc::Sender<String>,
 ) -> Result<()> {
-    let text = msg.text().unwrap_or("");
+    let text = msg.text().unwrap_or("").trim();
+    // 非命令:识别 Pixiv/X 作品链接 → 交抓取循环直发频道(跳过审批)。
     if !text.starts_with('/') {
+        if let Some(url) = extract_supported_url(text) {
+            let _ = link.send(url).await;
+            state
+                .bot
+                .send_message(msg.chat.id, "🔗 收到链接,抓取中…抓完直接发频道")
+                .await?;
+        }
         return Ok(());
     }
     // 取首词,去掉可能的 @botname 后缀(如 /run@Furinabi_bot)。
@@ -272,13 +295,23 @@ async fn handle_command(
         }
         "/ping" => "pong 🏓".to_string(),
         "/help" => {
-            "命令列表:\n/run — 立即抓取一轮\n/status — 待审数+运行状态\n/ping — 存活测试\n/help — 本帮助"
+            "命令列表:\n/run — 立即抓取一轮\n/status — 待审数+运行状态\n/ping — 存活测试\n/help — 本帮助\n\n💡 直接发 Pixiv/X 作品链接 → 自动抓取并发布到频道"
                 .to_string()
         }
         _ => return Ok(()),
     };
     state.bot.send_message(msg.chat.id, reply).await?;
     Ok(())
+}
+
+/// 从消息文本中提取受支持的作品链接(Pixiv / X / Twitter)。
+fn extract_supported_url(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .find(|w| {
+            w.starts_with("http")
+                && (w.contains("pixiv.net") || w.contains("x.com") || w.contains("twitter.com"))
+        })
+        .map(|s| s.to_string())
 }
 
 async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<()> {

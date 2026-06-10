@@ -1,10 +1,10 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use rusqlite::OptionalExtension;
 use teloxide::prelude::*;
 use teloxide::types::{
     AllowedUpdate, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
@@ -15,20 +15,13 @@ use tokio::sync::Mutex;
 use crate::model::MediaItem;
 use crate::sink::{needs_downscale, render_caption, Sink};
 
-/// 一条待审批作品:全套(已缩放)图文件 + caption + 私聊里这条审批占用的所有消息 id
-/// (多图 = 图组多条 + 控制消息一条;审批结束后整组删除)。
-struct Pending {
-    files: Vec<PathBuf>,
-    caption: String,
-    review_msg_ids: Vec<MessageId>,
-}
-
 /// 审批状态:由 `TelegramSink`(发审批消息)与 callback 轮询任务共享。
+/// pending 持久化到 sqlite,bot 重启后旧审批消息的按钮仍有效。
 pub struct ReviewState {
     bot: Bot,
     review_chat: Recipient,     // 审批私聊
     publish_channel: Recipient, // 批准后发布频道
-    pending: Mutex<HashMap<u64, Pending>>,
+    db: Mutex<rusqlite::Connection>,
     counter: AtomicU64,
 }
 
@@ -43,16 +36,36 @@ pub struct TelegramSink {
 }
 
 impl TelegramSink {
-    pub fn new(token: String, review_chat_id: String, publish_channel_id: String) -> Self {
-        Self {
+    pub fn new(
+        token: String,
+        review_chat_id: String,
+        publish_channel_id: String,
+        db_path: &str,
+    ) -> Result<Self> {
+        let conn = rusqlite::Connection::open(db_path).context("打开 pending 数据库失败")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE IF NOT EXISTS pending(
+                token   INTEGER PRIMARY KEY,
+                files   TEXT NOT NULL,
+                caption TEXT NOT NULL,
+                msg_ids TEXT NOT NULL
+             );",
+        )
+        .context("初始化 pending 表失败")?;
+        // counter 从已有最大 token 续上,避免重启后 token 与旧记录冲突。
+        let max_token: i64 = conn
+            .query_row("SELECT COALESCE(MAX(token), 0) FROM pending", [], |r| r.get(0))
+            .unwrap_or(0);
+        Ok(Self {
             state: Arc::new(ReviewState {
                 bot: Bot::new(token),
                 review_chat: to_recipient(review_chat_id),
                 publish_channel: to_recipient(publish_channel_id),
-                pending: Mutex::new(HashMap::new()),
-                counter: AtomicU64::new(1),
+                db: Mutex::new(conn),
+                counter: AtomicU64::new(max_token as u64 + 1),
             }),
-        }
+        })
     }
 
     /// 供 main 启动 callback 轮询任务(与抓取循环并发)。
@@ -78,6 +91,27 @@ fn to_recipient(id: String) -> Recipient {
     match id.parse::<i64>() {
         Ok(n) => Recipient::Id(ChatId(n)),
         Err(_) => Recipient::ChannelUsername(id),
+    }
+}
+
+/// 包装 Telegram 请求:遇限流 `RetryAfter` 自动等待后重试(最多 5 次)。
+async fn tg_retry<F, R, T>(f: F) -> std::result::Result<T, teloxide::RequestError>
+where
+    F: Fn() -> R,
+    R: std::future::IntoFuture<Output = std::result::Result<T, teloxide::RequestError>>,
+{
+    let mut tries = 0u32;
+    loop {
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(teloxide::RequestError::RetryAfter(after)) if tries < 5 => {
+                tries += 1;
+                let wait = after.duration() + std::time::Duration::from_secs(1);
+                tracing::warn!(?wait, "Telegram 限流,等待后重试");
+                tokio::time::sleep(wait).await;
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -115,30 +149,35 @@ fn build_media(prepared: &[PathBuf], caption: &str) -> Vec<InputMedia> {
 }
 
 /// 发一组图到指定 chat(用于发布到频道)。sendMediaGroup 限 2–10,超出按 10 分批,
-/// 余数 1 张退 sendPhoto。caption 仅置于最前一张。
+/// 余数 1 张退 sendPhoto。caption 仅置于最前一张。每个请求带限流重试。
 async fn send_group(bot: &Bot, chat: &Recipient, prepared: &[PathBuf], caption: &str) -> Result<()> {
     if prepared.is_empty() {
         anyhow::bail!("无图可发");
     }
     if prepared.len() == 1 {
-        bot.send_photo(chat.clone(), InputFile::file(&prepared[0]))
-            .caption(caption.to_string())
-            .parse_mode(ParseMode::Html)
-            .await?;
+        tg_retry(|| {
+            bot.send_photo(chat.clone(), InputFile::file(&prepared[0]))
+                .caption(caption.to_string())
+                .parse_mode(ParseMode::Html)
+        })
+        .await?;
         return Ok(());
     }
     for (ci, chunk) in prepared.chunks(10).enumerate() {
-        if chunk.len() == 1 {
-            let mut req = bot.send_photo(chat.clone(), InputFile::file(&chunk[0]));
-            if ci == 0 {
-                req = req.caption(caption.to_string()).parse_mode(ParseMode::Html);
-            }
-            req.await?;
-            continue;
-        }
         let cap = if ci == 0 { caption } else { "" };
-        bot.send_media_group(chat.clone(), build_media(chunk, cap))
+        if chunk.len() == 1 {
+            tg_retry(|| {
+                let req = bot.send_photo(chat.clone(), InputFile::file(&chunk[0]));
+                if ci == 0 {
+                    req.caption(cap.to_string()).parse_mode(ParseMode::Html)
+                } else {
+                    req
+                }
+            })
             .await?;
+        } else {
+            tg_retry(|| bot.send_media_group(chat.clone(), build_media(chunk, cap))).await?;
+        }
     }
     Ok(())
 }
@@ -153,7 +192,7 @@ fn cleanup(files: &[PathBuf]) {
 #[async_trait]
 impl Sink for TelegramSink {
     /// 发到审批私聊:**全套图**(单图=sendPhoto+按钮;多图=图组+一条带按钮的控制消息)。
-    /// 登记 pending,文件保留到审批结束才清理(批准时要发全套到频道)。
+    /// 发送成功后把 pending 持久化到 sqlite;文件保留到审批结束才清理。
     async fn deliver(&self, item: &MediaItem, files: &[PathBuf]) -> Result<()> {
         if files.is_empty() {
             anyhow::bail!("无图片可发: {}", item.source_id);
@@ -176,46 +215,53 @@ impl Sink for TelegramSink {
         let mut review_ids: Vec<MessageId> = Vec::new();
 
         if n == 1 {
-            let msg = bot
-                .send_photo(chat.clone(), InputFile::file(&prepared[0]))
-                .caption(format!("【待审】\n{caption}"))
-                .parse_mode(ParseMode::Html)
-                .reply_markup(keyboard)
-                .await?;
+            let msg = tg_retry(|| {
+                bot.send_photo(chat.clone(), InputFile::file(&prepared[0]))
+                    .caption(format!("【待审】\n{caption}"))
+                    .parse_mode(ParseMode::Html)
+                    .reply_markup(keyboard.clone())
+            })
+            .await?;
             review_ids.push(msg.id);
         } else {
             // 图组(全部图,第一张带 caption)。
             let first_cap = format!("【待审 · 共 {n} 张】\n{caption}");
-            let msgs = bot
-                .send_media_group(chat.clone(), build_media(&prepared, &first_cap))
-                .await?;
+            let msgs =
+                tg_retry(|| bot.send_media_group(chat.clone(), build_media(&prepared, &first_cap)))
+                    .await?;
             review_ids.extend(msgs.iter().map(|m| m.id));
             // 图组挂不了按钮,紧跟一条控制消息承载按钮。
-            let ctrl = bot
-                .send_message(chat.clone(), format!("👆 上面 {n} 张,请审批"))
-                .reply_markup(keyboard)
-                .await?;
+            let ctrl = tg_retry(|| {
+                bot.send_message(chat.clone(), format!("👆 上面 {n} 张,请审批"))
+                    .reply_markup(keyboard.clone())
+            })
+            .await?;
             review_ids.push(ctrl.id);
         }
 
-        self.state.pending.lock().await.insert(
-            token,
-            Pending {
-                files: prepared,
-                caption,
-                review_msg_ids: review_ids,
-            },
-        );
-        // 不在此清理文件——等 callback 审批后再清理。
+        // 持久化 pending(发送成功后才写,保证按钮一定对得上)。
+        let files_str: Vec<String> = prepared
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let msg_ids: Vec<i32> = review_ids.iter().map(|m| m.0).collect();
+        let files_json = serde_json::to_string(&files_str)?;
+        let msg_json = serde_json::to_string(&msg_ids)?;
+        {
+            let db = self.state.db.lock().await;
+            db.execute(
+                "INSERT OR REPLACE INTO pending(token, files, caption, msg_ids) VALUES(?1,?2,?3,?4)",
+                rusqlite::params![token as i64, files_json, caption, msg_json],
+            )?;
+        }
         Ok(())
     }
 }
 
-/// callback 轮询:监听按钮点击。批准 → 发频道 + 删私聊整组审批消息;
-/// 拒绝 → 删私聊整组审批消息。无论结果都清理临时文件。与抓取循环并发运行。
+/// callback 轮询:监听按钮点击与 `/` 命令/链接。批准 → 发频道 + 删私聊整组;
+/// 拒绝 → 删私聊整组。失败(如限流)保留 pending 供重点。与抓取循环并发运行。
 ///
-/// 用短轮询(timeout=0,空结果 sleep)而非长轮询:经代理时长连接长轮询易被掐断
-/// (operation timed out),导致按钮点击收不到。
+/// 用短轮询(timeout=0,空结果 sleep)而非长轮询:经代理时长连接长轮询易被掐断。
 pub async fn run_review_loop(
     state: Arc<ReviewState>,
     trigger: tokio::sync::mpsc::Sender<()>,
@@ -262,7 +308,7 @@ pub async fn run_review_loop(
 }
 
 /// 处理 `/` 命令(仅文本消息)。/run 发触发信号让抓取循环立即跑一轮;
-/// /status /ping /help 即时回复。
+/// /status /ping /help 即时回复;非命令的 Pixiv/X 链接交抓取循环直发频道。
 async fn handle_command(
     state: &Arc<ReviewState>,
     msg: &Message,
@@ -281,7 +327,6 @@ async fn handle_command(
         }
         return Ok(());
     }
-    // 取首词,去掉可能的 @botname 后缀(如 /run@Furinabi_bot)。
     let cmd = text.split_whitespace().next().unwrap_or("");
     let cmd = cmd.split('@').next().unwrap_or(cmd);
     let reply: String = match cmd {
@@ -290,8 +335,12 @@ async fn handle_command(
             "🚀 开始手动抓取一轮,有命中会发审批消息过来".to_string()
         }
         "/status" => {
-            let pending = state.pending.lock().await.len();
-            format!("✅ 运行中\n待审: {pending} 条")
+            let count: i64 = {
+                let db = state.db.lock().await;
+                db.query_row("SELECT COUNT(*) FROM pending", [], |r| r.get(0))
+                    .unwrap_or(0)
+            };
+            format!("✅ 运行中\n待审: {count} 条")
         }
         "/ping" => "pong 🏓".to_string(),
         "/help" => {
@@ -317,38 +366,67 @@ fn extract_supported_url(text: &str) -> Option<String> {
 async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<()> {
     let data = q.data.clone().unwrap_or_default();
     let (action, token_str) = data.split_once(':').unwrap_or(("", ""));
-    let token: u64 = token_str.parse().unwrap_or(0);
+    let token: i64 = token_str.parse().unwrap_or(-1);
 
-    let pending = state.pending.lock().await.remove(&token);
-    let note: &str;
-    if let Some(p) = pending {
-        match action {
-            "ok" => {
-                // 批准:全套图(已缩放)发频道。
-                send_group(&state.bot, &state.publish_channel, &p.files, &p.caption).await?;
-                note = "✅ 已发布到频道";
+    // 查 pending(不删);db 锁仅在查询期间持有,发送期间不持锁。
+    let row: Option<(String, String, String)> = {
+        let db = state.db.lock().await;
+        db.query_row(
+            "SELECT files, caption, msg_ids FROM pending WHERE token=?1",
+            [token],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+    };
+
+    let Some((files_json, caption, msg_json)) = row else {
+        let _ = state.bot.answer_callback_query(q.id).text("该条已失效").await;
+        return Ok(());
+    };
+
+    let files: Vec<PathBuf> = serde_json::from_str::<Vec<String>>(&files_json)?
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    let msg_ids: Vec<i32> = serde_json::from_str(&msg_json)?;
+
+    // 执行操作:批准→发频道;拒绝→无操作。失败(如限流)不删 pending,可重点。
+    let action_result: Result<()> = match action {
+        "ok" => send_group(&state.bot, &state.publish_channel, &files, &caption).await,
+        _ => Ok(()),
+    };
+
+    match action_result {
+        Ok(_) => {
+            // 成功才删:删私聊整组消息 + 清文件 + 删 db pending。
+            for mid in &msg_ids {
+                let _ = state
+                    .bot
+                    .delete_message(state.review_chat.clone(), MessageId(*mid))
+                    .await;
             }
-            "no" => {
-                note = "❌ 已丢弃";
-            }
-            _ => {
-                note = "未知操作";
-            }
+            cleanup(&files);
+            let _ = state
+                .db
+                .lock()
+                .await
+                .execute("DELETE FROM pending WHERE token=?1", [token]);
+            let note = if action == "ok" {
+                "✅ 已发布到频道"
+            } else {
+                "❌ 已丢弃"
+            };
+            let _ = state.bot.answer_callback_query(q.id).text(note).await;
         }
-        // 删私聊整组审批消息(图组各条 + 控制消息)。
-        for mid in &p.review_msg_ids {
+        Err(e) => {
+            // 失败(多为限流且重试已用尽):保留 pending,提示稍后重点。
             let _ = state
                 .bot
-                .delete_message(state.review_chat.clone(), *mid)
+                .answer_callback_query(q.id)
+                .text("发送失败(可能限流),请稍后再点一次")
                 .await;
+            tracing::warn!(error = %e, token, "审批发布失败,pending 保留可重试");
         }
-        // 清理临时文件。
-        cleanup(&p.files);
-    } else {
-        note = "该条已失效";
     }
-
-    // 让按钮停止转圈。
-    let _ = state.bot.answer_callback_query(q.id).text(note).await;
     Ok(())
 }

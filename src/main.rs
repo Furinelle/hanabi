@@ -44,7 +44,8 @@ async fn main() -> Result<()> {
         token,
         cfg.telegram.channel_id.clone(),
         cfg.telegram.publish_channel.clone(),
-    );
+        "hanabi.db",
+    )?;
     // 手动触发通道:/run 命令经此通知抓取循环立即跑一轮。
     let (trigger_tx, mut trigger_rx) = tokio::sync::mpsc::channel::<()>(8);
     // 手动链接通道:发来的 Pixiv/X 作品链接经此交抓取循环直发频道。

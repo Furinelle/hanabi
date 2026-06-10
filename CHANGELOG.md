@@ -2,6 +2,13 @@
 
 本项目所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.2.2] - 2026-06-10
+
+### 修复
+- **审批「该条已失效」**：pending 审批状态从内存 `HashMap` 改为 **sqlite 持久化**（hanabi.db 的 `pending` 表），bot 重启 / 崩溃后旧审批消息的按钮仍有效。
+- **限流导致 pending 丢失**：`handle_callback` 改为「操作成功才删 pending」——发布失败（如 Telegram 限流 `Retry after`）时保留 pending，可稍后重点，不再永久失效。
+- **限流自动重试**：所有发图/发消息请求遇 429 `RetryAfter` 自动等待后重试（最多 5 次）。
+
 ## [0.2.1] - 2026-06-08
 
 ### 新增

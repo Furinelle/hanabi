@@ -28,6 +28,14 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// 手动链接任务:URL + 用户链接消息 id + "抓取中"提示消息 id。
+/// 发布成功后删这两条,保持审批私聊干净。
+pub struct LinkJob {
+    pub url: String,
+    pub user_msg_id: i32,
+    pub notice_msg_id: i32,
+}
+
 /// 审批状态:由 `TelegramSink`(发审批消息)与 callback 轮询任务共享。
 /// pending 持久化到 sqlite,bot 重启后旧审批消息的按钮仍有效。
 pub struct ReviewState {
@@ -106,6 +114,30 @@ impl TelegramSink {
         send_group(&self.state.bot, &self.state.publish_channel, &prepared, &caption).await?;
         cleanup(files);
         Ok(())
+    }
+
+    /// 删审批私聊里的若干消息(手动链接发布后清理:用户链接 + "抓取中"提示)。
+    pub async fn delete_review_messages(&self, msg_ids: &[i32]) {
+        for id in msg_ids {
+            let _ = self
+                .state
+                .bot
+                .delete_message(self.state.review_chat.clone(), MessageId(*id))
+                .await;
+        }
+    }
+
+    /// 编辑审批私聊里某条消息文本(把"抓取中"改成结果提示)。
+    pub async fn edit_review_text(&self, msg_id: i32, text: &str) {
+        let _ = self
+            .state
+            .bot
+            .edit_message_text(
+                self.state.review_chat.clone(),
+                MessageId(msg_id),
+                text.to_string(),
+            )
+            .await;
     }
 }
 
@@ -375,7 +407,7 @@ impl Sink for TelegramSink {
 pub async fn run_review_loop(
     state: Arc<ReviewState>,
     trigger: tokio::sync::mpsc::Sender<()>,
-    link: tokio::sync::mpsc::Sender<String>,
+    link: tokio::sync::mpsc::Sender<LinkJob>,
 ) {
     // 启动先清一次超期/孤儿(顺手清掉旧版本遗留的临时图)。
     cleanup_stale(&state).await;
@@ -431,7 +463,7 @@ async fn handle_command(
     state: &Arc<ReviewState>,
     msg: &Message,
     trigger: &tokio::sync::mpsc::Sender<()>,
-    link: &tokio::sync::mpsc::Sender<String>,
+    link: &tokio::sync::mpsc::Sender<LinkJob>,
 ) -> Result<()> {
     // 权限校验:只有审批私聊本人能发命令/链接,其他人一律忽略。
     if msg.chat.id.0 != state.owner {
@@ -440,13 +472,20 @@ async fn handle_command(
 
     let text = msg.text().unwrap_or("").trim();
     // 非命令:识别 Pixiv/X 作品链接 → 交抓取循环直发频道(跳过审批)。
+    // 记下用户链接消息 id 与"抓取中"提示 id,发布成功后一并删除,保持私聊干净。
     if !text.starts_with('/') {
         if let Some(url) = extract_supported_url(text) {
-            let _ = link.send(url).await;
-            state
+            let notice = state
                 .bot
-                .send_message(msg.chat.id, "🔗 收到链接,抓取中…抓完直接发频道")
+                .send_message(msg.chat.id, "🔗 收到链接,抓取中…")
                 .await?;
+            let _ = link
+                .send(LinkJob {
+                    url,
+                    user_msg_id: msg.id.0,
+                    notice_msg_id: notice.id.0,
+                })
+                .await;
         }
         return Ok(());
     }

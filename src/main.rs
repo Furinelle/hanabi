@@ -73,8 +73,9 @@ async fn main() -> Result<()> {
     )?;
     // 手动触发通道:/run 命令经此通知抓取循环立即跑一轮。
     let (trigger_tx, mut trigger_rx) = tokio::sync::mpsc::channel::<()>(8);
-    // 手动链接通道:发来的 Pixiv/X 作品链接经此交抓取循环直发频道。
-    let (link_tx, mut link_rx) = tokio::sync::mpsc::channel::<String>(16);
+    // 手动链接通道:发来的 Pixiv/X 作品链接(含消息 id)经此交抓取循环直发频道。
+    let (link_tx, mut link_rx) =
+        tokio::sync::mpsc::channel::<hanabi::sink::telegram::LinkJob>(16);
     // 启动审批回调 + 命令/链接轮询任务(与抓取循环并发运行)。
     tokio::spawn(hanabi::sink::telegram::run_review_loop(
         sink.state(),
@@ -119,9 +120,9 @@ async fn main() -> Result<()> {
                 tracing::info!("收到 /run 手动触发,立即抓取");
                 true
             }
-            Some(url) = link_rx.recv() => {
-                tracing::info!(url = %url, "收到手动链接,直发频道");
-                if let Err(e) = handle_link(&url, &gdl, x_size.as_deref(), &sink, &store).await {
+            Some(job) = link_rx.recv() => {
+                tracing::info!(url = %job.url, "收到手动链接,直发频道");
+                if let Err(e) = handle_link(job, &gdl, x_size.as_deref(), &sink, &store).await {
                     tracing::warn!(error = %e, "手动链接处理失败");
                 }
                 false
@@ -138,24 +139,22 @@ async fn main() -> Result<()> {
 /// 处理手动发来的作品链接:probe + 解析 + 下载,直接发布到频道(跳过审批)。
 /// 发布前查去重,已发过的跳过,避免重复进频道。
 async fn handle_link(
-    url: &str,
+    job: hanabi::sink::telegram::LinkJob,
     gdl: &Arc<GalleryDl>,
     x_size: Option<&str>,
     sink: &TelegramSink,
     store: &Store,
 ) -> Result<()> {
-    let is_pixiv = url.contains("pixiv");
+    let is_pixiv = job.url.contains("pixiv");
     let g = gdl.clone();
-    let u = url.to_string();
+    let u = job.url.clone();
     let val = tokio::task::spawn_blocking(move || g.probe(&u)).await??;
     let items = if is_pixiv {
         hanabi::gallerydl::parse_pixiv(&val, "manual")
     } else {
         hanabi::source::x::parse_twitter(&val, "manual")
     };
-    if items.is_empty() {
-        anyhow::bail!("链接未解析出作品(确认是作品/推文页)");
-    }
+    let mut published = 0;
     for item in &items {
         if store.already_pushed(item)? {
             tracing::info!(id = %item.source_id, "手动链接作品已发过,跳过");
@@ -167,6 +166,19 @@ async fn handle_link(
         }
         sink.publish_direct(item, &files).await?;
         let _ = store.mark_pushed(item);
+        published += 1;
+    }
+    if published > 0 {
+        // 发布成功:删用户链接消息 + "抓取中"提示,保持私聊干净。
+        sink.delete_review_messages(&[job.user_msg_id, job.notice_msg_id])
+            .await;
+    } else {
+        // 没发出新图:把"抓取中"改成结果提示(不删,便于你知道)。
+        sink.edit_review_text(
+            job.notice_msg_id,
+            "ℹ️ 该链接没有可发布的新图(已发过或无图)",
+        )
+        .await;
     }
     Ok(())
 }

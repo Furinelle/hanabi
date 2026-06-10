@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -15,11 +16,24 @@ use tokio::sync::Mutex;
 use crate::model::MediaItem;
 use crate::sink::{needs_downscale, render_caption, Sink};
 
+/// Telegram photo 缩放目标边长上限(超限按比例缩到此框内)。
+const MAX_DIMENSION: u32 = 4096;
+/// pending 保留时长上限(秒);超期未审批自动清理(删消息+文件+记录)。
+const PENDING_TTL_SECS: i64 = 7 * 24 * 3600;
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// 审批状态:由 `TelegramSink`(发审批消息)与 callback 轮询任务共享。
 /// pending 持久化到 sqlite,bot 重启后旧审批消息的按钮仍有效。
 pub struct ReviewState {
     bot: Bot,
     review_chat: Recipient,     // 审批私聊
+    owner: i64,                 // 审批私聊数字 id;仅响应本人的命令/链接
     publish_channel: Recipient, // 批准后发布频道
     db: Mutex<rusqlite::Connection>,
     counter: AtomicU64,
@@ -42,17 +56,24 @@ impl TelegramSink {
         publish_channel_id: String,
         db_path: &str,
     ) -> Result<Self> {
+        let owner: i64 = review_chat_id.parse().unwrap_or(0);
         let conn = rusqlite::Connection::open(db_path).context("打开 pending 数据库失败")?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS pending(
-                token   INTEGER PRIMARY KEY,
-                files   TEXT NOT NULL,
-                caption TEXT NOT NULL,
-                msg_ids TEXT NOT NULL
+                token      INTEGER PRIMARY KEY,
+                files      TEXT NOT NULL,
+                caption    TEXT NOT NULL,
+                msg_ids    TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT 0
              );",
         )
         .context("初始化 pending 表失败")?;
+        // 兼容旧库(无 created_at 列):补列,已存在则忽略报错。
+        let _ = conn.execute(
+            "ALTER TABLE pending ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         // counter 从已有最大 token 续上,避免重启后 token 与旧记录冲突。
         let max_token: i64 = conn
             .query_row("SELECT COALESCE(MAX(token), 0) FROM pending", [], |r| r.get(0))
@@ -61,6 +82,7 @@ impl TelegramSink {
             state: Arc::new(ReviewState {
                 bot: Bot::new(token),
                 review_chat: to_recipient(review_chat_id),
+                owner,
                 publish_channel: to_recipient(publish_channel_id),
                 db: Mutex::new(conn),
                 counter: AtomicU64::new(max_token as u64 + 1),
@@ -123,7 +145,11 @@ fn prepare(path: &Path) -> Result<PathBuf> {
         return Ok(path.to_path_buf());
     }
     let dyn_img = image::open(path).context("打开图片失败")?;
-    let scaled = dyn_img.resize(4096, 4096, image::imageops::FilterType::Lanczos3);
+    let scaled = dyn_img.resize(
+        MAX_DIMENSION,
+        MAX_DIMENSION,
+        image::imageops::FilterType::Lanczos3,
+    );
     let out = path.with_extension("scaled.jpg");
     scaled.to_rgb8().save(&out).context("保存缩放图失败")?;
     Ok(out)
@@ -189,6 +215,92 @@ fn cleanup(files: &[PathBuf]) {
     }
 }
 
+/// 启动清理:① 删超期未审 pending(消息+文件+记录);② 删 `/tmp/hanabi_*` 中
+/// 不被任何 pending 引用的孤儿目录(多为旧版本/重启遗留)。
+async fn cleanup_stale(state: &Arc<ReviewState>) {
+    // ① 超期 pending。
+    let cutoff = now_secs() - PENDING_TTL_SECS;
+    let expired: Vec<(i64, String, String)> = {
+        let db = state.db.lock().await;
+        let mut out = Vec::new();
+        if let Ok(mut stmt) = db.prepare(
+            "SELECT token, files, msg_ids FROM pending WHERE created_at > 0 AND created_at < ?1",
+        ) {
+            if let Ok(rows) = stmt.query_map([cutoff], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            }) {
+                out.extend(rows.flatten());
+            }
+        }
+        out
+    };
+    for (token, files_json, msg_json) in &expired {
+        if let Ok(ids) = serde_json::from_str::<Vec<i32>>(msg_json) {
+            for mid in ids {
+                let _ = state
+                    .bot
+                    .delete_message(state.review_chat.clone(), MessageId(mid))
+                    .await;
+            }
+        }
+        if let Ok(files) = serde_json::from_str::<Vec<String>>(files_json) {
+            let paths: Vec<PathBuf> = files.into_iter().map(PathBuf::from).collect();
+            cleanup(&paths);
+        }
+        let _ = state
+            .db
+            .lock()
+            .await
+            .execute("DELETE FROM pending WHERE token=?1", [*token]);
+    }
+    if !expired.is_empty() {
+        tracing::info!(count = expired.len(), "清理超期 pending");
+    }
+
+    // ② 孤儿临时目录。先把 files JSON 收集成 owned(释放 db 锁),再在锁外解析。
+    let file_jsons: Vec<String> = {
+        let db = state.db.lock().await;
+        let mut out = Vec::new();
+        if let Ok(mut stmt) = db.prepare("SELECT files FROM pending") {
+            if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+                out.extend(rows.flatten());
+            }
+        }
+        out
+    };
+    let mut referenced: HashSet<PathBuf> = HashSet::new();
+    for fj in file_jsons {
+        if let Ok(files) = serde_json::from_str::<Vec<String>>(&fj) {
+            for f in files {
+                if let Some(parent) = PathBuf::from(&f).parent() {
+                    referenced.insert(parent.to_path_buf());
+                }
+            }
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) {
+        let mut orphans = 0;
+        for e in rd.flatten() {
+            let p = e.path();
+            let is_hanabi = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map_or(false, |n| n.starts_with("hanabi_"));
+            if is_hanabi && p.is_dir() && !referenced.contains(&p) {
+                let _ = std::fs::remove_dir_all(&p);
+                orphans += 1;
+            }
+        }
+        if orphans > 0 {
+            tracing::info!(orphans, "清理孤儿临时目录");
+        }
+    }
+}
+
 #[async_trait]
 impl Sink for TelegramSink {
     /// 发到审批私聊:**全套图**(单图=sendPhoto+按钮;多图=图组+一条带按钮的控制消息)。
@@ -224,13 +336,11 @@ impl Sink for TelegramSink {
             .await?;
             review_ids.push(msg.id);
         } else {
-            // 图组(全部图,第一张带 caption)。
             let first_cap = format!("【待审 · 共 {n} 张】\n{caption}");
             let msgs =
                 tg_retry(|| bot.send_media_group(chat.clone(), build_media(&prepared, &first_cap)))
                     .await?;
             review_ids.extend(msgs.iter().map(|m| m.id));
-            // 图组挂不了按钮,紧跟一条控制消息承载按钮。
             let ctrl = tg_retry(|| {
                 bot.send_message(chat.clone(), format!("👆 上面 {n} 张,请审批"))
                     .reply_markup(keyboard.clone())
@@ -250,8 +360,8 @@ impl Sink for TelegramSink {
         {
             let db = self.state.db.lock().await;
             db.execute(
-                "INSERT OR REPLACE INTO pending(token, files, caption, msg_ids) VALUES(?1,?2,?3,?4)",
-                rusqlite::params![token as i64, files_json, caption, msg_json],
+                "INSERT OR REPLACE INTO pending(token, files, caption, msg_ids, created_at) VALUES(?1,?2,?3,?4,?5)",
+                rusqlite::params![token as i64, files_json, caption, msg_json, now_secs()],
             )?;
         }
         Ok(())
@@ -267,6 +377,9 @@ pub async fn run_review_loop(
     trigger: tokio::sync::mpsc::Sender<()>,
     link: tokio::sync::mpsc::Sender<String>,
 ) {
+    // 启动先清一次超期/孤儿(顺手清掉旧版本遗留的临时图)。
+    cleanup_stale(&state).await;
+
     let mut offset: i32 = 0;
     loop {
         let updates = state
@@ -300,21 +413,31 @@ pub async fn run_review_loop(
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "get_updates 失败");
+                let s = e.to_string();
+                if s.contains("Conflict") || s.contains("terminated by other") {
+                    tracing::error!("检测到另一个 bot 实例在抢 getUpdates,请确保只运行一个 hanabi");
+                } else {
+                    tracing::warn!(error = %e, "get_updates 失败");
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             }
         }
     }
 }
 
-/// 处理 `/` 命令(仅文本消息)。/run 发触发信号让抓取循环立即跑一轮;
-/// /status /ping /help 即时回复;非命令的 Pixiv/X 链接交抓取循环直发频道。
+/// 处理 `/` 命令(仅文本消息)。**仅响应审批私聊本人**(owner),陌生人忽略。
+/// /run 触发抓取;/status /ping /help 即时回复;非命令的 Pixiv/X 链接交抓取循环直发频道。
 async fn handle_command(
     state: &Arc<ReviewState>,
     msg: &Message,
     trigger: &tokio::sync::mpsc::Sender<()>,
     link: &tokio::sync::mpsc::Sender<String>,
 ) -> Result<()> {
+    // 权限校验:只有审批私聊本人能发命令/链接,其他人一律忽略。
+    if msg.chat.id.0 != state.owner {
+        return Ok(());
+    }
+
     let text = msg.text().unwrap_or("").trim();
     // 非命令:识别 Pixiv/X 作品链接 → 交抓取循环直发频道(跳过审批)。
     if !text.starts_with('/') {
@@ -429,4 +552,32 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_url_recognizes_pixiv_and_x() {
+        assert_eq!(
+            extract_supported_url("https://www.pixiv.net/artworks/123").as_deref(),
+            Some("https://www.pixiv.net/artworks/123")
+        );
+        assert_eq!(
+            extract_supported_url("看这张 https://x.com/u/status/9 不错").as_deref(),
+            Some("https://x.com/u/status/9")
+        );
+        assert_eq!(
+            extract_supported_url("https://twitter.com/u/status/7").as_deref(),
+            Some("https://twitter.com/u/status/7")
+        );
+    }
+
+    #[test]
+    fn extract_url_ignores_commands_and_other_links() {
+        assert!(extract_supported_url("/run").is_none());
+        assert!(extract_supported_url("https://example.com/a").is_none());
+        assert!(extract_supported_url("随便聊聊").is_none());
+    }
 }

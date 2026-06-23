@@ -87,11 +87,13 @@ impl TelegramSink {
             .query_row("SELECT COALESCE(MAX(token), 0) FROM pending", [], |r| r.get(0))
             .unwrap_or(0);
         // 自定义 client:
-        // - timeout(40) > 长轮询 25s,否则长轮询挂起期间被 client 默认 timeout 掐断;
-        // - trust_dns(true) 启用纯 Rust DNS,避开 musl 静态二进制 getaddrinfo 解析失败
+        // - timeout(300):整体超时。yunyoo-la 上传带宽约 170KB/s,orig 4K 大图(几 MB)
+        //   单张需数十秒、多图一次 sendMediaGroup 可达 2-3 分钟,给足 5 分钟避免超时。
+        // - connect_timeout(15):连接阶段超时,短一些好快速失败重试。
+        // - trust_dns(true):纯 Rust DNS,避开 musl 静态二进制 getaddrinfo 解析失败
         //   (reqwest 0.11 光开 feature 不够,必须显式调用此方法)。
         let client = teloxide::net::default_reqwest_settings()
-            .timeout(std::time::Duration::from_secs(40))
+            .timeout(std::time::Duration::from_secs(300))
             .connect_timeout(std::time::Duration::from_secs(15))
             .trust_dns(true)
             .build()

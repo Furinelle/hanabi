@@ -86,10 +86,14 @@ impl TelegramSink {
         let max_token: i64 = conn
             .query_row("SELECT COALESCE(MAX(token), 0) FROM pending", [], |r| r.get(0))
             .unwrap_or(0);
-        // 自定义 client:整体 timeout 须 > 长轮询的 25s,否则 get_updates 长轮询挂起期间
-        // 被 client 默认 timeout 掐断,报 operation timed out(musl/glibc 一视同仁)。
+        // 自定义 client:
+        // - timeout(40) > 长轮询 25s,否则长轮询挂起期间被 client 默认 timeout 掐断;
+        // - trust_dns(true) 启用纯 Rust DNS,避开 musl 静态二进制 getaddrinfo 解析失败
+        //   (reqwest 0.11 光开 feature 不够,必须显式调用此方法)。
         let client = teloxide::net::default_reqwest_settings()
             .timeout(std::time::Duration::from_secs(40))
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .trust_dns(true)
             .build()
             .context("构造 reqwest client 失败")?;
         Ok(Self {

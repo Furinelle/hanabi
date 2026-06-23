@@ -5,7 +5,8 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
-teloxide = { version = "0.13", features = ["macros"] }
+# rustls 替代 native-tls,避开 openssl,便于 musl 静态编译(CI 产物跨发行版通用)
+teloxide = { version = "0.13", default-features = false, features = ["macros", "rustls"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -14,7 +15,8 @@ anyhow = "1"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-image = "0.25"
+# 精简解码器,去掉 avif(ravif)/exr 等 C 依赖,musl 编译更顺;够处理 pixiv/x 下载图
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
 async-trait = "0.1"
 
 [dev-dependencies]

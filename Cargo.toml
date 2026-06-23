@@ -18,6 +18,10 @@ tracing-subscriber = "0.3"
 # 精简解码器,去掉 avif(ravif)/exr 等 C 依赖,musl 编译更顺;够处理 pixiv/x 下载图
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
 async-trait = "0.1"
+# 启用 reqwest 的 trust-dns(纯 Rust DNS),绕开 musl 静态二进制 getaddrinfo 的坑。
+# 必须匹配 teloxide 0.13 实际用的 reqwest 0.11(0.11 的 feature 名是 trust-dns),
+# 同版本 cargo 才会 unify,把 DNS 解析器合并进 teloxide 内部的 reqwest。
+reqwest = { version = "0.11", default-features = false, features = ["trust-dns"] }
 
 [dev-dependencies]
 tempfile = "3"

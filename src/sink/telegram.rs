@@ -403,7 +403,8 @@ impl Sink for TelegramSink {
 /// callback 轮询:监听按钮点击与 `/` 命令/链接。批准 → 发频道 + 删私聊整组;
 /// 拒绝 → 删私聊整组。失败(如限流)保留 pending 供重点。与抓取循环并发运行。
 ///
-/// 用短轮询(timeout=0,空结果 sleep)而非长轮询:经代理时长连接长轮询易被掐断。
+/// 长轮询(timeout=25):get_updates 挂起等待事件,有按钮/命令立即返回 → 即时响应,
+/// 没有空轮询的固定延迟。直连 Telegram 时用此;经代理若被掐断会走 Err 分支重试。
 pub async fn run_review_loop(
     state: Arc<ReviewState>,
     trigger: tokio::sync::mpsc::Sender<()>,
@@ -418,15 +419,11 @@ pub async fn run_review_loop(
             .bot
             .get_updates()
             .offset(offset)
-            .timeout(0)
+            .timeout(25)
             .allowed_updates(vec![AllowedUpdate::CallbackQuery, AllowedUpdate::Message])
             .await;
         match updates {
             Ok(list) => {
-                if list.is_empty() {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    continue;
-                }
                 for u in list {
                     offset = u.id.0 as i32 + 1;
                     match u.kind {
@@ -551,45 +548,52 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
         .map(PathBuf::from)
         .collect();
     let msg_ids: Vec<i32> = serde_json::from_str(&msg_json)?;
+    let is_ok = action == "ok";
 
-    // 执行操作:批准→发频道;拒绝→无操作。失败(如限流)不删 pending,可重点。
-    let action_result: Result<()> = match action {
-        "ok" => send_group(&state.bot, &state.publish_channel, &files, &caption).await,
-        _ => Ok(()),
-    };
+    // 立即应答,停止按钮转圈(必须 3 秒内,否则 callback query 过期)。
+    // 发图/删消息这些耗时操作放后台,不让你盯着转圈等上传。
+    let _ = state
+        .bot
+        .answer_callback_query(q.id)
+        .text(if is_ok { "⏳ 发布中…" } else { "❌ 已丢弃" })
+        .await;
 
-    match action_result {
-        Ok(_) => {
-            // 成功才删:删私聊整组消息 + 清文件 + 删 db pending。
-            for mid in &msg_ids {
+    // 后台执行:批准→发频道;然后删私聊整组 + 清文件 + 删 pending。
+    // 失败(如限流)保留 pending,发提示可重点。
+    let state = state.clone();
+    tokio::spawn(async move {
+        let result: Result<()> = if is_ok {
+            send_group(&state.bot, &state.publish_channel, &files, &caption).await
+        } else {
+            Ok(())
+        };
+        match result {
+            Ok(_) => {
+                for mid in &msg_ids {
+                    let _ = state
+                        .bot
+                        .delete_message(state.review_chat.clone(), MessageId(*mid))
+                        .await;
+                }
+                cleanup(&files);
+                let _ = state
+                    .db
+                    .lock()
+                    .await
+                    .execute("DELETE FROM pending WHERE token=?1", [token]);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, token, "审批发布失败,pending 保留可重试");
                 let _ = state
                     .bot
-                    .delete_message(state.review_chat.clone(), MessageId(*mid))
+                    .send_message(
+                        state.review_chat.clone(),
+                        "⚠️ 发布失败(可能限流),过会儿再点一次那条审批",
+                    )
                     .await;
             }
-            cleanup(&files);
-            let _ = state
-                .db
-                .lock()
-                .await
-                .execute("DELETE FROM pending WHERE token=?1", [token]);
-            let note = if action == "ok" {
-                "✅ 已发布到频道"
-            } else {
-                "❌ 已丢弃"
-            };
-            let _ = state.bot.answer_callback_query(q.id).text(note).await;
         }
-        Err(e) => {
-            // 失败(多为限流且重试已用尽):保留 pending,提示稍后重点。
-            let _ = state
-                .bot
-                .answer_callback_query(q.id)
-                .text("发送失败(可能限流),请稍后再点一次")
-                .await;
-            tracing::warn!(error = %e, token, "审批发布失败,pending 保留可重试");
-        }
-    }
+    });
     Ok(())
 }
 

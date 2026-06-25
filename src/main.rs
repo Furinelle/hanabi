@@ -60,12 +60,13 @@ async fn main() -> Result<()> {
 
     let store = Store::open("hanabi.db")?;
     let chain = FilterChain::standard();
-    let sink = TelegramSink::new(
+    // Arc 包裹:手动链接处理移入独立 task 时需克隆共享。
+    let sink = Arc::new(TelegramSink::new(
         token,
         cfg.telegram.channel_id.clone(),
         cfg.telegram.publish_channel.clone(),
         "hanabi.db",
-    )?;
+    )?);
     // 手动触发通道:/run 命令经此通知抓取循环立即跑一轮。
     let (trigger_tx, mut trigger_rx) = tokio::sync::mpsc::channel::<()>(8);
     // 手动链接通道:发来的 Pixiv/X 作品链接(含消息 id)经此交抓取循环直发频道。
@@ -102,7 +103,7 @@ async fn main() -> Result<()> {
         move |item: &MediaItem| -> Vec<PathBuf> { download_work(&gdl_dl, item, x_size_dl.as_deref()) };
 
     // 启动立即跑首轮。
-    if let Err(e) = run_once(&store, &sources, &chain, &sink as &dyn Sink, &download).await {
+    if let Err(e) = run_once(&store, &sources, &chain, sink.as_ref() as &dyn Sink, &download).await {
         tracing::error!(error = %e, "本轮异常");
     }
     loop {
@@ -121,14 +122,20 @@ async fn main() -> Result<()> {
             }
             Some(job) = link_rx.recv() => {
                 tracing::info!(url = %job.url, "收到手动链接,直发频道");
-                if let Err(e) = handle_link(job, &gdl, x_size.as_deref(), &sink, &store).await {
-                    tracing::warn!(error = %e, "手动链接处理失败");
-                }
+                // 移入独立 task:慢链接(probe+下载+上传)不阻塞定时槽与 /run。
+                let gdl = gdl.clone();
+                let sink = sink.clone();
+                let x_size = x_size.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_link(job, &gdl, x_size.as_deref(), &sink).await {
+                        tracing::warn!(error = %e, "手动链接处理失败");
+                    }
+                });
                 false
             }
         };
         if do_fetch {
-            if let Err(e) = run_once(&store, &sources, &chain, &sink as &dyn Sink, &download).await {
+            if let Err(e) = run_once(&store, &sources, &chain, sink.as_ref() as &dyn Sink, &download).await {
                 tracing::error!(error = %e, "本轮异常");
             }
         }
@@ -142,8 +149,10 @@ async fn handle_link(
     gdl: &Arc<GalleryDl>,
     x_size: Option<&str>,
     sink: &TelegramSink,
-    store: &Store,
 ) -> Result<()> {
+    // 自开 Store 连接:Store 持 rusqlite::Connection(!Sync)不能跨 spawn 共享;
+    // Task1 已加 busy_timeout, 多连接并发安全。
+    let store = Store::open("hanabi.db").context("handle_link 打开 Store 失败")?;
     let is_pixiv = job.url.contains("pixiv");
     let g = gdl.clone();
     let u = job.url.clone();

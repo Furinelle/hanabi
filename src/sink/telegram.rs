@@ -162,6 +162,11 @@ impl TelegramSink {
     }
 }
 
+/// 距上次清理是否已超 interval(秒)。
+fn cleanup_due(last_secs: i64, now_secs: i64, interval_secs: i64) -> bool {
+    now_secs - last_secs >= interval_secs
+}
+
 /// 解析审批私聊数字 id。非数字(如 @username)返回 None —— 命令/链接功能要求数字 id。
 fn parse_owner(review_chat_id: &str) -> Option<i64> {
     review_chat_id.parse::<i64>().ok()
@@ -441,9 +446,16 @@ pub async fn run_review_loop(
 ) {
     // 启动先清一次超期/孤儿(顺手清掉旧版本遗留的临时图)。
     cleanup_stale(&state).await;
+    let mut last_cleanup = now_secs();
+    const CLEANUP_INTERVAL_SECS: i64 = 6 * 3600;
 
     let mut offset: i32 = 0;
     loop {
+        // 周期清理:常驻不重启实例也能清过期 pending 与孤儿临时目录。
+        if cleanup_due(last_cleanup, now_secs(), CLEANUP_INTERVAL_SECS) {
+            cleanup_stale(&state).await;
+            last_cleanup = now_secs();
+        }
         let updates = state
             .bot
             .get_updates()
@@ -629,6 +641,12 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_due_after_interval() {
+        assert!(!cleanup_due(1000, 1000 + 6 * 3600 - 1, 6 * 3600));
+        assert!(cleanup_due(1000, 1000 + 6 * 3600, 6 * 3600));
+    }
 
     #[test]
     fn prepare_preserves_png_alpha_when_downscaling() {

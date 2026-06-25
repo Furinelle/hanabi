@@ -21,6 +21,12 @@ impl Store {
     }
 
     fn init(conn: &Connection) -> Result<()> {
+        // WAL + busy_timeout:抓取循环与审批任务两条连接并发写 hanabi.db,
+        // 不加锁会撞 "database is locked";sink 端连接也启用了 WAL,此处对齐。
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA busy_timeout=5000;",
+        )?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS pushed (
                  source_kind TEXT NOT NULL,
@@ -81,6 +87,23 @@ mod tests {
             }],
             origin: "s".into(),
         }
+    }
+
+    #[test]
+    fn open_sets_wal_and_busy_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        let mode: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+        let busy: i64 = store
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy, 5000);
     }
 
     #[test]

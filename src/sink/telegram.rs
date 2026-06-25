@@ -208,8 +208,11 @@ fn prepare(path: &Path) -> Result<PathBuf> {
         MAX_DIMENSION,
         image::imageops::FilterType::Lanczos3,
     );
-    let out = path.with_extension("scaled.jpg");
-    scaled.to_rgb8().save(&out).context("保存缩放图失败")?;
+    // 保留原格式: PNG 缩放后仍是 PNG(保 alpha), JPG 仍是 JPG。
+    // DynamicImage::save 按扩展名推断编码,RGBA 透明通道得以保留。
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("jpg");
+    let out = path.with_extension(format!("scaled.{ext}"));
+    scaled.save(&out).context("保存缩放图失败")?;
     Ok(out)
 }
 
@@ -626,6 +629,25 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepare_preserves_png_alpha_when_downscaling() {
+        use image::GenericImageView;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("big.png");
+        // 9000x2000 RGBA(宽+高>10000 触发缩放), 半透明像素。
+        let mut img = image::RgbaImage::new(9000, 2000);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([10, 20, 30, 128]);
+        }
+        img.save(&src).unwrap();
+
+        let out = prepare(&src).unwrap();
+        assert_ne!(out, src, "应产出缩放副本");
+        assert_eq!(out.extension().unwrap(), "png", "应保留 png 而非转 jpg");
+        let reloaded = image::open(&out).unwrap();
+        assert!(reloaded.color().has_alpha(), "应保留 alpha 通道");
+    }
 
     #[test]
     fn parse_owner_numeric_only() {

@@ -2,6 +2,11 @@
 
 本项目所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.4.2] - 2026-06-25
+
+### 修复
+- **手动 X 画师主页「已转 0 个进审批」**：手动发裸 X 主页（`x.com/<user>`）时，gallery-dl `-j` 只返回一个 type-6 Queue 节点（指向 `/timeline`）、不递归，`parse_twitter` 只认 type-3 文件项 → 解析出 0 张图。修复：探测前用 `normalize_profile_url` 把裸主页规整为 `/media` 子页（直接出 type-3）。`/status`、`/i/lists`、已是 `/media` 的及非 X 链接均不变。
+
 ## [0.4.1] - 2026-06-25
 
 ### 其他

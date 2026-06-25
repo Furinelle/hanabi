@@ -89,6 +89,12 @@ pub fn parse_pixiv(root: &Value, origin: &str) -> Vec<MediaItem> {
             None => String::new(),
         };
 
+        // AI 生成作品(pixiv illust_ai_type==2)打标:置于 tag 首位,渲染为 #AI生成
+        // (放最前避免被 caption 的 take(6) 截掉)。
+        let mut tags = tags_field(meta);
+        if u32_field(meta, "illust_ai_type") == Some(2) {
+            tags.insert(0, "AI生成".to_string());
+        }
         let item = MediaItem {
             source: SourceKind::Pixiv,
             source_id: id.clone(),
@@ -98,7 +104,7 @@ pub fn parse_pixiv(root: &Value, origin: &str) -> Vec<MediaItem> {
             },
             title: str_field(meta, "title"),
             url: format!("https://www.pixiv.net/artworks/{id}"),
-            tags: tags_field(meta),
+            tags,
             bookmark_count: u32_field(meta, "total_bookmarks"),
             is_r18: u32_field(meta, "x_restrict").is_some_and(|x| x > 0),
             pixiv_type: str_field(meta, "type").and_then(|s| pixiv_type(&s)),
@@ -221,5 +227,26 @@ mod tests {
         let b = items.iter().find(|i| i.source_id == "124").unwrap();
         assert_eq!(b.pixiv_type, Some(PixivType::Manga));
         assert!(b.is_r18);
+    }
+
+    #[test]
+    fn parse_pixiv_tags_ai_generated() {
+        // illust_ai_type==2 → tag 首位插入 AI生成;==1 不插。
+        let ai = serde_json::json!([[3, "https://i.pximg.net/a.png", {
+            "id": 999, "title": "t", "type": "illust",
+            "tags": ["原神"], "illust_ai_type": 2,
+            "user": {"id": 1, "name": "a"}
+        }]]);
+        let items = parse_pixiv(&ai, "test");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].tags.first().map(String::as_str), Some("AI生成"));
+
+        let not_ai = serde_json::json!([[3, "https://i.pximg.net/b.png", {
+            "id": 1000, "title": "t", "type": "illust",
+            "tags": ["原神"], "illust_ai_type": 1,
+            "user": {"id": 1, "name": "a"}
+        }]]);
+        let items = parse_pixiv(&not_ai, "test");
+        assert_eq!(items[0].tags, vec!["原神".to_string()]);
     }
 }

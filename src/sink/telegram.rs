@@ -190,6 +190,34 @@ fn to_recipient(id: String) -> Recipient {
     }
 }
 
+/// 若 msg 是 `publish_channel` 帖子自动转发到讨论组的那条(评论锚点),返回被转发的
+/// 频道帖 msg_id。频道来源为 `MessageOrigin::Channel`(便捷访问器 forward_from_chat
+/// 只认 Chat 变体、对 Channel 返回 None,故此处直接 match Channel 取 .chat)。
+// 接线在 PR4-T3(run_review_loop 投递评论区);此前仅测试引用,先抑制 dead_code。
+#[allow(dead_code)]
+fn match_auto_forward(msg: &Message, publish_channel: &Recipient) -> Option<i32> {
+    if !msg.is_automatic_forward() {
+        return None;
+    }
+    let (from_chat, msg_id) = match msg.forward_origin()? {
+        teloxide::types::MessageOrigin::Channel {
+            chat, message_id, ..
+        } => (chat, message_id),
+        _ => return None,
+    };
+    let matches_channel = match publish_channel {
+        Recipient::Id(id) => from_chat.id == *id,
+        Recipient::ChannelUsername(name) => {
+            from_chat.username().map(|u| format!("@{u}")).as_deref() == Some(name.as_str())
+        }
+    };
+    if matches_channel {
+        Some(msg_id.0)
+    } else {
+        None
+    }
+}
+
 /// 包装 Telegram 请求:遇限流 `RetryAfter` 自动等待后重试(最多 5 次)。
 async fn tg_retry<F, R, T>(f: F) -> std::result::Result<T, teloxide::RequestError>
 where
@@ -762,6 +790,21 @@ mod tests {
         assert!(extract_supported_url("/run").is_none());
         assert!(extract_supported_url("https://example.com/a").is_none());
         assert!(extract_supported_url("随便聊聊").is_none());
+    }
+
+    #[test]
+    fn match_auto_forward_extracts_channel_msg_id() {
+        let raw = include_str!("../../tests/fixtures/auto_forward_channel.json");
+        let msg: teloxide::types::Message = serde_json::from_str(raw).unwrap();
+        // 源频道用户名匹配 → 返回被转发的频道帖 msg_id(789)。
+        let chan = to_recipient("@FurinaDeCanvas".into());
+        assert_eq!(match_auto_forward(&msg, &chan), Some(789));
+        // 用数字 id 匹配同一频道。
+        let chan_id = to_recipient("-1002222222222".into());
+        assert_eq!(match_auto_forward(&msg, &chan_id), Some(789));
+        // 不匹配的频道 → None。
+        let other = to_recipient("@SomeoneElse".into());
+        assert_eq!(match_auto_forward(&msg, &other), None);
     }
 
     #[test]

@@ -1,0 +1,18 @@
+{
+  "message_id": 5,
+  "chat": { "id": -1001111111111, "title": "Furina Discuss", "type": "supergroup" },
+  "date": 1700000001,
+  "is_automatic_forward": true,
+  "forward_origin": {
+    "type": "channel",
+    "date": 1700000000,
+    "chat": {
+      "id": -1002222222222,
+      "title": "FurinaDeCanvas",
+      "type": "channel",
+      "username": "FurinaDeCanvas"
+    },
+    "message_id": 789
+  },
+  "text": "auto forwarded channel post"
+}

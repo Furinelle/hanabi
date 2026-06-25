@@ -2,6 +2,11 @@
 
 本项目所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.4.1] - 2026-06-25
+
+### 其他
+- **恢复 aarch64 静态 musl 产物**：Release 现同时出 `hanabi-x86_64-unknown-linux-musl` 与 `hanabi-aarch64-unknown-linux-musl`（`.tar.gz` + `.sha256`）。aarch64 改用 **cargo-zigbuild**（zig 作交叉 C 编译器/链接器），正确为 musl target 编译 rusqlite 的 bundled `sqlite3.c`；此前 GNU 交叉工具链会引入 glibc 专有符号（`open64`/`__memset_chk` 等）导致链接 musl 失败，0.4.0 曾退回 x86_64-only。x86_64 仍走系统 musl-gcc 不变。
+
 ## [0.4.0] - 2026-06-25
 
 ### 新增

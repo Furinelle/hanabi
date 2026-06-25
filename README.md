@@ -18,7 +18,7 @@
 - 🎯 **分源过滤**：R18 / 收藏数 / 点赞数 / 标签白名单 / 只插画 / 页数上限
 - ⌨️ **命令控制**：`/run` 手动抓一轮、`/status`、`/ping`、`/help`
 - ⏰ **定时轮询**：`poll_interval_secs` 可配（如一天三次 = 28800），`tz_offset_hours` 可配时区（默认 +8）
-- 🐳 **多种部署**：systemd / launchd / Docker（GHCR 镜像，含 gallery-dl）；预编译 x86_64 musl 静态二进制
+- 🐳 **多种部署**：systemd / launchd / Docker（GHCR 镜像，含 gallery-dl）；预编译 x86_64 + aarch64 musl 静态二进制
 
 ## 前置依赖
 

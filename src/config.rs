@@ -3,6 +3,9 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub poll_interval_secs: u64,
+    /// 整点时间槽所用时区相对 UTC 的偏移(CST=+8,默认 8)。
+    #[serde(default = "default_tz_offset")]
+    pub tz_offset_hours: i64,
     pub telegram: TelegramCfg,
     pub gallery_dl: GalleryDlCfg,
     #[serde(default)]
@@ -29,6 +32,10 @@ pub struct GalleryDlCfg {
 
 fn default_range() -> String {
     "1-20".to_string()
+}
+
+fn default_tz_offset() -> i64 {
+    8
 }
 
 #[derive(Debug, Deserialize, Default)]

@@ -16,18 +16,13 @@ use hanabi::source::x::{download_extra, XSource};
 use hanabi::source::Source;
 use hanabi::store::Store;
 
-/// 计算距下一个整点时间槽的秒数（CST = UTC+8）。
-/// poll_interval_secs 须能整除 86400，例如 28800 → 00:00 / 08:00 / 16:00。
-fn secs_until_next_slot(interval_secs: u64) -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let utc = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let local = utc + 8 * 3600; // CST (UTC+8)
-    let secs_into_day = local % 86400;
-    let next_slot = ((secs_into_day / interval_secs) + 1) * interval_secs;
-    next_slot - secs_into_day
+/// 计算距下一个整点时间槽的秒数。`tz_offset_hours` 为本地时区相对 UTC 的偏移
+/// (CST=+8)。`now_unix` 为当前 UTC 秒(注入便于测试)。
+/// interval_secs 须能整除 86400，例如 28800 → 00:00 / 08:00 / 16:00。
+fn secs_until_next_slot(interval_secs: u64, tz_offset_hours: i64, now_unix: u64) -> u64 {
+    let local = (now_unix as i64 + tz_offset_hours * 3600).rem_euclid(86400) as u64;
+    let next_slot = ((local / interval_secs) + 1) * interval_secs;
+    next_slot - local
 }
 
 /// 下载单个作品到独立临时目录(X 用 size=orig)。供定时抓取与手动链接共用。
@@ -111,7 +106,11 @@ async fn main() -> Result<()> {
         tracing::error!(error = %e, "本轮异常");
     }
     loop {
-        let wait = secs_until_next_slot(cfg.poll_interval_secs);
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let wait = secs_until_next_slot(cfg.poll_interval_secs, cfg.tz_offset_hours, now_unix);
         tracing::info!(wait_secs = wait, "下次抓取在 {:.1} 小时后", wait as f64 / 3600.0);
         // 整点时间槽到点 / /run 手动触发 → 跑一轮;手动链接 → 直发频道(不跑全量)。
         let do_fetch = tokio::select! {
@@ -181,4 +180,20 @@ async fn handle_link(
         .await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::secs_until_next_slot;
+
+    #[test]
+    fn slot_aligns_to_interval_in_local_tz() {
+        // now=57600 即当天 UTC 16:00:00 → CST(+8) 次日 00:00 整点槽起点,距下一个 8h 槽 8h。
+        let now = 57600;
+        assert_eq!(secs_until_next_slot(28800, 8, now), 28800);
+        // local 04:00(now=72000),距下一个 08:00 槽 4h。
+        assert_eq!(secs_until_next_slot(28800, 8, 72000), 14400);
+        // tz_offset=0 时同一 now=57600 → local 16:00,距 24:00 槽 8h。
+        assert_eq!(secs_until_next_slot(28800, 0, 57600), 28800);
+    }
 }

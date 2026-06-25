@@ -122,6 +122,21 @@ From <Pixiv|X>(作品链接) By 作者名(作者链接)
 
 `deploy/ai.hanabi.plist` → `~/Library/LaunchAgents/`，改占位后 `launchctl load`。
 
+### Docker（GHCR 镜像）
+
+镜像内含 gallery-dl，无需另装：
+
+```bash
+docker run -d --name hanabi \
+  -e HANABI_BOT_TOKEN="<bot token>" \
+  -v $PWD/config.toml:/data/config.toml:ro \
+  -v $PWD/gallery-dl.conf:/data/gallery-dl.conf:ro \
+  -v $PWD/hanabi.db:/data/hanabi.db \
+  ghcr.io/furinelle/hanabi:latest
+```
+
+> `config.toml` 里 `gallery_dl.config_path` 设为 `/data/gallery-dl.conf`。镜像随 `v*` tag 自动构建推送到 GHCR。
+
 ## 架构
 
 单 Rust 二进制 + 两个并发任务：

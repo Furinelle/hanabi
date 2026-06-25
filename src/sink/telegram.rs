@@ -93,7 +93,9 @@ impl TelegramSink {
         );
         // counter 从已有最大 token 续上,避免重启后 token 与旧记录冲突。
         let max_token: i64 = conn
-            .query_row("SELECT COALESCE(MAX(token), 0) FROM pending", [], |r| r.get(0))
+            .query_row("SELECT COALESCE(MAX(token), 0) FROM pending", [], |r| {
+                r.get(0)
+            })
             .unwrap_or(0);
         // 自定义 client:
         // - timeout(300):整体超时。yunyoo-la 上传带宽约 170KB/s,orig 4K 大图(几 MB)
@@ -135,7 +137,13 @@ impl TelegramSink {
         let caption = render_caption(item);
         let files_owned: Vec<PathBuf> = files.to_vec();
         let prepared = tokio::task::spawn_blocking(move || prepare_all(&files_owned)).await??;
-        send_group(&self.state.bot, &self.state.publish_channel, &prepared, &caption).await?;
+        send_group(
+            &self.state.bot,
+            &self.state.publish_channel,
+            &prepared,
+            &caption,
+        )
+        .await?;
         cleanup(files);
         Ok(())
     }
@@ -236,7 +244,9 @@ fn build_media(prepared: &[PathBuf], caption: &str) -> Vec<InputMedia> {
         .map(|(i, p)| {
             let mut photo = InputMediaPhoto::new(InputFile::file(p));
             if i == 0 && !caption.is_empty() {
-                photo = photo.caption(caption.to_string()).parse_mode(ParseMode::Html);
+                photo = photo
+                    .caption(caption.to_string())
+                    .parse_mode(ParseMode::Html);
             }
             InputMedia::Photo(photo)
         })
@@ -245,7 +255,12 @@ fn build_media(prepared: &[PathBuf], caption: &str) -> Vec<InputMedia> {
 
 /// 发一组图到指定 chat(用于发布到频道)。sendMediaGroup 限 2–10,超出按 10 分批,
 /// 余数 1 张退 sendPhoto。caption 仅置于最前一张。每个请求带限流重试。
-async fn send_group(bot: &Bot, chat: &Recipient, prepared: &[PathBuf], caption: &str) -> Result<()> {
+async fn send_group(
+    bot: &Bot,
+    chat: &Recipient,
+    prepared: &[PathBuf],
+    caption: &str,
+) -> Result<()> {
     if prepared.is_empty() {
         anyhow::bail!("无图可发");
     }
@@ -583,7 +598,11 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
     };
 
     let Some((files_json, caption, msg_json)) = row else {
-        let _ = state.bot.answer_callback_query(q.id).text("该条已失效").await;
+        let _ = state
+            .bot
+            .answer_callback_query(q.id)
+            .text("该条已失效")
+            .await;
         return Ok(());
     };
 
@@ -599,7 +618,11 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
     let _ = state
         .bot
         .answer_callback_query(q.id)
-        .text(if is_ok { "⏳ 发布中…" } else { "❌ 已丢弃" })
+        .text(if is_ok {
+            "⏳ 发布中…"
+        } else {
+            "❌ 已丢弃"
+        })
         .await;
 
     // 后台执行:批准→发频道;然后删私聊整组 + 清文件 + 删 pending。

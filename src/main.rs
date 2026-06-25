@@ -70,8 +70,7 @@ async fn main() -> Result<()> {
     // 手动触发通道:/run 命令经此通知抓取循环立即跑一轮。
     let (trigger_tx, mut trigger_rx) = tokio::sync::mpsc::channel::<()>(8);
     // 手动链接通道:发来的 Pixiv/X 作品链接(含消息 id)经此交抓取循环直发频道。
-    let (link_tx, mut link_rx) =
-        tokio::sync::mpsc::channel::<hanabi::sink::telegram::LinkJob>(16);
+    let (link_tx, mut link_rx) = tokio::sync::mpsc::channel::<hanabi::sink::telegram::LinkJob>(16);
     // 启动审批回调 + 命令/链接轮询任务(与抓取循环并发运行)。
     tokio::spawn(hanabi::sink::telegram::run_review_loop(
         sink.state(),
@@ -99,11 +98,20 @@ async fn main() -> Result<()> {
     // 下载闭包:复用 download_work。x_size 克隆给闭包,原值留给手动链接(handle_link)。
     let gdl_dl = gdl.clone();
     let x_size_dl = x_size.clone();
-    let download =
-        move |item: &MediaItem| -> Vec<PathBuf> { download_work(&gdl_dl, item, x_size_dl.as_deref()) };
+    let download = move |item: &MediaItem| -> Vec<PathBuf> {
+        download_work(&gdl_dl, item, x_size_dl.as_deref())
+    };
 
     // 启动立即跑首轮。
-    if let Err(e) = run_once(&store, &sources, &chain, sink.as_ref() as &dyn Sink, &download).await {
+    if let Err(e) = run_once(
+        &store,
+        &sources,
+        &chain,
+        sink.as_ref() as &dyn Sink,
+        &download,
+    )
+    .await
+    {
         tracing::error!(error = %e, "本轮异常");
     }
     loop {
@@ -112,7 +120,11 @@ async fn main() -> Result<()> {
             .unwrap()
             .as_secs();
         let wait = secs_until_next_slot(cfg.poll_interval_secs, cfg.tz_offset_hours, now_unix);
-        tracing::info!(wait_secs = wait, "下次抓取在 {:.1} 小时后", wait as f64 / 3600.0);
+        tracing::info!(
+            wait_secs = wait,
+            "下次抓取在 {:.1} 小时后",
+            wait as f64 / 3600.0
+        );
         // 整点时间槽到点 / /run 手动触发 → 跑一轮;手动链接 → 直发频道(不跑全量)。
         let do_fetch = tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(wait)) => true,
@@ -135,7 +147,15 @@ async fn main() -> Result<()> {
             }
         };
         if do_fetch {
-            if let Err(e) = run_once(&store, &sources, &chain, sink.as_ref() as &dyn Sink, &download).await {
+            if let Err(e) = run_once(
+                &store,
+                &sources,
+                &chain,
+                sink.as_ref() as &dyn Sink,
+                &download,
+            )
+            .await
+            {
                 tracing::error!(error = %e, "本轮异常");
             }
         }
@@ -182,11 +202,8 @@ async fn handle_link(
             .await;
     } else {
         // 没发出新图:把"抓取中"改成结果提示(不删,便于你知道)。
-        sink.edit_review_text(
-            job.notice_msg_id,
-            "ℹ️ 该链接没有可发布的新图(已发过或无图)",
-        )
-        .await;
+        sink.edit_review_text(job.notice_msg_id, "ℹ️ 该链接没有可发布的新图(已发过或无图)")
+            .await;
     }
     Ok(())
 }

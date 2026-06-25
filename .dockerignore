@@ -1,0 +1,8 @@
+target
+.git
+*.db
+*.sqlite
+config.toml
+gallery-dl.conf
+.env
+docs

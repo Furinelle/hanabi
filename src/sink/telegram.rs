@@ -9,7 +9,8 @@ use rusqlite::OptionalExtension;
 use teloxide::prelude::*;
 use teloxide::types::{
     AllowedUpdate, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
-    InputMedia, InputMediaPhoto, MessageId, ParseMode, Recipient, UpdateKind,
+    InputMedia, InputMediaDocument, InputMediaPhoto, MessageId, MessageOrigin, ParseMode,
+    Recipient, ReplyParameters, UpdateKind,
 };
 use tokio::sync::Mutex;
 
@@ -36,6 +37,17 @@ pub struct LinkJob {
     pub notice_msg_id: i32,
 }
 
+/// 待投递评论区的原图任务:发布到频道后登记,等讨论组 auto-forward 到来时
+/// 把原画质 document reply 进该帖评论区。temp_dir 在投递完成或超时后清理。
+struct CommentJob {
+    originals: Vec<PathBuf>,
+    temp_dir: PathBuf,
+    created_at: i64,
+}
+
+/// 评论区原图任务的兜底保留时长:超时仍未等到 auto-forward 则清临时目录,避免泄漏。
+const COMMENT_TTL_SECS: i64 = 120;
+
 /// 审批状态:由 `TelegramSink`(发审批消息)与 callback 轮询任务共享。
 /// pending 持久化到 sqlite,bot 重启后旧审批消息的按钮仍有效。
 pub struct ReviewState {
@@ -45,6 +57,8 @@ pub struct ReviewState {
     publish_channel: Recipient, // 批准后发布频道
     db: Mutex<rusqlite::Connection>,
     counter: AtomicU64,
+    // 频道帖首条 msg_id → 待投递评论区的原图任务。
+    pending_comments: Mutex<std::collections::HashMap<i32, CommentJob>>,
 }
 
 impl ReviewState {
@@ -126,6 +140,7 @@ impl TelegramSink {
                 publish_channel: to_recipient(publish_channel_id),
                 db: Mutex::new(conn),
                 counter: AtomicU64::new(max_token as u64 + 1),
+                pending_comments: Mutex::new(std::collections::HashMap::new()),
             }),
         })
     }
@@ -143,14 +158,18 @@ impl TelegramSink {
         let caption = render_caption(item);
         let files_owned: Vec<PathBuf> = files.to_vec();
         let prepared = tokio::task::spawn_blocking(move || prepare_all(&files_owned)).await??;
-        send_group(
+        let first_id = send_group(
             &self.state.bot,
             &self.state.publish_channel,
             &prepared,
             &caption,
         )
         .await?;
-        cleanup(files);
+        // 登记原图评论任务,等讨论组 auto-forward 到来再投递;登记则延后清理临时目录。
+        match first_id {
+            Some(mid) => register_comment(&self.state, mid.0, files).await,
+            None => cleanup(files),
+        }
         Ok(())
     }
 
@@ -199,14 +218,12 @@ fn to_recipient(id: String) -> Recipient {
 /// 若 msg 是 `publish_channel` 帖子自动转发到讨论组的那条(评论锚点),返回被转发的
 /// 频道帖 msg_id。频道来源为 `MessageOrigin::Channel`(便捷访问器 forward_from_chat
 /// 只认 Chat 变体、对 Channel 返回 None,故此处直接 match Channel 取 .chat)。
-// 接线在 PR4-T3(run_review_loop 投递评论区);此前仅测试引用,先抑制 dead_code。
-#[allow(dead_code)]
 fn match_auto_forward(msg: &Message, publish_channel: &Recipient) -> Option<i32> {
     if !msg.is_automatic_forward() {
         return None;
     }
     let (from_chat, msg_id) = match msg.forward_origin()? {
-        teloxide::types::MessageOrigin::Channel {
+        MessageOrigin::Channel {
             chat, message_id, ..
         } => (chat, message_id),
         _ => return None,
@@ -221,6 +238,96 @@ fn match_auto_forward(msg: &Message, publish_channel: &Recipient) -> Option<i32>
         Some(msg_id.0)
     } else {
         None
+    }
+}
+
+/// 登记原图评论任务:发布到频道后调用,等讨论组 auto-forward 到来再投递。
+async fn register_comment(state: &Arc<ReviewState>, first_msg_id: i32, originals: &[PathBuf]) {
+    let temp_dir = match originals.first().and_then(|p| p.parent()) {
+        Some(d) => d.to_path_buf(),
+        None => return,
+    };
+    state.pending_comments.lock().await.insert(
+        first_msg_id,
+        CommentJob {
+            originals: originals.to_vec(),
+            temp_dir,
+            created_at: now_secs(),
+        },
+    );
+}
+
+/// 构造 document 图组(原画质,不压缩)。
+fn build_documents(files: &[PathBuf]) -> Vec<InputMedia> {
+    files
+        .iter()
+        .map(|p| InputMedia::Document(InputMediaDocument::new(InputFile::file(p))))
+        .collect()
+}
+
+/// 把原图作为 document 组 reply 到讨论组那条 auto-forward 上(即帖子评论区)。
+/// sendMediaGroup 限 10,超出按 10 分批,每批都 reply 到锚点。
+async fn send_documents_reply(
+    bot: &Bot,
+    chat: &Recipient,
+    files: &[PathBuf],
+    reply_to: MessageId,
+) -> Result<()> {
+    for chunk in files.chunks(10) {
+        if chunk.len() == 1 {
+            tg_retry(|| {
+                bot.send_document(chat.clone(), InputFile::file(&chunk[0]))
+                    .reply_parameters(ReplyParameters::new(reply_to))
+            })
+            .await?;
+        } else {
+            tg_retry(|| {
+                bot.send_media_group(chat.clone(), build_documents(chunk))
+                    .reply_parameters(ReplyParameters::new(reply_to))
+            })
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// 收到匹配的 auto-forward 后投递原图到评论区。取出任务、发送、清临时目录。
+/// 失败也清目录(频道帖 photo 已发出,评论区只是增益,不重试以免泄漏)。
+async fn deliver_comment(state: &Arc<ReviewState>, anchor: &Message, chan_msg_id: i32) {
+    let job = state.pending_comments.lock().await.remove(&chan_msg_id);
+    let Some(job) = job else {
+        return;
+    };
+    let chat = Recipient::Id(anchor.chat.id);
+    if let Err(e) = send_documents_reply(&state.bot, &chat, &job.originals, anchor.id).await {
+        tracing::warn!(error = %e, chan_msg_id, "原图投递评论区失败");
+    } else {
+        tracing::info!(
+            chan_msg_id,
+            n = job.originals.len(),
+            "原图已投递到帖子评论区"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&job.temp_dir);
+}
+
+/// 兜底:清理超时仍未等到 auto-forward 的评论任务(频道没绑讨论组/转发丢失)。
+async fn sweep_expired_comments(state: &Arc<ReviewState>) {
+    let now = now_secs();
+    let expired: Vec<CommentJob> = {
+        let mut map = state.pending_comments.lock().await;
+        let keys: Vec<i32> = map
+            .iter()
+            .filter(|(_, j)| now - j.created_at > COMMENT_TTL_SECS)
+            .map(|(k, _)| *k)
+            .collect();
+        keys.iter().filter_map(|k| map.remove(k)).collect()
+    };
+    for job in &expired {
+        let _ = std::fs::remove_dir_all(&job.temp_dir);
+    }
+    if !expired.is_empty() {
+        tracing::info!(count = expired.len(), "清理超时未投递的评论任务临时目录");
     }
 }
 
@@ -522,6 +629,8 @@ pub async fn run_review_loop(
             cleanup_stale(&state).await;
             last_cleanup = now_secs();
         }
+        // 兜底:清理超时仍未等到 auto-forward 的评论任务(频道没绑讨论组/转发丢失)。
+        sweep_expired_comments(&state).await;
         let updates = state
             .bot
             .get_updates()
@@ -540,7 +649,14 @@ pub async fn run_review_loop(
                             }
                         }
                         UpdateKind::Message(msg) => {
-                            if let Err(e) = handle_command(&state, &msg, &trigger, &link).await {
+                            // 讨论组里的频道帖 auto-forward → 投递原图到评论区,不当命令处理。
+                            if let Some(chan_msg_id) =
+                                match_auto_forward(&msg, &state.publish_channel)
+                            {
+                                deliver_comment(&state, &msg, chan_msg_id).await;
+                            } else if let Err(e) =
+                                handle_command(&state, &msg, &trigger, &link).await
+                            {
                                 tracing::warn!(error = %e, "处理命令失败");
                             }
                         }
@@ -677,17 +793,17 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
     let token: i64 = token_str.parse().unwrap_or(-1);
 
     // 查 pending(不删);db 锁仅在查询期间持有,发送期间不持锁。
-    let row: Option<(String, String, String)> = {
+    let row: Option<(String, String, String, String)> = {
         let db = state.db.lock().await;
         db.query_row(
-            "SELECT files, caption, msg_ids FROM pending WHERE token=?1",
+            "SELECT files, caption, msg_ids, originals FROM pending WHERE token=?1",
             [token],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?
     };
 
-    let Some((files_json, caption, msg_json)) = row else {
+    let Some((files_json, caption, msg_json, originals_json)) = row else {
         let _ = state
             .bot
             .answer_callback_query(q.id)
@@ -697,6 +813,11 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
     };
 
     let files: Vec<PathBuf> = serde_json::from_str::<Vec<String>>(&files_json)?
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    let originals: Vec<PathBuf> = serde_json::from_str::<Vec<String>>(&originals_json)
+        .unwrap_or_default()
         .into_iter()
         .map(PathBuf::from)
         .collect();
@@ -719,27 +840,31 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
     // 失败(如限流)保留 pending,发提示可重点。
     let state = state.clone();
     tokio::spawn(async move {
-        let result: Result<()> = if is_ok {
-            send_group(&state.bot, &state.publish_channel, &files, &caption)
-                .await
-                .map(|_| ())
+        let send_result: Result<Option<MessageId>> = if is_ok {
+            send_group(&state.bot, &state.publish_channel, &files, &caption).await
         } else {
-            Ok(())
+            Ok(None)
         };
-        match result {
-            Ok(_) => {
+        match send_result {
+            Ok(first_id) => {
                 for mid in &msg_ids {
                     let _ = state
                         .bot
                         .delete_message(state.review_chat.clone(), MessageId(*mid))
                         .await;
                 }
-                cleanup(&files);
                 let _ = state
                     .db
                     .lock()
                     .await
                     .execute("DELETE FROM pending WHERE token=?1", [token]);
+                // 批准且拿到首条频道帖 msg_id → 登记原图评论任务(延后清理);否则即时清。
+                match (is_ok, first_id) {
+                    (true, Some(mid)) if !originals.is_empty() => {
+                        register_comment(&state, mid.0, &originals).await;
+                    }
+                    _ => cleanup(&files),
+                }
             }
             Err(e) => {
                 tracing::warn!(error = %e, token, "审批发布失败,pending 保留可重试");

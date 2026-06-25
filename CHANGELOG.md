@@ -7,7 +7,6 @@
 ### 新增
 - **原画质进评论区**：审批通过 / 手动直发后，频道帖照常发压缩大图，**原画质图作为 document 自动投递到该帖评论区**（需频道绑定讨论组、bot 为管理员）；频道未绑讨论组或 120s 未等到自动转发则兜底清理临时文件，不泄漏。
 - **Docker / GHCR 镜像**：多阶段 Dockerfile（alpine musl 静态 + 内置 gallery-dl），打 `v*` tag 自动构建并推送 `ghcr.io/furinelle/hanabi`；README 增 Docker 部署小节。
-- **aarch64 产物**：Release 增 `aarch64-unknown-linux-musl` 静态二进制。
 - **时区可配置**：`tz_offset_hours`（默认 8），整点时间槽不再硬编码 CST。
 
 ### 变更

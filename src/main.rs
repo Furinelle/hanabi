@@ -174,8 +174,14 @@ async fn handle_link(
     // Task1 已加 busy_timeout, 多连接并发安全。
     let store = Store::open("hanabi.db").context("handle_link 打开 Store 失败")?;
     let is_pixiv = job.url.contains("pixiv");
+    // 裸 X 画师主页规整为 /media 子页:否则 gallery-dl 只回 type-6 Queue,probe 解析出 0 张图。
+    let probe_url = if is_pixiv {
+        job.url.clone()
+    } else {
+        hanabi::source::x::normalize_profile_url(&job.url)
+    };
     let g = gdl.clone();
-    let u = job.url.clone();
+    let u = probe_url;
     let val = tokio::task::spawn_blocking(move || g.probe(&u)).await??;
     let items = if is_pixiv {
         hanabi::gallerydl::parse_pixiv(&val, "manual")

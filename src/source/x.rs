@@ -10,6 +10,47 @@ use crate::model::{Author, ImageRef, MediaItem, SourceKind};
 use crate::source::Source;
 use crate::store::Store;
 
+/// 裸 X 画师主页(`x.com/<user>`)→ media 时间线(`/media`,直接出图)。
+/// gallery-dl 对裸主页只回一个 Queue(type 6,指向 /timeline),`-j` 不递归 → 解析出 0 张图;
+/// `/media` 子页直接给 type-3 文件项。其它形态(/status//media//i/lists 等)与非 X 链接原样返回。
+pub fn normalize_profile_url(url: &str) -> String {
+    let rest = match url.split_once("://") {
+        Some((_, r)) => r,
+        None => return url.to_string(),
+    };
+    // 去掉 query/fragment,再按 / 切。
+    let path_part = rest.split(['?', '#']).next().unwrap_or(rest);
+    let mut segs = path_part.split('/');
+    let host = segs.next().unwrap_or("").to_lowercase();
+    let is_x = host == "x.com"
+        || host.ends_with(".x.com")
+        || host == "twitter.com"
+        || host.ends_with(".twitter.com");
+    if !is_x {
+        return url.to_string();
+    }
+    let path_segs: Vec<&str> = segs.filter(|s| !s.is_empty()).collect();
+    // 保留子页/特殊路径,不当用户名处理。
+    const RESERVED: &[&str] = &[
+        "i",
+        "status",
+        "media",
+        "likes",
+        "with_replies",
+        "home",
+        "search",
+        "explore",
+        "notifications",
+        "messages",
+        "settings",
+        "hashtag",
+    ];
+    if path_segs.len() == 1 && !RESERVED.contains(&path_segs[0]) {
+        return format!("https://x.com/{}/media", path_segs[0]);
+    }
+    url.to_string()
+}
+
 /// 下载时把图片尺寸设为最高画质(size=orig)。
 pub fn download_extra(size: Option<&str>) -> Vec<String> {
     match size {
@@ -136,5 +177,40 @@ impl Source for XSource {
             out.extend(parse_twitter(&val, &origin));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_profile_url;
+
+    #[test]
+    fn bare_profile_becomes_media() {
+        assert_eq!(
+            normalize_profile_url("https://x.com/misonyeo_s2_?s=21"),
+            "https://x.com/misonyeo_s2_/media"
+        );
+        assert_eq!(
+            normalize_profile_url("https://x.com/chiyuran"),
+            "https://x.com/chiyuran/media"
+        );
+        assert_eq!(
+            normalize_profile_url("https://twitter.com/someone"),
+            "https://x.com/someone/media"
+        );
+    }
+
+    #[test]
+    fn non_bare_and_non_x_unchanged() {
+        // 单作品 / 已是 media / list / 非 X 一律原样。
+        for u in [
+            "https://x.com/user/status/123",
+            "https://x.com/user/media",
+            "https://x.com/i/lists/42",
+            "https://www.pixiv.net/users/555",
+            "https://example.com/foo",
+        ] {
+            assert_eq!(normalize_profile_url(u), u);
+        }
     }
 }

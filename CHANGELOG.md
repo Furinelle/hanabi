@@ -2,6 +2,14 @@
 
 本项目所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.4.3] - 2026-06-25
+
+### 修复
+- **手动 pixiv 画师主页抓不到**：同 X 主页问题——裸 pixiv 主页（`pixiv.net/users/<id>`）`-j` 只返回一个 type-6 Queue（指向 `/artworks`），解析出 0 张。修复：探测前用 `pixiv::normalize_profile_url` 规整为 `/artworks` 子页。
+
+### 新增
+- **AI 生成标签**：pixiv `illust_ai_type==2` 的作品在 caption 标签首位加 `#AI生成`（X 无 AI 标记字段，不适用）。
+
 ## [0.4.2] - 2026-06-25
 
 ### 修复

@@ -82,13 +82,19 @@ impl TelegramSink {
                 files      TEXT NOT NULL,
                 caption    TEXT NOT NULL,
                 msg_ids    TEXT NOT NULL,
+                originals  TEXT NOT NULL DEFAULT '[]',
                 created_at INTEGER NOT NULL DEFAULT 0
              );",
         )
         .context("初始化 pending 表失败")?;
-        // 兼容旧库(无 created_at 列):补列,已存在则忽略报错。
+        // 兼容旧库:补列,已存在则忽略报错。
         let _ = conn.execute(
             "ALTER TABLE pending ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        // originals: 原始(缩放前)文件路径, 审批通过后把原图发进频道帖评论区。
+        let _ = conn.execute(
+            "ALTER TABLE pending ADD COLUMN originals TEXT NOT NULL DEFAULT '[]'",
             [],
         );
         // counter 从已有最大 token 续上,避免重启后 token 与旧记录冲突。
@@ -288,23 +294,25 @@ async fn send_group(
     chat: &Recipient,
     prepared: &[PathBuf],
     caption: &str,
-) -> Result<()> {
+) -> Result<Option<MessageId>> {
     if prepared.is_empty() {
         anyhow::bail!("无图可发");
     }
     if prepared.len() == 1 {
-        tg_retry(|| {
+        let m = tg_retry(|| {
             bot.send_photo(chat.clone(), InputFile::file(&prepared[0]))
                 .caption(caption.to_string())
                 .parse_mode(ParseMode::Html)
         })
         .await?;
-        return Ok(());
+        return Ok(Some(m.id));
     }
+    // 记首条帖 msg_id:用于评论区把原图 reply 到该帖的 auto-forward 上。
+    let mut first_id: Option<MessageId> = None;
     for (ci, chunk) in prepared.chunks(10).enumerate() {
         let cap = if ci == 0 { caption } else { "" };
         if chunk.len() == 1 {
-            tg_retry(|| {
+            let m = tg_retry(|| {
                 let req = bot.send_photo(chat.clone(), InputFile::file(&chunk[0]));
                 if ci == 0 {
                     req.caption(cap.to_string()).parse_mode(ParseMode::Html)
@@ -313,11 +321,16 @@ async fn send_group(
                 }
             })
             .await?;
+            first_id.get_or_insert(m.id);
         } else {
-            tg_retry(|| bot.send_media_group(chat.clone(), build_media(chunk, cap))).await?;
+            let msgs =
+                tg_retry(|| bot.send_media_group(chat.clone(), build_media(chunk, cap))).await?;
+            if let Some(m) = msgs.first() {
+                first_id.get_or_insert(m.id);
+            }
         }
     }
-    Ok(())
+    Ok(first_id)
 }
 
 /// 清理某作品的临时目录(原图 + 缩放图同处一目录)。
@@ -423,6 +436,8 @@ impl Sink for TelegramSink {
         }
         let caption = render_caption(item);
         let files_owned: Vec<PathBuf> = files.to_vec();
+        // 原始(缩放前)路径:审批通过后发原画质 document 进频道帖评论区(发 photo 用缩放版)。
+        let originals: Vec<PathBuf> = files.to_vec();
 
         // 全套图缩放(CPU 阻塞,放 blocking 线程);审批需要看到全部,批准后直接复用。
         let prepared = tokio::task::spawn_blocking(move || prepare_all(&files_owned)).await??;
@@ -467,13 +482,18 @@ impl Sink for TelegramSink {
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         let msg_ids: Vec<i32> = review_ids.iter().map(|m| m.0).collect();
+        let originals_str: Vec<String> = originals
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         let files_json = serde_json::to_string(&files_str)?;
         let msg_json = serde_json::to_string(&msg_ids)?;
+        let originals_json = serde_json::to_string(&originals_str)?;
         {
             let db = self.state.db.lock().await;
             db.execute(
-                "INSERT OR REPLACE INTO pending(token, files, caption, msg_ids, created_at) VALUES(?1,?2,?3,?4,?5)",
-                rusqlite::params![token as i64, files_json, caption, msg_json, now_secs()],
+                "INSERT OR REPLACE INTO pending(token, files, caption, msg_ids, originals, created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+                rusqlite::params![token as i64, files_json, caption, msg_json, originals_json, now_secs()],
             )?;
         }
         Ok(())
@@ -700,7 +720,9 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
     let state = state.clone();
     tokio::spawn(async move {
         let result: Result<()> = if is_ok {
-            send_group(&state.bot, &state.publish_channel, &files, &caption).await
+            send_group(&state.bot, &state.publish_channel, &files, &caption)
+                .await
+                .map(|_| ())
         } else {
             Ok(())
         };
@@ -790,6 +812,28 @@ mod tests {
         assert!(extract_supported_url("/run").is_none());
         assert!(extract_supported_url("https://example.com/a").is_none());
         assert!(extract_supported_url("随便聊聊").is_none());
+    }
+
+    #[test]
+    fn pending_table_has_originals_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.db");
+        let _sink = TelegramSink::new(
+            "123:abc".into(),
+            "7794592020".into(),
+            "@chan".into(),
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('pending')")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(cols.contains(&"originals".to_string()));
     }
 
     #[test]

@@ -1,5 +1,7 @@
 /target
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
 config.toml
 gallery-dl.conf

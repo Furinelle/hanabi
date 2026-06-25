@@ -571,13 +571,55 @@ async fn handle_command(
     Ok(())
 }
 
-/// 从消息文本中提取受支持的作品链接(Pixiv / X / Twitter)。
+/// 链接粒度:单作品(直发频道) / 多作品(主页/榜单/list,走审批流)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkKind {
+    Single,
+    Multi,
+}
+
+/// 取 http(s) URL 的 host(小写)。无 scheme 或畸形返回 None。
+fn url_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.split('@').next_back().unwrap_or(host); // 去掉 userinfo
+    let host = host.split(':').next().unwrap_or(host); // 去掉端口
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_lowercase())
+    }
+}
+
+/// host 是否属于受支持站点(精确后缀匹配, 防 evil.com/pixiv.net 子串伪装)。
+fn supported_host(url: &str) -> bool {
+    matches!(url_host(url), Some(h)
+        if h == "pixiv.net" || h.ends_with(".pixiv.net")
+        || h == "x.com" || h.ends_with(".x.com")
+        || h == "twitter.com" || h.ends_with(".twitter.com"))
+}
+
+/// 受支持站点的单/多作品分类;非受支持站点返回 None。
+pub fn classify_link(url: &str) -> Option<LinkKind> {
+    if !supported_host(url) {
+        return None;
+    }
+    let is_single = url.contains("/artworks/") // pixiv 单作品
+        || url.contains("/status/") // x/twitter 单推
+        || url.contains("pixiv.net/i/"); // pixiv 短链单作品
+    Some(if is_single {
+        LinkKind::Single
+    } else {
+        LinkKind::Multi
+    })
+}
+
+/// 从消息文本中提取首个受支持作品链接(host 精确判定)。
 fn extract_supported_url(text: &str) -> Option<String> {
     text.split_whitespace()
-        .find(|w| {
-            w.starts_with("http")
-                && (w.contains("pixiv.net") || w.contains("x.com") || w.contains("twitter.com"))
-        })
+        .find(|w| w.starts_with("http") && classify_link(w).is_some())
         .map(|s| s.to_string())
 }
 
@@ -720,5 +762,40 @@ mod tests {
         assert!(extract_supported_url("/run").is_none());
         assert!(extract_supported_url("https://example.com/a").is_none());
         assert!(extract_supported_url("随便聊聊").is_none());
+    }
+
+    #[test]
+    fn classify_single_vs_multi() {
+        assert_eq!(
+            classify_link("https://www.pixiv.net/artworks/123"),
+            Some(LinkKind::Single)
+        );
+        assert_eq!(
+            classify_link("https://www.pixiv.net/i/123"),
+            Some(LinkKind::Single)
+        );
+        assert_eq!(
+            classify_link("https://x.com/user/status/9"),
+            Some(LinkKind::Single)
+        );
+        assert_eq!(
+            classify_link("https://twitter.com/u/status/7"),
+            Some(LinkKind::Single)
+        );
+        assert_eq!(
+            classify_link("https://www.pixiv.net/users/555"),
+            Some(LinkKind::Multi)
+        );
+        assert_eq!(
+            classify_link("https://www.pixiv.net/ranking.php?mode=weekly"),
+            Some(LinkKind::Multi)
+        );
+        assert_eq!(
+            classify_link("https://x.com/i/lists/42"),
+            Some(LinkKind::Multi)
+        );
+        // 子串伪装域名被 host 判定挡掉。
+        assert_eq!(classify_link("https://evil.com/pixiv.net/artworks/1"), None);
+        assert_eq!(classify_link("https://example.com/a"), None);
     }
 }

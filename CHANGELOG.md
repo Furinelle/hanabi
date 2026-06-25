@@ -2,6 +2,27 @@
 
 本项目所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.4.0] - 2026-06-25
+
+### 新增
+- **原画质进评论区**：审批通过 / 手动直发后，频道帖照常发压缩大图，**原画质图作为 document 自动投递到该帖评论区**（需频道绑定讨论组、bot 为管理员）；频道未绑讨论组或 120s 未等到自动转发则兜底清理临时文件，不泄漏。
+- **Docker / GHCR 镜像**：多阶段 Dockerfile（alpine musl 静态 + 内置 gallery-dl），打 `v*` tag 自动构建并推送 `ghcr.io/furinelle/hanabi`；README 增 Docker 部署小节。
+- **aarch64 产物**：Release 增 `aarch64-unknown-linux-musl` 静态二进制。
+- **时区可配置**：`tz_offset_hours`（默认 8），整点时间槽不再硬编码 CST。
+
+### 变更
+- **手动链接分流**：单作品链接（`artworks/` `status/`）直发频道；画师主页 / 榜单 / list 等多作品链接改走**审批流**逐个过按钮。链接识别改 **host 精确判定**，防 `evil.com/pixiv.net` 子串伪装。
+- **缩放保原格式**：超限图缩放后保留原格式与 PNG alpha 通道，不再强转 RGB JPG。
+
+### 修复
+- **并发写锁**：Store 连接启用 WAL + `busy_timeout`，消除抓取循环与审批任务并发写 `hanabi.db` 的 "database is locked"。
+- **owner 静默失败**：`channel_id` 配成非数字 id 时显式 `error` 告警（此前会静默忽略所有命令/链接）。
+- **资源泄漏**：`cleanup_stale` 周期化（每 6h），常驻不重启实例也能清过期 pending 与孤儿临时目录。
+- **慢链接阻塞调度**：`handle_link` 移入独立 task，慢链接不再卡定时槽与 `/run`。
+
+### 其他
+- 删除死依赖 `thiserror`；clippy 清零（`is_some_and` / `#[allow(deprecated)]` 保留 musl DNS 命脉 `trust_dns`）；CI 增 clippy/fmt lint job 与 push/PR 触发。
+
 ## [0.3.1] - 2026-06-10
 
 ### 变更

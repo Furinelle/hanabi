@@ -182,6 +182,33 @@ async fn handle_link(
     } else {
         hanabi::source::x::parse_twitter(&val, "manual")
     };
+
+    // 多作品链接(画师主页/榜单/list): 逐个下载后进审批私聊, 不直发频道。
+    use hanabi::sink::telegram::{classify_link, LinkKind};
+    if classify_link(&job.url) == Some(LinkKind::Multi) {
+        let mut queued = 0;
+        for item in &items {
+            if store.already_pushed(item)? {
+                continue;
+            }
+            let files = download_work(gdl, item, x_size);
+            if files.is_empty() {
+                continue;
+            }
+            if sink.deliver(item, &files).await.is_ok() {
+                let _ = store.mark_pushed(item);
+                queued += 1;
+            }
+        }
+        sink.edit_review_text(
+            job.notice_msg_id,
+            &format!("📥 已转 {queued} 个作品进审批,请在审批消息上点按钮"),
+        )
+        .await;
+        return Ok(());
+    }
+
+    // 单作品链接: 直发频道(跳过审批,手动=已选定)。
     let mut published = 0;
     for item in &items {
         if store.already_pushed(item)? {

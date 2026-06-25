@@ -506,7 +506,6 @@ dependencies = [
  "serde_json",
  "teloxide",
  "tempfile",
- "thiserror",
  "tokio",
  "toml",
  "tracing",

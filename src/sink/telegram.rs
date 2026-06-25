@@ -101,6 +101,9 @@ impl TelegramSink {
         // - connect_timeout(15):连接阶段超时,短一些好快速失败重试。
         // - trust_dns(true):纯 Rust DNS,避开 musl 静态二进制 getaddrinfo 解析失败
         //   (reqwest 0.11 光开 feature 不够,必须显式调用此方法)。
+        // trust_dns 已 deprecated 但保留:它是 musl 静态二进制 DNS 解析的命脉
+        // (reqwest 0.11 仅开 feature 不够,必须显式调用),不为消 lint 冒险换 hickory_dns。
+        #[allow(deprecated)]
         let client = teloxide::net::default_reqwest_settings()
             .timeout(std::time::Duration::from_secs(300))
             .connect_timeout(std::time::Duration::from_secs(15))
@@ -355,7 +358,7 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
             let is_hanabi = p
                 .file_name()
                 .and_then(|n| n.to_str())
-                .map_or(false, |n| n.starts_with("hanabi_"));
+                .is_some_and(|n| n.starts_with("hanabi_"));
             if is_hanabi && p.is_dir() && !referenced.contains(&p) {
                 let _ = std::fs::remove_dir_all(&p);
                 orphans += 1;
@@ -650,7 +653,6 @@ mod tests {
 
     #[test]
     fn prepare_preserves_png_alpha_when_downscaling() {
-        use image::GenericImageView;
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("big.png");
         // 9000x2000 RGBA(宽+高>10000 触发缩放), 半透明像素。

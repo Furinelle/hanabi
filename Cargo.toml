@@ -12,7 +12,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 anyhow = "1"
-thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 # 精简解码器,去掉 avif(ravif)/exr 等 C 依赖,musl 编译更顺;够处理 pixiv/x 下载图

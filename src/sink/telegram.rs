@@ -64,7 +64,16 @@ impl TelegramSink {
         publish_channel_id: String,
         db_path: &str,
     ) -> Result<Self> {
-        let owner: i64 = review_chat_id.parse().unwrap_or(0);
+        let owner: i64 = match parse_owner(&review_chat_id) {
+            Some(n) => n,
+            None => {
+                tracing::error!(
+                    channel_id = %review_chat_id,
+                    "channel_id 非数字 id, 命令/链接功能将无法响应(owner 校验恒不匹配); 请改用数字私聊 id"
+                );
+                0
+            }
+        };
         let conn = rusqlite::Connection::open(db_path).context("打开 pending 数据库失败")?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -151,6 +160,11 @@ impl TelegramSink {
             )
             .await;
     }
+}
+
+/// 解析审批私聊数字 id。非数字(如 @username)返回 None —— 命令/链接功能要求数字 id。
+fn parse_owner(review_chat_id: &str) -> Option<i64> {
+    review_chat_id.parse::<i64>().ok()
 }
 
 fn to_recipient(id: String) -> Recipient {
@@ -612,6 +626,13 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_owner_numeric_only() {
+        assert_eq!(parse_owner("7794592020"), Some(7794592020));
+        assert_eq!(parse_owner("@my_channel"), None);
+        assert_eq!(parse_owner(""), None);
+    }
 
     #[test]
     fn extract_url_recognizes_pixiv_and_x() {

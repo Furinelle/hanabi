@@ -36,6 +36,7 @@ fn download_work(gdl: &GalleryDl, item: &MediaItem, x_size: Option<&str>) -> Vec
     let extra = match item.source {
         SourceKind::X => download_extra(x_size),
         SourceKind::Pixiv => vec![],
+        SourceKind::Douyin => vec![], // 抖音不走 gallery-dl 下载,见 handle_douyin
     };
     gdl.download(&item.url, &dir, &extra).unwrap_or_else(|e| {
         tracing::warn!(id = %item.source_id, error = %e, "gallery-dl 下载失败");
@@ -170,6 +171,10 @@ async fn handle_link(
     x_size: Option<&str>,
     sink: &TelegramSink,
 ) -> Result<()> {
+    // 抖音:gallery-dl 不支持,走独立的 reqwest 解析路径(直发频道,同单作品)。
+    if hanabi::source::douyin::is_douyin_url(&job.url) {
+        return handle_douyin(job, sink).await;
+    }
     // 自开 Store 连接:Store 持 rusqlite::Connection(!Sync)不能跨 spawn 共享;
     // Task1 已加 busy_timeout, 多连接并发安全。
     let store = Store::open("hanabi.db").context("handle_link 打开 Store 失败")?;
@@ -227,6 +232,39 @@ async fn handle_link(
     // 处理完(无论是否发出新图):删用户链接消息 + "抓取中"提示,保持私聊干净。
     sink.delete_review_messages(&[job.user_msg_id, job.notice_msg_id])
         .await;
+    Ok(())
+}
+
+/// 处理抖音图文链接:reqwest 抓分享页 → 解析 → 下原图(无水印)→ 直发频道。
+async fn handle_douyin(job: hanabi::sink::telegram::LinkJob, sink: &TelegramSink) -> Result<()> {
+    use hanabi::source::douyin;
+    let store = Store::open("hanabi.db").context("handle_douyin 打开 Store 失败")?;
+    let client = douyin::build_client()?;
+    match douyin::fetch_note(&client, &job.url, "manual").await {
+        Ok(item) => {
+            if store.already_pushed(&item)? {
+                tracing::info!(id = %item.source_id, "抖音作品已发过,跳过");
+            } else {
+                let dir = std::env::temp_dir().join(format!("hanabi_douyin_{}", item.source_id));
+                let files = douyin::download_images(&client, &item, &dir).await;
+                if files.is_empty() {
+                    tracing::warn!(id = %item.source_id, "抖音图片全部下载失败");
+                } else {
+                    sink.publish_direct(&item, &files).await?;
+                    let _ = store.mark_pushed(&item);
+                }
+            }
+            // 处理完:删链接消息 + "抓取中"提示。
+            sink.delete_review_messages(&[job.user_msg_id, job.notice_msg_id])
+                .await;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "抖音解析失败");
+            sink.delete_review_messages(&[job.user_msg_id]).await;
+            sink.edit_review_text(job.notice_msg_id, "ℹ️ 抖音解析失败(可能改版或需验证)")
+                .await;
+        }
+    }
     Ok(())
 }
 

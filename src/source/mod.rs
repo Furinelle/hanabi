@@ -1,3 +1,4 @@
+pub mod douyin;
 pub mod pixiv;
 pub mod x;
 

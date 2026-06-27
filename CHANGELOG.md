@@ -2,6 +2,14 @@
 
 本项目所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.5.0] - 2026-06-28
+
+### 新增
+- **抖音图文支持**：私聊发抖音分享链接（短链 `v.douyin.com`，或从「复制打开抖音…」整段分享文本里自动提取链接），bot 解析图文作品、下载**无水印原图**（`url_list` 的 `tplv-dy-aweme-images` 全分辨率，非带水印的 `download_url_list`）直发频道。caption：`Tag` + `From 抖音(note链接) By 作者(主页链接)`。
+  - 免签名路线：移动端 UA 跟随短链 → note 页 → 抠 `window._ROUTER_DATA` JSON（对标 versenilvis/douyin-downloader）；gallery-dl 不支持抖音，故用 reqwest 独立实现。
+  - webp 原图转 jpg(q92) 发送（Telegram sendPhoto 对 webp 不友好）。
+  - 比 pixiv/x 脆：抖音改 `_ROUTER_DATA` 结构或加验证墙时解析会失败，bot 给「抖音解析失败」提示。
+
 ## [0.4.5] - 2026-06-25
 
 ### 新增

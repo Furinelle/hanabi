@@ -40,6 +40,7 @@ impl Filter for ScoreThreshold {
         let min = match item.source {
             SourceKind::Pixiv => cfg.min_bookmarks,
             SourceKind::X => cfg.min_likes,
+            SourceKind::Douyin => None, // 抖音仅手动链接(绕过过滤),无分数阈值
         };
         match min {
             Some(m) => item.bookmark_count.is_some_and(|s| s >= m),

@@ -1,6 +1,6 @@
 [package]
 name = "hanabi"
-version = "0.4.5"
+version = "0.5.0"
 edition = "2021"
 
 [dependencies]
@@ -20,7 +20,8 @@ async-trait = "0.1"
 # 启用 reqwest 的 trust-dns(纯 Rust DNS),绕开 musl 静态二进制 getaddrinfo 的坑。
 # 必须匹配 teloxide 0.13 实际用的 reqwest 0.11(0.11 的 feature 名是 trust-dns),
 # 同版本 cargo 才会 unify,把 DNS 解析器合并进 teloxide 内部的 reqwest。
-reqwest = { version = "0.11", default-features = false, features = ["trust-dns"] }
+# rustls-tls:抖音抓取用独立 reqwest client 直接发 https,显式带 TLS 不依赖 unify。
+reqwest = { version = "0.11", default-features = false, features = ["trust-dns", "rustls-tls"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -790,10 +790,13 @@ pub fn classify_link(url: &str) -> Option<LinkKind> {
     })
 }
 
-/// 从消息文本中提取首个受支持作品链接(host 精确判定)。
+/// 从消息文本中提取首个受支持作品链接(host 精确判定)。pixiv/x/抖音。
 fn extract_supported_url(text: &str) -> Option<String> {
     text.split_whitespace()
-        .find(|w| w.starts_with("http") && classify_link(w).is_some())
+        .find(|w| {
+            w.starts_with("http")
+                && (classify_link(w).is_some() || crate::source::douyin::is_douyin_url(w))
+        })
         .map(|s| s.to_string())
 }
 

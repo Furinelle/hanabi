@@ -53,6 +53,7 @@ pub fn render_caption(item: &MediaItem) -> String {
     let src = match item.source {
         crate::model::SourceKind::Pixiv => "Pixiv",
         crate::model::SourceKind::X => "X",
+        crate::model::SourceKind::Douyin => "抖音",
     };
     s.push_str(&format!(
         "From <a href=\"{}\">{}</a> By <a href=\"{}\">{}</a>",

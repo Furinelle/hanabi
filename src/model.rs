@@ -2,6 +2,7 @@
 pub enum SourceKind {
     Pixiv,
     X,
+    Douyin,
 }
 
 impl SourceKind {
@@ -9,6 +10,7 @@ impl SourceKind {
         match self {
             SourceKind::Pixiv => "pixiv",
             SourceKind::X => "x",
+            SourceKind::Douyin => "douyin",
         }
     }
 }

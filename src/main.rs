@@ -207,11 +207,15 @@ async fn handle_link(
                 queued += 1;
             }
         }
-        sink.edit_review_text(
-            job.notice_msg_id,
-            &format!("📥 已转 {queued} 个作品进审批,请在审批消息上点按钮"),
-        )
-        .await;
+        if queued > 0 {
+            // 有作品进审批:删掉链接消息 + "抓取中"提示,私聊只留待审消息(同单作品流程)。
+            sink.delete_review_messages(&[job.user_msg_id, job.notice_msg_id])
+                .await;
+        } else {
+            // 没有可转审批的新作品:把提示改成结果说明(不删,便于知晓)。
+            sink.edit_review_text(job.notice_msg_id, "ℹ️ 没有可转审批的新作品(已发过或无图)")
+                .await;
+        }
         return Ok(());
     }
 

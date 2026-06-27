@@ -163,6 +163,7 @@ impl TelegramSink {
             &self.state.publish_channel,
             &prepared,
             &caption,
+            item.is_r18, // R18 → 频道帖打剧透遮罩
         )
         .await?;
         // 登记原图评论任务,等讨论组 auto-forward 到来再投递;登记则延后清理临时目录。
@@ -377,13 +378,16 @@ fn prepare_all(files: &[PathBuf]) -> Result<Vec<PathBuf>> {
     files.iter().map(|p| prepare(p)).collect()
 }
 
-/// 构造图组:第一张挂 caption,其余无。
-fn build_media(prepared: &[PathBuf], caption: &str) -> Vec<InputMedia> {
+/// 构造图组:第一张挂 caption,其余无。spoiler=true 时整组打剧透遮罩(R18)。
+fn build_media(prepared: &[PathBuf], caption: &str, spoiler: bool) -> Vec<InputMedia> {
     prepared
         .iter()
         .enumerate()
         .map(|(i, p)| {
             let mut photo = InputMediaPhoto::new(InputFile::file(p));
+            if spoiler {
+                photo = photo.spoiler();
+            }
             if i == 0 && !caption.is_empty() {
                 photo = photo
                     .caption(caption.to_string())
@@ -401,6 +405,7 @@ async fn send_group(
     chat: &Recipient,
     prepared: &[PathBuf],
     caption: &str,
+    spoiler: bool,
 ) -> Result<Option<MessageId>> {
     if prepared.is_empty() {
         anyhow::bail!("无图可发");
@@ -410,6 +415,7 @@ async fn send_group(
             bot.send_photo(chat.clone(), InputFile::file(&prepared[0]))
                 .caption(caption.to_string())
                 .parse_mode(ParseMode::Html)
+                .has_spoiler(spoiler)
         })
         .await?;
         return Ok(Some(m.id));
@@ -420,7 +426,9 @@ async fn send_group(
         let cap = if ci == 0 { caption } else { "" };
         if chunk.len() == 1 {
             let m = tg_retry(|| {
-                let req = bot.send_photo(chat.clone(), InputFile::file(&chunk[0]));
+                let req = bot
+                    .send_photo(chat.clone(), InputFile::file(&chunk[0]))
+                    .has_spoiler(spoiler);
                 if ci == 0 {
                     req.caption(cap.to_string()).parse_mode(ParseMode::Html)
                 } else {
@@ -431,7 +439,8 @@ async fn send_group(
             first_id.get_or_insert(m.id);
         } else {
             let msgs =
-                tg_retry(|| bot.send_media_group(chat.clone(), build_media(chunk, cap))).await?;
+                tg_retry(|| bot.send_media_group(chat.clone(), build_media(chunk, cap, spoiler)))
+                    .await?;
             if let Some(m) = msgs.first() {
                 first_id.get_or_insert(m.id);
             }
@@ -571,9 +580,10 @@ impl Sink for TelegramSink {
             review_ids.push(msg.id);
         } else {
             let first_cap = format!("【待审 · 共 {n} 张】\n{caption}");
-            let msgs =
-                tg_retry(|| bot.send_media_group(chat.clone(), build_media(&prepared, &first_cap)))
-                    .await?;
+            let msgs = tg_retry(|| {
+                bot.send_media_group(chat.clone(), build_media(&prepared, &first_cap, false))
+            })
+            .await?;
             review_ids.extend(msgs.iter().map(|m| m.id));
             let ctrl = tg_retry(|| {
                 bot.send_message(chat.clone(), format!("👆 上面 {n} 张,请审批"))
@@ -840,8 +850,17 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
     // 失败(如限流)保留 pending,发提示可重点。
     let state = state.clone();
     tokio::spawn(async move {
+        // R18 → 频道帖打剧透遮罩;caption 由 render_caption 生成,R18 时以 🔞 R18 起头。
+        let spoiler = caption.contains("🔞 R18");
         let send_result: Result<Option<MessageId>> = if is_ok {
-            send_group(&state.bot, &state.publish_channel, &files, &caption).await
+            send_group(
+                &state.bot,
+                &state.publish_channel,
+                &files,
+                &caption,
+                spoiler,
+            )
+            .await
         } else {
             Ok(None)
         };

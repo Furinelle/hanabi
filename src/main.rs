@@ -193,7 +193,6 @@ async fn handle_link(
     // 多作品链接(画师主页/榜单/list): 逐个下载后进审批私聊, 不直发频道。
     use hanabi::sink::telegram::{classify_link, LinkKind};
     if classify_link(&job.url) == Some(LinkKind::Multi) {
-        let mut queued = 0;
         for item in &items {
             if store.already_pushed(item)? {
                 continue;
@@ -204,23 +203,15 @@ async fn handle_link(
             }
             if sink.deliver(item, &files).await.is_ok() {
                 let _ = store.mark_pushed(item);
-                queued += 1;
             }
         }
-        if queued > 0 {
-            // 有作品进审批:删掉链接消息 + "抓取中"提示,私聊只留待审消息(同单作品流程)。
-            sink.delete_review_messages(&[job.user_msg_id, job.notice_msg_id])
-                .await;
-        } else {
-            // 没有可转审批的新作品:把提示改成结果说明(不删,便于知晓)。
-            sink.edit_review_text(job.notice_msg_id, "ℹ️ 没有可转审批的新作品(已发过或无图)")
-                .await;
-        }
+        // 处理完:删链接消息 + "抓取中"提示,私聊只留待审消息(若有)。
+        sink.delete_review_messages(&[job.user_msg_id, job.notice_msg_id])
+            .await;
         return Ok(());
     }
 
     // 单作品链接: 直发频道(跳过审批,手动=已选定)。
-    let mut published = 0;
     for item in &items {
         if store.already_pushed(item)? {
             tracing::info!(id = %item.source_id, "手动链接作品已发过,跳过");
@@ -232,17 +223,10 @@ async fn handle_link(
         }
         sink.publish_direct(item, &files).await?;
         let _ = store.mark_pushed(item);
-        published += 1;
     }
-    if published > 0 {
-        // 发布成功:删用户链接消息 + "抓取中"提示,保持私聊干净。
-        sink.delete_review_messages(&[job.user_msg_id, job.notice_msg_id])
-            .await;
-    } else {
-        // 没发出新图:把"抓取中"改成结果提示(不删,便于你知道)。
-        sink.edit_review_text(job.notice_msg_id, "ℹ️ 该链接没有可发布的新图(已发过或无图)")
-            .await;
-    }
+    // 处理完(无论是否发出新图):删用户链接消息 + "抓取中"提示,保持私聊干净。
+    sink.delete_review_messages(&[job.user_msg_id, job.notice_msg_id])
+        .await;
     Ok(())
 }
 

@@ -14,7 +14,8 @@
 - 🖼️ **人工审批**：作品先发审批私聊（单图直发 / 多图整组 + 控制消息），附 `✅ 发送到频道` `❌ 丢弃` 按钮；点击后整组消息自动删除
 - 🪄 **原画质进评论区**：批准/直发后，频道帖发压缩大图，**原画质图作为文件自动投递到该帖评论区**（需频道绑定讨论组、bot 为管理员）；未绑定时自动降级，120s 兜底清理
 - ♻️ **自动去重**：sqlite 记录，进过审批的作品永不重复出现
-- 🔞 **R18 标记**：敏感内容（Pixiv `x_restrict` / X `sensitive`）进审批并标 🔞，由你人工决定
+- 🔞 **R18 处理**：敏感内容（Pixiv `x_restrict` / X `sensitive`）进审批标 🔞 由你人工决定；发布到频道时图片加**剧透遮罩**（spoiler，点开才显示），审批私聊不打码便于审
+- 🤖 **AI 生成标签**：Pixiv `illust_ai_type==2` 的作品 caption 标签首位自动加 `#AI生成`
 - 🎯 **分源过滤**：R18 / 收藏数 / 点赞数 / 标签白名单 / 只插画 / 页数上限
 - ⌨️ **命令控制**：`/run` 手动抓一轮、`/status`、`/ping`、`/help`
 - ⏰ **定时轮询**：`poll_interval_secs` 可配（如一天三次 = 28800），`tz_offset_hours` 可配时区（默认 +8）
@@ -44,8 +45,8 @@ poll_interval_secs = 28800   # 一天三次
 tz_offset_hours = 8          # 整点时间槽所用时区（默认 +8，可选）
 
 [telegram]
-channel_id = "7794592020"           # 审批私聊（作品先发这里）
-publish_channel = "@FurinaDeCanvas" # 批准后发布的频道（绑定讨论组后，原图自动进帖子评论区）
+channel_id = "<你的私聊 chat_id>"     # 审批私聊（作品先发这里）
+publish_channel = "@your_channel"   # 批准后发布的频道（绑定讨论组后，原图自动进帖子评论区）
 
 [gallery_dl]
 probe_range = "1-50"
@@ -112,10 +113,10 @@ bot 启动后：抓取循环按 `poll_interval_secs` 定时跑，审批回调任
 
 caption 格式：
 ```
-🔞 R18              （仅敏感内容）
+🔞 R18                       （仅敏感内容，发频道时图片打剧透遮罩）
 Title: 标题
-Tag: #标签 #标签
-From <Pixiv|X>(作品链接) By 作者名(作者链接)
+Tag: #AI生成 #标签 #标签       （#AI生成 仅 Pixiv illust_ai_type==2 时首位添加）
+From <Pixiv|X|抖音>(作品链接) By 作者名(作者链接)
 ```
 
 ## 部署

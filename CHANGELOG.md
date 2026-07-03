@@ -2,6 +2,11 @@
 
 本项目所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.5.1] - 2026-07-03
+
+### 修复
+- **图片超 Telegram photo 硬上限时退化为 document 发送**：缩放（`prepare`）按 10MB 预判触发，但高细节/透明 PNG 缩放后字节数仍可能超过 Telegram 实测硬上限（10485760 字节），此前会导致 `sendPhoto` 报错、投递无限重试卡死。album 不允许 photo/document 混投，组内任一文件超限即整组退化为 `sendDocument`（审批投递与发布到频道均覆盖），R18 剧透遮罩随之自然丢失（document 不支持）。
+
 ## [0.5.0] - 2026-06-28
 
 ### 新增

@@ -266,6 +266,32 @@ fn build_documents(files: &[PathBuf]) -> Vec<InputMedia> {
         .collect()
 }
 
+/// 构造 document 图组并挂 caption(第一张挂,其余无)。用于超限退化发送场景,
+/// 需要保留原 caption 但不再走 sendPhoto。
+fn build_documents_with_caption(files: &[PathBuf], caption: &str) -> Vec<InputMedia> {
+    files
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let mut doc = InputMediaDocument::new(InputFile::file(p));
+            if i == 0 && !caption.is_empty() {
+                doc = doc.caption(caption.to_string()).parse_mode(ParseMode::Html);
+            }
+            InputMedia::Document(doc)
+        })
+        .collect()
+}
+
+/// 组内是否有文件超过 Telegram photo 硬上限。缩放(prepare)后仍可能超限的高细节图,
+/// sendPhoto 必定被拒,需整组退化为 sendDocument(album 不允许 photo/document 混投)。
+fn any_oversized_for_photo(files: &[PathBuf]) -> bool {
+    files.iter().any(|p| {
+        std::fs::metadata(p)
+            .map(|m| m.len() > crate::sink::PHOTO_HARD_LIMIT_BYTES)
+            .unwrap_or(false)
+    })
+}
+
 /// 把原图作为 document 组 reply 到讨论组那条 auto-forward 上(即帖子评论区)。
 /// sendMediaGroup 限 10,超出按 10 分批,每批都 reply 到锚点。
 async fn send_documents_reply(
@@ -400,6 +426,8 @@ fn build_media(prepared: &[PathBuf], caption: &str, spoiler: bool) -> Vec<InputM
 
 /// 发一组图到指定 chat(用于发布到频道)。sendMediaGroup 限 2–10,超出按 10 分批,
 /// 余数 1 张退 sendPhoto。caption 仅置于最前一张。每个请求带限流重试。
+/// 组内任一文件超 Telegram photo 硬上限时,整组退化为 document 发送(album 不允许
+/// photo/document 混投,故不能只降级单张;R18 剧透遮罩仅 photo 支持,随退化自然丢失)。
 async fn send_group(
     bot: &Bot,
     chat: &Recipient,
@@ -409,6 +437,9 @@ async fn send_group(
 ) -> Result<Option<MessageId>> {
     if prepared.is_empty() {
         anyhow::bail!("无图可发");
+    }
+    if any_oversized_for_photo(prepared) {
+        return send_group_as_documents(bot, chat, prepared, caption).await;
     }
     if prepared.len() == 1 {
         let m = tg_retry(|| {
@@ -441,6 +472,50 @@ async fn send_group(
             let msgs =
                 tg_retry(|| bot.send_media_group(chat.clone(), build_media(chunk, cap, spoiler)))
                     .await?;
+            if let Some(m) = msgs.first() {
+                first_id.get_or_insert(m.id);
+            }
+        }
+    }
+    Ok(first_id)
+}
+
+/// send_group 的 document 退化版:结构与 send_group 相同(单张/分批+caption+首条 id),
+/// 仅把 sendPhoto/sendMediaGroup(photo) 换成 sendDocument/sendMediaGroup(document)。
+async fn send_group_as_documents(
+    bot: &Bot,
+    chat: &Recipient,
+    prepared: &[PathBuf],
+    caption: &str,
+) -> Result<Option<MessageId>> {
+    if prepared.len() == 1 {
+        let m = tg_retry(|| {
+            bot.send_document(chat.clone(), InputFile::file(&prepared[0]))
+                .caption(caption.to_string())
+                .parse_mode(ParseMode::Html)
+        })
+        .await?;
+        return Ok(Some(m.id));
+    }
+    let mut first_id: Option<MessageId> = None;
+    for (ci, chunk) in prepared.chunks(10).enumerate() {
+        let cap = if ci == 0 { caption } else { "" };
+        if chunk.len() == 1 {
+            let m = tg_retry(|| {
+                let req = bot.send_document(chat.clone(), InputFile::file(&chunk[0]));
+                if ci == 0 {
+                    req.caption(cap.to_string()).parse_mode(ParseMode::Html)
+                } else {
+                    req
+                }
+            })
+            .await?;
+            first_id.get_or_insert(m.id);
+        } else {
+            let msgs = tg_retry(|| {
+                bot.send_media_group(chat.clone(), build_documents_with_caption(chunk, cap))
+            })
+            .await?;
             if let Some(m) = msgs.first() {
                 first_id.get_or_insert(m.id);
             }
@@ -568,22 +643,45 @@ impl Sink for TelegramSink {
         let bot = &self.state.bot;
         let chat = self.state.review_chat.clone();
         let mut review_ids: Vec<MessageId> = Vec::new();
+        // 缩放后仍超 Telegram photo 硬上限:审批消息也退化为 document,否则 sendPhoto 直接
+        // 报错、投递卡死重试(批准后 send_group 复用同一批 prepared 文件,同样会退化,一致)。
+        let oversized = any_oversized_for_photo(&prepared);
 
         if n == 1 {
-            let msg = tg_retry(|| {
-                bot.send_photo(chat.clone(), InputFile::file(&prepared[0]))
-                    .caption(format!("【待审】\n{caption}"))
-                    .parse_mode(ParseMode::Html)
-                    .reply_markup(keyboard.clone())
-            })
-            .await?;
+            let msg = if oversized {
+                tg_retry(|| {
+                    bot.send_document(chat.clone(), InputFile::file(&prepared[0]))
+                        .caption(format!("【待审】\n{caption}"))
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(keyboard.clone())
+                })
+                .await?
+            } else {
+                tg_retry(|| {
+                    bot.send_photo(chat.clone(), InputFile::file(&prepared[0]))
+                        .caption(format!("【待审】\n{caption}"))
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(keyboard.clone())
+                })
+                .await?
+            };
             review_ids.push(msg.id);
         } else {
             let first_cap = format!("【待审 · 共 {n} 张】\n{caption}");
-            let msgs = tg_retry(|| {
-                bot.send_media_group(chat.clone(), build_media(&prepared, &first_cap, false))
-            })
-            .await?;
+            let msgs = if oversized {
+                tg_retry(|| {
+                    bot.send_media_group(
+                        chat.clone(),
+                        build_documents_with_caption(&prepared, &first_cap),
+                    )
+                })
+                .await?
+            } else {
+                tg_retry(|| {
+                    bot.send_media_group(chat.clone(), build_media(&prepared, &first_cap, false))
+                })
+                .await?
+            };
             review_ids.extend(msgs.iter().map(|m| m.id));
             let ctrl = tg_retry(|| {
                 bot.send_message(chat.clone(), format!("👆 上面 {n} 张,请审批"))
@@ -911,6 +1009,43 @@ mod tests {
     fn cleanup_due_after_interval() {
         assert!(!cleanup_due(1000, 1000 + 6 * 3600 - 1, 6 * 3600));
         assert!(cleanup_due(1000, 1000 + 6 * 3600, 6 * 3600));
+    }
+
+    #[test]
+    fn any_oversized_detects_file_over_photo_hard_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("small.bin");
+        let big = dir.path().join("big.bin");
+        std::fs::write(&small, vec![0u8; 1024]).unwrap();
+        std::fs::write(&big, vec![0u8; crate::sink::PHOTO_HARD_LIMIT_BYTES as usize + 1]).unwrap();
+
+        assert!(!any_oversized_for_photo(std::slice::from_ref(&small)));
+        assert!(any_oversized_for_photo(&[small, big]));
+    }
+
+    #[test]
+    fn build_documents_with_caption_only_tags_first() {
+        let files = vec![PathBuf::from("a.png"), PathBuf::from("b.png")];
+        let media = build_documents_with_caption(&files, "hello");
+        assert_eq!(media.len(), 2);
+        let InputMedia::Document(first) = &media[0] else {
+            panic!("expected document")
+        };
+        let InputMedia::Document(second) = &media[1] else {
+            panic!("expected document")
+        };
+        assert_eq!(first.caption.as_deref(), Some("hello"));
+        assert_eq!(second.caption, None);
+    }
+
+    #[test]
+    fn build_documents_with_caption_skips_empty_caption() {
+        let files = vec![PathBuf::from("a.png")];
+        let media = build_documents_with_caption(&files, "");
+        let InputMedia::Document(first) = &media[0] else {
+            panic!("expected document")
+        };
+        assert_eq!(first.caption, None);
     }
 
     #[test]

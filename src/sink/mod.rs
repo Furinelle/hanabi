@@ -70,6 +70,11 @@ pub fn needs_downscale(bytes: u64, width: u32, height: u32) -> bool {
     bytes > 10_000_000 || (width + height) > 10_000
 }
 
+/// Telegram sendPhoto 硬上限(实测报错阈值:file too big for a photo, max 10485760)。
+/// prepare() 按更保守的 needs_downscale 预判缩放,但高细节/透明 PNG 缩放后仍可能超此线;
+/// 到达硬上限时 sendPhoto 必定被拒,调用方应退化为 sendDocument。
+pub const PHOTO_HARD_LIMIT_BYTES: u64 = 10_485_760;
+
 #[cfg(test)]
 mod tests {
     use super::*;

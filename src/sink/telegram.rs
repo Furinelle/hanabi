@@ -1017,7 +1017,11 @@ mod tests {
         let small = dir.path().join("small.bin");
         let big = dir.path().join("big.bin");
         std::fs::write(&small, vec![0u8; 1024]).unwrap();
-        std::fs::write(&big, vec![0u8; crate::sink::PHOTO_HARD_LIMIT_BYTES as usize + 1]).unwrap();
+        std::fs::write(
+            &big,
+            vec![0u8; crate::sink::PHOTO_HARD_LIMIT_BYTES as usize + 1],
+        )
+        .unwrap();
 
         assert!(!any_oversized_for_photo(std::slice::from_ref(&small)));
         assert!(any_oversized_for_photo(&[small, big]));

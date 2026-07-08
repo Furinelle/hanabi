@@ -118,18 +118,24 @@ impl TelegramSink {
             })
             .unwrap_or(0);
         // 自定义 client:
-        // - timeout(300):整体超时。yunyoo-la 上传带宽约 170KB/s,orig 4K 大图(几 MB)
-        //   单张需数十秒、多图一次 sendMediaGroup 可达 2-3 分钟,给足 5 分钟避免超时。
+        // - timeout(300):整体超时。orig 4K 大图(几 MB)单张需数十秒、多图一次
+        //   sendMediaGroup 可达 2-3 分钟,给足 5 分钟避免超时。
         // - connect_timeout(15):连接阶段超时,短一些好快速失败重试。
         // - trust_dns(true):纯 Rust DNS,避开 musl 静态二进制 getaddrinfo 解析失败
         //   (reqwest 0.11 光开 feature 不够,必须显式调用此方法)。
         // trust_dns 已 deprecated 但保留:它是 musl 静态二进制 DNS 解析的命脉
         // (reqwest 0.11 仅开 feature 不够,必须显式调用),不为消 lint 冒险换 hickory_dns。
+        // - http1_only():审批一条挨一条点、不等上一条上传完就点下一条时,多张大图
+        //   会在同一条 h2 连接上并发多路复用,踩中 h2 0.3.x 的内部状态机 bug(报
+        //   "http2 error: stream error sent by user: unexpected internal error
+        //   encountered",实际不是 Telegram 限流)。强制 HTTP/1.1 后并发请求走独立
+        //   连接,规避这个 bug。
         #[allow(deprecated)]
         let client = teloxide::net::default_reqwest_settings()
             .timeout(std::time::Duration::from_secs(300))
             .connect_timeout(std::time::Duration::from_secs(15))
             .trust_dns(true)
+            .http1_only()
             .build()
             .context("构造 reqwest client 失败")?;
         Ok(Self {

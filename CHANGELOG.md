@@ -2,6 +2,11 @@
 
 本项目所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.5.2] - 2026-07-08
+
+### 修复
+- **审批发布连点报"发布失败(可能限流)"**：审批一条挨一条点、不等上一条上传完就点下一条时，多张大图会在同一条 HTTP/2 连接上并发多路复用，踩中 `h2` 0.3.x 的内部状态机 bug（报 `stream error sent by user: unexpected internal error encountered`，实测从未收到 Telegram 真实 429，与限流无关）。Telegram Bot API 用不到 HTTP/2 的特性，client 改为 `.http1_only()`，并发请求走独立 TCP 连接，规避该问题。
+
 ## [0.5.1] - 2026-07-03
 
 ### 修复

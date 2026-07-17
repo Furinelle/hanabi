@@ -97,7 +97,8 @@ impl TelegramSink {
                 caption    TEXT NOT NULL,
                 msg_ids    TEXT NOT NULL,
                 originals  TEXT NOT NULL DEFAULT '[]',
-                created_at INTEGER NOT NULL DEFAULT 0
+                created_at INTEGER NOT NULL DEFAULT 0,
+                state      TEXT NOT NULL DEFAULT 'pending'
              );",
         )
         .context("初始化 pending 表失败")?;
@@ -111,6 +112,18 @@ impl TelegramSink {
             "ALTER TABLE pending ADD COLUMN originals TEXT NOT NULL DEFAULT '[]'",
             [],
         );
+        // state: pending → publishing。用条件 UPDATE 原子抢占,防止同一审批按钮被连点后
+        // 并发发送多次。旧库新增列后默认都是 pending。
+        let _ = conn.execute(
+            "ALTER TABLE pending ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'",
+            [],
+        );
+        // 进程崩溃时未完成的 publishing 没有活着的发送任务,启动后恢复为可重试状态。
+        conn.execute(
+            "UPDATE pending SET state='pending' WHERE state='publishing'",
+            [],
+        )
+        .context("恢复中断的审批发布失败")?;
         // counter 从已有最大 token 续上,避免重启后 token 与旧记录冲突。
         let max_token: i64 = conn
             .query_row("SELECT COALESCE(MAX(token), 0) FROM pending", [], |r| {
@@ -220,6 +233,51 @@ fn to_recipient(id: String) -> Recipient {
         Ok(n) => Recipient::Id(ChatId(n)),
         Err(_) => Recipient::ChannelUsername(id),
     }
+}
+
+type PendingRow = (String, String, String, String);
+
+/// 审批记录的原子抢占结果。只有从 pending 成功切到 publishing 的回调能真正发图。
+enum PendingClaim {
+    Claimed(PendingRow),
+    Missing,
+    Publishing,
+}
+
+/// 原子把待审记录抢为发布中，并取出其发送数据。
+///
+/// 两次 callback 都可能同时到达；条件 UPDATE 让数据库只允许一个回调从 pending
+/// 转为 publishing，另一个回调只会拿到 Publishing，绝不会再启动第二次上传。
+fn claim_pending(db: &rusqlite::Connection, token: i64) -> rusqlite::Result<PendingClaim> {
+    let changed = db.execute(
+        "UPDATE pending SET state='publishing' WHERE token=?1 AND state='pending'",
+        [token],
+    )?;
+    if changed == 0 {
+        let exists = db
+            .query_row("SELECT 1 FROM pending WHERE token=?1", [token], |_| Ok(()))
+            .optional()?
+            .is_some();
+        return Ok(if exists {
+            PendingClaim::Publishing
+        } else {
+            PendingClaim::Missing
+        });
+    }
+    let row = db.query_row(
+        "SELECT files, caption, msg_ids, originals FROM pending WHERE token=?1",
+        [token],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    Ok(PendingClaim::Claimed(row))
+}
+
+/// 发布失败时放弃抢占，让原审批按钮可以重试。
+fn restore_pending(db: &rusqlite::Connection, token: i64) -> rusqlite::Result<usize> {
+    db.execute(
+        "UPDATE pending SET state='pending' WHERE token=?1 AND state='publishing'",
+        [token],
+    )
 }
 
 /// 若 msg 是 `publish_channel` 帖子自动转发到讨论组的那条(评论锚点),返回被转发的
@@ -713,7 +771,7 @@ impl Sink for TelegramSink {
         {
             let db = self.state.db.lock().await;
             db.execute(
-                "INSERT OR REPLACE INTO pending(token, files, caption, msg_ids, originals, created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+                "INSERT OR REPLACE INTO pending(token, files, caption, msg_ids, originals, created_at, state) VALUES(?1,?2,?3,?4,?5,?6,'pending')",
                 rusqlite::params![token as i64, files_json, caption, msg_json, originals_json, now_secs()],
             )?;
         }
@@ -909,36 +967,62 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
     let (action, token_str) = data.split_once(':').unwrap_or(("", ""));
     let token: i64 = token_str.parse().unwrap_or(-1);
 
-    // 查 pending(不删);db 锁仅在查询期间持有,发送期间不持锁。
-    let row: Option<(String, String, String, String)> = {
-        let db = state.db.lock().await;
-        db.query_row(
-            "SELECT files, caption, msg_ids, originals FROM pending WHERE token=?1",
-            [token],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .optional()?
-    };
-
-    let Some((files_json, caption, msg_json, originals_json)) = row else {
+    if action != "ok" && action != "no" {
         let _ = state
             .bot
             .answer_callback_query(q.id)
-            .text("该条已失效")
+            .text("无效审批操作")
             .await;
         return Ok(());
+    }
+
+    // 先以条件 UPDATE 原子抢占 pending→publishing。同一 token 的第二次点击只能看到
+    // Publishing，不会再启动一个 send_group。
+    let claim = {
+        let db = state.db.lock().await;
+        claim_pending(&db, token)?
+    };
+    let (files_json, caption, msg_json, originals_json) = match claim {
+        PendingClaim::Claimed(row) => row,
+        PendingClaim::Missing => {
+            let _ = state
+                .bot
+                .answer_callback_query(q.id)
+                .text("该条已失效")
+                .await;
+            return Ok(());
+        }
+        PendingClaim::Publishing => {
+            let _ = state
+                .bot
+                .answer_callback_query(q.id)
+                .text("⏳ 已在发布中…")
+                .await;
+            return Ok(());
+        }
     };
 
-    let files: Vec<PathBuf> = serde_json::from_str::<Vec<String>>(&files_json)?
-        .into_iter()
-        .map(PathBuf::from)
-        .collect();
-    let originals: Vec<PathBuf> = serde_json::from_str::<Vec<String>>(&originals_json)
-        .unwrap_or_default()
-        .into_iter()
-        .map(PathBuf::from)
-        .collect();
-    let msg_ids: Vec<i32> = serde_json::from_str(&msg_json)?;
+    let parsed: Result<(Vec<PathBuf>, Vec<PathBuf>, Vec<i32>)> = (|| {
+        let files = serde_json::from_str::<Vec<String>>(&files_json)?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        let originals = serde_json::from_str::<Vec<String>>(&originals_json)
+            .unwrap_or_default()
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        let msg_ids = serde_json::from_str(&msg_json)?;
+        Ok((files, originals, msg_ids))
+    })();
+    let (files, originals, msg_ids) = match parsed {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            let db = state.db.lock().await;
+            let _ = restore_pending(&db, token);
+            return Err(e);
+        }
+    };
     let is_ok = action == "ok";
 
     // 立即应答,停止按钮转圈(必须 3 秒内,否则 callback query 过期)。
@@ -993,6 +1077,13 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
                 }
             }
             Err(e) => {
+                let restore = {
+                    let db = state.db.lock().await;
+                    restore_pending(&db, token)
+                };
+                if let Err(restore_error) = restore {
+                    tracing::error!(error = %restore_error, token, "审批发布失败后恢复待审状态失败");
+                }
                 tracing::warn!(error = %e, token, "审批发布失败,pending 保留可重试");
                 let _ = state
                     .bot
@@ -1110,6 +1201,22 @@ mod tests {
     fn pending_table_has_originals_column() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("p.db");
+        // 模拟升级前仅有 created_at 的旧 pending 表，启动时必须无损补齐两列。
+        let legacy = rusqlite::Connection::open(&path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE pending(
+                    token INTEGER PRIMARY KEY,
+                    files TEXT NOT NULL,
+                    caption TEXT NOT NULL,
+                    msg_ids TEXT NOT NULL,
+                    created_at INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO pending(token, files, caption, msg_ids, created_at)
+                VALUES(1, '[]', 'legacy', '[]', 1);",
+            )
+            .unwrap();
+        drop(legacy);
         let _sink = TelegramSink::new(
             "123:abc".into(),
             "7794592020".into(),
@@ -1126,6 +1233,48 @@ mod tests {
             .flatten()
             .collect();
         assert!(cols.contains(&"originals".to_string()));
+        assert!(cols.contains(&"state".to_string()));
+        let state: String = conn
+            .query_row("SELECT state FROM pending WHERE token=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "pending");
+    }
+
+    #[test]
+    fn pending_claim_is_single_winner_and_failed_publish_can_be_retried() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE pending(
+                token INTEGER PRIMARY KEY,
+                files TEXT NOT NULL,
+                caption TEXT NOT NULL,
+                msg_ids TEXT NOT NULL,
+                originals TEXT NOT NULL DEFAULT '[]',
+                created_at INTEGER NOT NULL DEFAULT 0,
+                state TEXT NOT NULL DEFAULT 'pending'
+            );",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO pending(token, files, caption, msg_ids, originals, created_at)
+             VALUES(1, '[]', 'caption', '[]', '[]', 1)",
+            [],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            claim_pending(&db, 1).unwrap(),
+            PendingClaim::Claimed((_, caption, _, _)) if caption == "caption"
+        ));
+        assert!(matches!(
+            claim_pending(&db, 1).unwrap(),
+            PendingClaim::Publishing
+        ));
+        assert_eq!(restore_pending(&db, 1).unwrap(), 1);
+        assert!(matches!(
+            claim_pending(&db, 1).unwrap(),
+            PendingClaim::Claimed(_)
+        ));
     }
 
     #[test]

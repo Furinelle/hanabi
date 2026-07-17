@@ -2,6 +2,11 @@
 
 本项目所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.5.3] - 2026-07-17
+
+### 修复
+- **同一审批按钮连点会重复发图**：`pending` 记录新增持久化 `state`（`pending → publishing`），回调先以 `UPDATE ... WHERE state='pending'` 原子抢占；同一 token 的后续点击只提示「已在发布中」，不再启动第二个上传。发布失败会恢复为待审以便重试；进程重启会恢复中断的发布状态。
+
 ## [0.5.2] - 2026-07-08
 
 ### 修复

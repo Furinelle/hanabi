@@ -8,9 +8,9 @@ use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 use teloxide::prelude::*;
 use teloxide::types::{
-    AllowedUpdate, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
-    InputMedia, InputMediaDocument, InputMediaPhoto, MessageId, MessageOrigin, ParseMode,
-    Recipient, ReplyParameters, UpdateKind,
+    AllowedUpdate, BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+    InputFile, InputMedia, InputMediaDocument, InputMediaPhoto, MessageId, MessageOrigin,
+    ParseMode, Recipient, ReplyParameters, UpdateKind,
 };
 use tokio::sync::Mutex;
 
@@ -278,6 +278,50 @@ fn restore_pending(db: &rusqlite::Connection, token: i64) -> rusqlite::Result<us
         "UPDATE pending SET state='pending' WHERE token=?1 AND state='publishing'",
         [token],
     )
+}
+
+/// 原子抢占当前所有仍为 pending 的审批记录，按进入审批的先后顺序返回。
+///
+/// 已点丢弃/单独批准的记录会先进入 publishing，因此不会被 `/approve` 再次选中；
+/// 重复发送 `/approve` 也只会由第一次命令拿到这些记录。
+fn claim_all_pending(db: &mut rusqlite::Connection) -> rusqlite::Result<Vec<(i64, PendingRow)>> {
+    let tx = db.transaction()?;
+    let tokens: Vec<i64> = {
+        let mut stmt = tx.prepare(
+            "SELECT token FROM pending WHERE state='pending' ORDER BY created_at, token",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    let mut claimed = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let changed = tx.execute(
+            "UPDATE pending SET state='publishing' WHERE token=?1 AND state='pending'",
+            [token],
+        )?;
+        if changed == 1 {
+            let row = tx.query_row(
+                "SELECT files, caption, msg_ids, originals FROM pending WHERE token=?1",
+                [token],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            claimed.push((token, row));
+        }
+    }
+    tx.commit()?;
+    Ok(claimed)
+}
+
+fn command_menu() -> Vec<BotCommand> {
+    vec![
+        BotCommand::new("run", "立即抓取一轮"),
+        BotCommand::new("approve", "批准并发布全部剩余待审"),
+        BotCommand::new("status", "查看待审数和运行状态"),
+        BotCommand::new("ping", "存活测试"),
+        BotCommand::new("help", "查看命令列表"),
+    ]
 }
 
 /// 若 msg 是 `publish_channel` 帖子自动转发到讨论组的那条(评论锚点),返回被转发的
@@ -779,6 +823,120 @@ impl Sink for TelegramSink {
     }
 }
 
+struct PendingWork {
+    files: Vec<PathBuf>,
+    caption: String,
+    msg_ids: Vec<i32>,
+    originals: Vec<PathBuf>,
+}
+
+fn decode_pending(row: PendingRow) -> Result<PendingWork> {
+    let (files_json, caption, msg_json, originals_json) = row;
+    let files = serde_json::from_str::<Vec<String>>(&files_json)?
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    let originals = serde_json::from_str::<Vec<String>>(&originals_json)
+        .unwrap_or_default()
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    let msg_ids = serde_json::from_str(&msg_json)?;
+    Ok(PendingWork {
+        files,
+        caption,
+        msg_ids,
+        originals,
+    })
+}
+
+/// 完成一条已抢占的审批。发布/解析失败会恢复为 pending，供按钮或下一次
+/// `/approve` 重试；成功后删除审批消息、pending 记录并接续原图评论任务。
+async fn finish_claimed(
+    state: &Arc<ReviewState>,
+    token: i64,
+    row: PendingRow,
+    publish: bool,
+) -> Result<()> {
+    let work = match decode_pending(row) {
+        Ok(work) => work,
+        Err(e) => {
+            let db = state.db.lock().await;
+            let _ = restore_pending(&db, token);
+            return Err(e);
+        }
+    };
+    let spoiler = work.caption.contains("🔞 R18");
+    let send_result = if publish {
+        send_group(
+            &state.bot,
+            &state.publish_channel,
+            &work.files,
+            &work.caption,
+            spoiler,
+        )
+        .await
+    } else {
+        Ok(None)
+    };
+    let first_id = match send_result {
+        Ok(first_id) => first_id,
+        Err(e) => {
+            let restore = {
+                let db = state.db.lock().await;
+                restore_pending(&db, token)
+            };
+            if let Err(restore_error) = restore {
+                tracing::error!(error = %restore_error, token, "审批发布失败后恢复待审状态失败");
+            }
+            return Err(e);
+        }
+    };
+
+    for mid in &work.msg_ids {
+        let _ = state
+            .bot
+            .delete_message(state.review_chat.clone(), MessageId(*mid))
+            .await;
+    }
+    let delete_result = state
+        .db
+        .lock()
+        .await
+        .execute("DELETE FROM pending WHERE token=?1", [token]);
+    match (publish, first_id) {
+        (true, Some(mid)) if !work.originals.is_empty() => {
+            register_comment(state, mid.0, &work.originals).await;
+        }
+        _ => cleanup(&work.files),
+    }
+    delete_result.context("删除已完成的审批记录失败")?;
+    Ok(())
+}
+
+/// 顺序发布 `/approve` 原子抢占到的全部记录。顺序发送避免瞬间把大量图组并发压给
+/// Telegram；单条失败不阻断后续项，失败记录恢复为 pending。
+async fn publish_all_claimed(state: Arc<ReviewState>, claimed: Vec<(i64, PendingRow)>) {
+    let total = claimed.len();
+    let mut succeeded = 0usize;
+    for (token, row) in claimed {
+        match finish_claimed(&state, token, row, true).await {
+            Ok(()) => succeeded += 1,
+            Err(e) => tracing::warn!(error = %e, token, "一键批准中的单条发布失败"),
+        }
+    }
+    let failed = total - succeeded;
+    let summary = if failed == 0 {
+        format!("✅ 一键批准完成：已发布 {succeeded} 条")
+    } else {
+        format!("⚠️ 一键批准完成：成功 {succeeded} 条，失败 {failed} 条；失败项仍保留待审，可再次 /approve")
+    };
+    let _ = state
+        .bot
+        .send_message(state.review_chat.clone(), summary)
+        .await;
+}
+
 /// callback 轮询:监听按钮点击与 `/` 命令/链接。批准 → 发频道 + 删私聊整组;
 /// 拒绝 → 删私聊整组。失败(如限流)保留 pending 供重点。与抓取循环并发运行。
 ///
@@ -791,6 +949,9 @@ pub async fn run_review_loop(
 ) {
     // 启动先清一次超期/孤儿(顺手清掉旧版本遗留的临时图)。
     cleanup_stale(&state).await;
+    if let Err(e) = state.bot.set_my_commands(command_menu()).await {
+        tracing::warn!(error = %e, "注册 Telegram 命令菜单失败");
+    }
     let mut last_cleanup = now_secs();
     const CLEANUP_INTERVAL_SECS: i64 = 6 * 3600;
 
@@ -850,7 +1011,8 @@ pub async fn run_review_loop(
 }
 
 /// 处理 `/` 命令(仅文本消息)。**仅响应审批私聊本人**(owner),陌生人忽略。
-/// /run 触发抓取;/status /ping /help 即时回复;非命令的 Pixiv/X 链接交抓取循环直发频道。
+/// /run 触发抓取;/approve 批准全部剩余待审;/status /ping /help 即时回复;
+/// 非命令的 Pixiv/X 链接交抓取循环直发频道。
 async fn handle_command(
     state: &Arc<ReviewState>,
     msg: &Message,
@@ -883,6 +1045,27 @@ async fn handle_command(
     }
     let cmd = text.split_whitespace().next().unwrap_or("");
     let cmd = cmd.split('@').next().unwrap_or(cmd);
+    if cmd == "/approve" {
+        let claimed = {
+            let mut db = state.db.lock().await;
+            claim_all_pending(&mut db)?
+        };
+        if claimed.is_empty() {
+            state
+                .bot
+                .send_message(msg.chat.id, "✅ 当前没有剩余待审项")
+                .await?;
+        } else {
+            let count = claimed.len();
+            let task_state = state.clone();
+            tokio::spawn(publish_all_claimed(task_state, claimed));
+            state
+                .bot
+                .send_message(msg.chat.id, format!("⏳ 正在一键批准并发布 {count} 条…"))
+                .await?;
+        }
+        return Ok(());
+    }
     let reply: String = match cmd {
         "/run" => {
             let _ = trigger.send(()).await;
@@ -898,7 +1081,7 @@ async fn handle_command(
         }
         "/ping" => "pong 🏓".to_string(),
         "/help" => {
-            "命令列表:\n/run — 立即抓取一轮\n/status — 待审数+运行状态\n/ping — 存活测试\n/help — 本帮助\n\n💡 直接发 Pixiv/X 作品链接 → 自动抓取并发布到频道"
+            "命令列表:\n/run — 立即抓取一轮\n/approve — 批准并发布全部剩余待审\n/status — 待审数+运行状态\n/ping — 存活测试\n/help — 本帮助\n\n💡 先逐条点 ❌ 丢弃不想推送的图片，再发 /approve 一键发布其余图片\n💡 直接发 Pixiv/X 作品链接 → 自动抓取并发布到频道"
                 .to_string()
         }
         _ => return Ok(()),
@@ -982,7 +1165,7 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
         let db = state.db.lock().await;
         claim_pending(&db, token)?
     };
-    let (files_json, caption, msg_json, originals_json) = match claim {
+    let row = match claim {
         PendingClaim::Claimed(row) => row,
         PendingClaim::Missing => {
             let _ = state
@@ -1001,28 +1184,6 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
             return Ok(());
         }
     };
-
-    let parsed: Result<(Vec<PathBuf>, Vec<PathBuf>, Vec<i32>)> = (|| {
-        let files = serde_json::from_str::<Vec<String>>(&files_json)?
-            .into_iter()
-            .map(PathBuf::from)
-            .collect();
-        let originals = serde_json::from_str::<Vec<String>>(&originals_json)
-            .unwrap_or_default()
-            .into_iter()
-            .map(PathBuf::from)
-            .collect();
-        let msg_ids = serde_json::from_str(&msg_json)?;
-        Ok((files, originals, msg_ids))
-    })();
-    let (files, originals, msg_ids) = match parsed {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            let db = state.db.lock().await;
-            let _ = restore_pending(&db, token);
-            return Err(e);
-        }
-    };
     let is_ok = action == "ok";
 
     // 立即应答,停止按钮转圈(必须 3 秒内,否则 callback query 过期)。
@@ -1038,53 +1199,12 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
         .await;
 
     // 后台执行:批准→发频道;然后删私聊整组 + 清文件 + 删 pending。
-    // 失败(如限流)保留 pending,发提示可重点。
+    // 失败(如限流)恢复 pending,发提示可重试。
     let state = state.clone();
     tokio::spawn(async move {
-        // R18 → 频道帖打剧透遮罩;caption 由 render_caption 生成,R18 时以 🔞 R18 起头。
-        let spoiler = caption.contains("🔞 R18");
-        let send_result: Result<Option<MessageId>> = if is_ok {
-            send_group(
-                &state.bot,
-                &state.publish_channel,
-                &files,
-                &caption,
-                spoiler,
-            )
-            .await
-        } else {
-            Ok(None)
-        };
-        match send_result {
-            Ok(first_id) => {
-                for mid in &msg_ids {
-                    let _ = state
-                        .bot
-                        .delete_message(state.review_chat.clone(), MessageId(*mid))
-                        .await;
-                }
-                let _ = state
-                    .db
-                    .lock()
-                    .await
-                    .execute("DELETE FROM pending WHERE token=?1", [token]);
-                // 批准且拿到首条频道帖 msg_id → 登记原图评论任务(延后清理);否则即时清。
-                match (is_ok, first_id) {
-                    (true, Some(mid)) if !originals.is_empty() => {
-                        register_comment(&state, mid.0, &originals).await;
-                    }
-                    _ => cleanup(&files),
-                }
-            }
-            Err(e) => {
-                let restore = {
-                    let db = state.db.lock().await;
-                    restore_pending(&db, token)
-                };
-                if let Err(restore_error) = restore {
-                    tracing::error!(error = %restore_error, token, "审批发布失败后恢复待审状态失败");
-                }
-                tracing::warn!(error = %e, token, "审批发布失败,pending 保留可重试");
+        if let Err(e) = finish_claimed(&state, token, row, is_ok).await {
+            tracing::warn!(error = %e, token, "审批操作失败,pending 保留可重试");
+            if is_ok {
                 let _ = state
                     .bot
                     .send_message(
@@ -1275,6 +1395,44 @@ mod tests {
             claim_pending(&db, 1).unwrap(),
             PendingClaim::Claimed(_)
         ));
+    }
+
+    #[test]
+    fn claim_all_only_takes_remaining_pending_in_order() {
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE pending(
+                token INTEGER PRIMARY KEY,
+                files TEXT NOT NULL,
+                caption TEXT NOT NULL,
+                msg_ids TEXT NOT NULL,
+                originals TEXT NOT NULL DEFAULT '[]',
+                created_at INTEGER NOT NULL DEFAULT 0,
+                state TEXT NOT NULL DEFAULT 'pending'
+            );
+            INSERT INTO pending VALUES(1, '[]', 'first', '[]', '[]', 20, 'pending');
+            INSERT INTO pending VALUES(2, '[]', 'cancelled', '[]', '[]', 10, 'publishing');
+            INSERT INTO pending VALUES(3, '[]', 'oldest', '[]', '[]', 10, 'pending');",
+        )
+        .unwrap();
+
+        let claimed = claim_all_pending(&mut db).unwrap();
+        let tokens: Vec<i64> = claimed.iter().map(|(token, _)| *token).collect();
+        assert_eq!(tokens, vec![3, 1]);
+        assert!(claimed
+            .iter()
+            .all(|(_, (_, caption, _, _))| { caption == "oldest" || caption == "first" }));
+        assert!(claim_all_pending(&mut db).unwrap().is_empty());
+        let cancelled_state: String = db
+            .query_row("SELECT state FROM pending WHERE token=2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cancelled_state, "publishing");
+    }
+
+    #[test]
+    fn command_menu_contains_one_click_approve() {
+        let menu = command_menu();
+        assert!(menu.iter().any(|cmd| cmd.command == "approve"));
     }
 
     #[test]

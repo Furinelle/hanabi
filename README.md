@@ -18,6 +18,7 @@
 - 🔞 **R18 处理**：敏感内容（Pixiv `x_restrict` / X `sensitive`）进审批标 🔞 由你人工决定；发布到频道时图片加**剧透遮罩**（spoiler，点开才显示），审批私聊不打码便于审
 - 🤖 **AI 生成标签**：Pixiv `illust_ai_type==2` 的作品 caption 标签首位自动加 `#AI生成`
 - 🎯 **分源过滤**：R18 / 收藏数 / 点赞数 / 标签白名单 / 只插画 / 页数上限
+- 🧯 **失败可见**：手动链接抓取/发布失败时，「抓取中」提示会改写成具体原因（解析为空、下载 0 张、部分批次失败、队列已满），不静默装成功；超 10 张的作品审批与发布自动按 10 分批
 - ⌨️ **命令控制**：`/run` 手动抓一轮、`/approve` 一键批准剩余待审、`/status`、`/ping`、`/help`
 - ⏰ **定时轮询**：`poll_interval_secs` 可配（如一天三次 = 28800），`tz_offset_hours` 可配时区（默认 +8）
 - 🐳 **多种部署**：systemd / launchd / Docker（GHCR 镜像，含 gallery-dl）；预编译 x86_64 + aarch64 musl 静态二进制
@@ -50,7 +51,13 @@ channel_id = "<你的私聊 chat_id>"     # 审批私聊（作品先发这里）
 publish_channel = "@your_channel"   # 批准后发布的频道（绑定讨论组后，原图自动进帖子评论区）
 
 [gallery_dl]
+config_path = "gallery-dl.conf"  # 必填：gallery-dl 认证配置路径
 probe_range = "1-50"
+
+# 可选：X 图片下载画质。download 阶段以 -o extractor.twitter.size=orig 追加；
+# 与 gallery-dl.conf 里的 "size" 各管一段（probe 用 conf、download 用这里），两处都设才稳。
+[x_image]
+size = "orig"
 
 # 关注画师新作（不筛标签，全进审批）
 [[source]]

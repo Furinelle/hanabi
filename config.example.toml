@@ -1,7 +1,8 @@
 poll_interval_secs = 1800
 
 [telegram]
-channel_id = "@my_channel"     # bot_token 走环境变量 HANABI_BOT_TOKEN
+channel_id = "123456789"          # 审批私聊的数字 chat_id(命令/审批要求数字 id;bot_token 走环境变量 HANABI_BOT_TOKEN)
+publish_channel = "@your_channel" # 必填:批准后发布的频道(@username 或 -100 开头的数字 id),缺了点「发送到频道」必失败
 
 [gallery_dl]
 config_path = "gallery-dl.conf"

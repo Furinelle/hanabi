@@ -37,6 +37,14 @@ pub struct LinkJob {
     pub notice_msg_id: i32,
 }
 
+/// 直发结果:Full=全部批次发出;Partial=部分批次发出后失败(频道帖已存在但缺图,
+/// 重发会重复,调用方须 mark_pushed 并提示人工补图)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    Full,
+    Partial,
+}
+
 /// 待投递评论区的原图任务:发布到频道后登记,等讨论组 auto-forward 到来时
 /// 把原画质 document reply 进该帖评论区。temp_dir 在投递完成或超时后清理。
 struct CommentJob {
@@ -47,6 +55,9 @@ struct CommentJob {
 
 /// 评论区原图任务的兜底保留时长:超时仍未等到 auto-forward 则清临时目录,避免泄漏。
 const COMMENT_TTL_SECS: i64 = 120;
+/// 孤儿目录最小年龄:比它新的 hanabi_* 目录可能是在途下载/发送(pending 行要等
+/// 审批消息全部发出后才写入,窗口可达数分钟),清理时按修改时间避让。
+const ORPHAN_MIN_AGE_SECS: u64 = 3600;
 
 /// 审批状态:由 `TelegramSink`(发审批消息)与 callback 轮询任务共享。
 /// pending 持久化到 sqlite,bot 重启后旧审批消息的按钮仍有效。
@@ -88,9 +99,18 @@ impl TelegramSink {
                 0
             }
         };
+        if publish_channel_id.is_empty() {
+            tracing::error!(
+                "telegram.publish_channel 未配置,批准/直发将无法发布到频道;请在 config.toml 填写"
+            );
+        }
         let conn = rusqlite::Connection::open(db_path).context("打开 pending 数据库失败")?;
+        // busy_timeout 与 store.rs 对齐:抓取循环 Store 连接、handle_link 自开连接与
+        // 本连接并发写同一 hanabi.db,SQLite 默认无 busy handler,写-写竞争会立即
+        // 报 SQLITE_BUSY(WAL 只解决读写并发,解决不了写写)。
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
+             PRAGMA busy_timeout=5000;
              CREATE TABLE IF NOT EXISTS pending(
                 token      INTEGER PRIMARY KEY,
                 files      TEXT NOT NULL,
@@ -98,7 +118,8 @@ impl TelegramSink {
                 msg_ids    TEXT NOT NULL,
                 originals  TEXT NOT NULL DEFAULT '[]',
                 created_at INTEGER NOT NULL DEFAULT 0,
-                state      TEXT NOT NULL DEFAULT 'pending'
+                state      TEXT NOT NULL DEFAULT 'pending',
+                is_r18     INTEGER NOT NULL DEFAULT 0
              );",
         )
         .context("初始化 pending 表失败")?;
@@ -118,6 +139,22 @@ impl TelegramSink {
             "ALTER TABLE pending ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'",
             [],
         );
+        // is_r18: 结构化存 R18 标记,发布时据此打剧透遮罩。此前从 caption 文本
+        // contains("🔞 R18") 反推,与渲染格式隐式耦合且标题含该字样会误判。
+        // 回填仅在列刚补建时执行一次(ALTER 成功=旧库):新写入的行自带准确值,
+        // 每次启动都回填会把"标题恰含该字样"的非 R18 行重新误标。
+        if conn
+            .execute(
+                "ALTER TABLE pending ADD COLUMN is_r18 INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .is_ok()
+        {
+            let _ = conn.execute(
+                "UPDATE pending SET is_r18=1 WHERE caption LIKE '%🔞 R18%'",
+                [],
+            );
+        }
         // 进程崩溃时未完成的 publishing 没有活着的发送任务,启动后恢复为可重试状态。
         conn.execute(
             "UPDATE pending SET state='pending' WHERE state='publishing'",
@@ -170,27 +207,46 @@ impl TelegramSink {
     }
 
     /// 直接发布到频道(跳过审批):用于手动发来的链接,作品即时发布。
-    pub async fn publish_direct(&self, item: &MediaItem, files: &[PathBuf]) -> Result<()> {
+    ///
+    /// 返回 [`PublishOutcome`]:`Partial` 表示部分批次已进频道后失败——频道帖已存在,
+    /// 整条重发会重复,调用方应与完整成功一样 mark_pushed 并提示人工补图
+    /// (与 finish_claimed 对部分成功"按已发布收尾"的策略一致)。
+    pub async fn publish_direct(
+        &self,
+        item: &MediaItem,
+        files: &[PathBuf],
+    ) -> Result<PublishOutcome> {
         if files.is_empty() {
             anyhow::bail!("无图片可发: {}", item.source_id);
         }
         let caption = render_caption(item);
         let files_owned: Vec<PathBuf> = files.to_vec();
         let prepared = tokio::task::spawn_blocking(move || prepare_all(&files_owned)).await??;
-        let first_id = send_group(
+        let mut sent: Vec<MessageId> = Vec::new();
+        let send_result = send_group(
             &self.state.bot,
             &self.state.publish_channel,
             &prepared,
             &caption,
             item.is_r18, // R18 → 频道帖打剧透遮罩
+            &mut sent,
         )
-        .await?;
+        .await;
         // 登记原图评论任务,等讨论组 auto-forward 到来再投递;登记则延后清理临时目录。
-        match first_id {
+        // 部分批次已发出时同样登记(频道帖已存在,评论区原图仍有意义)。
+        match sent.first() {
             Some(mid) => register_comment(&self.state, mid.0, files).await,
             None => cleanup(files),
         }
-        Ok(())
+        if let Err(e) = send_result {
+            if sent.is_empty() {
+                return Err(e);
+            }
+            // 部分成功:整条重发会造成频道重复内容,按已发布收尾,转人工检查。
+            tracing::warn!(error = %e, id = %item.source_id, "直发部分成功,后续批次失败");
+            return Ok(PublishOutcome::Partial);
+        }
+        Ok(PublishOutcome::Full)
     }
 
     /// 删审批私聊里的若干消息(手动链接发布后清理:用户链接 + "抓取中"提示)。
@@ -235,7 +291,7 @@ fn to_recipient(id: String) -> Recipient {
     }
 }
 
-type PendingRow = (String, String, String, String);
+type PendingRow = (String, String, String, String, bool);
 
 /// 审批记录的原子抢占结果。只有从 pending 成功切到 publishing 的回调能真正发图。
 enum PendingClaim {
@@ -265,9 +321,9 @@ fn claim_pending(db: &rusqlite::Connection, token: i64) -> rusqlite::Result<Pend
         });
     }
     let row = db.query_row(
-        "SELECT files, caption, msg_ids, originals FROM pending WHERE token=?1",
+        "SELECT files, caption, msg_ids, originals, is_r18 FROM pending WHERE token=?1",
         [token],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
     )?;
     Ok(PendingClaim::Claimed(row))
 }
@@ -303,9 +359,9 @@ fn claim_all_pending(db: &mut rusqlite::Connection) -> rusqlite::Result<Vec<(i64
         )?;
         if changed == 1 {
             let row = tx.query_row(
-                "SELECT files, caption, msg_ids, originals FROM pending WHERE token=?1",
+                "SELECT files, caption, msg_ids, originals, is_r18 FROM pending WHERE token=?1",
                 [token],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )?;
             claimed.push((token, row));
         }
@@ -443,7 +499,7 @@ async fn deliver_comment(state: &Arc<ReviewState>, anchor: &Message, chan_msg_id
             "原图已投递到帖子评论区"
         );
     }
-    let _ = std::fs::remove_dir_all(&job.temp_dir);
+    remove_dir_all_bg(job.temp_dir);
 }
 
 /// 兜底:清理超时仍未等到 auto-forward 的评论任务(频道没绑讨论组/转发丢失)。
@@ -459,7 +515,7 @@ async fn sweep_expired_comments(state: &Arc<ReviewState>) {
         keys.iter().filter_map(|k| map.remove(k)).collect()
     };
     for job in &expired {
-        let _ = std::fs::remove_dir_all(&job.temp_dir);
+        remove_dir_all_bg(job.temp_dir.clone());
     }
     if !expired.is_empty() {
         tracing::info!(count = expired.len(), "清理超时未投递的评论任务临时目录");
@@ -532,123 +588,147 @@ fn build_media(prepared: &[PathBuf], caption: &str, spoiler: bool) -> Vec<InputM
         .collect()
 }
 
-/// 发一组图到指定 chat(用于发布到频道)。sendMediaGroup 限 2–10,超出按 10 分批,
-/// 余数 1 张退 sendPhoto。caption 仅置于最前一张。每个请求带限流重试。
-/// 组内任一文件超 Telegram photo 硬上限时,整组退化为 document 发送(album 不允许
-/// photo/document 混投,故不能只降级单张;R18 剧透遮罩仅 photo 支持,随退化自然丢失)。
+/// 发送模式:photo(可带 R18 剧透遮罩)或 document(原画质/超限退化)。
+enum MediaMode {
+    Photo { spoiler: bool },
+    Document,
+}
+
+/// 发一组图到指定 chat(用于发布到频道)。组内任一文件超 Telegram photo 硬上限时,
+/// 整组退化为 document 发送(album 不允许 photo/document 混投,故不能只降级单张;
+/// R18 剧透遮罩仅 photo 支持,随退化自然丢失)。
 async fn send_group(
     bot: &Bot,
     chat: &Recipient,
     prepared: &[PathBuf],
     caption: &str,
     spoiler: bool,
-) -> Result<Option<MessageId>> {
+    sent: &mut Vec<MessageId>,
+) -> Result<()> {
     if prepared.is_empty() {
         anyhow::bail!("无图可发");
     }
-    if any_oversized_for_photo(prepared) {
-        return send_group_as_documents(bot, chat, prepared, caption).await;
-    }
-    if prepared.len() == 1 {
-        let m = tg_retry(|| {
-            bot.send_photo(chat.clone(), InputFile::file(&prepared[0]))
-                .caption(caption.to_string())
-                .parse_mode(ParseMode::Html)
-                .has_spoiler(spoiler)
-        })
-        .await?;
-        return Ok(Some(m.id));
-    }
-    // 记首条帖 msg_id:用于评论区把原图 reply 到该帖的 auto-forward 上。
-    let mut first_id: Option<MessageId> = None;
-    for (ci, chunk) in prepared.chunks(10).enumerate() {
-        let cap = if ci == 0 { caption } else { "" };
-        if chunk.len() == 1 {
-            let m = tg_retry(|| {
-                let req = bot
-                    .send_photo(chat.clone(), InputFile::file(&chunk[0]))
-                    .has_spoiler(spoiler);
-                if ci == 0 {
-                    req.caption(cap.to_string()).parse_mode(ParseMode::Html)
-                } else {
-                    req
-                }
-            })
-            .await?;
-            first_id.get_or_insert(m.id);
-        } else {
-            let msgs =
-                tg_retry(|| bot.send_media_group(chat.clone(), build_media(chunk, cap, spoiler)))
-                    .await?;
-            if let Some(m) = msgs.first() {
-                first_id.get_or_insert(m.id);
-            }
-        }
-    }
-    Ok(first_id)
+    let mode = if any_oversized_for_photo(prepared) {
+        MediaMode::Document
+    } else {
+        MediaMode::Photo { spoiler }
+    };
+    send_batches(bot, chat, prepared, caption, &mode, sent).await
 }
 
-/// send_group 的 document 退化版:结构与 send_group 相同(单张/分批+caption+首条 id),
-/// 仅把 sendPhoto/sendMediaGroup(photo) 换成 sendDocument/sendMediaGroup(document)。
-async fn send_group_as_documents(
+/// 分批发送核心:sendMediaGroup 限 2–10,按 10 分批,余数 1 张退化为单发。
+/// caption 仅挂第一批第一张。每个请求带限流重试。已发出的消息 id 实时推入 `sent`
+/// (首元素即频道帖锚点),中途失败时调用方据 `sent` 是否非空判断"部分批次已进
+/// 频道"——此时盲目恢复重试会造成频道重复内容。
+async fn send_batches(
     bot: &Bot,
     chat: &Recipient,
     prepared: &[PathBuf],
     caption: &str,
-) -> Result<Option<MessageId>> {
-    if prepared.len() == 1 {
-        let m = tg_retry(|| {
-            bot.send_document(chat.clone(), InputFile::file(&prepared[0]))
-                .caption(caption.to_string())
-                .parse_mode(ParseMode::Html)
-        })
-        .await?;
-        return Ok(Some(m.id));
-    }
-    let mut first_id: Option<MessageId> = None;
+    mode: &MediaMode,
+    sent: &mut Vec<MessageId>,
+) -> Result<()> {
     for (ci, chunk) in prepared.chunks(10).enumerate() {
         let cap = if ci == 0 { caption } else { "" };
         if chunk.len() == 1 {
-            let m = tg_retry(|| {
-                let req = bot.send_document(chat.clone(), InputFile::file(&chunk[0]));
-                if ci == 0 {
-                    req.caption(cap.to_string()).parse_mode(ParseMode::Html)
-                } else {
-                    req
+            let m = match mode {
+                MediaMode::Photo { spoiler } => {
+                    tg_retry(|| {
+                        let req = bot
+                            .send_photo(chat.clone(), InputFile::file(&chunk[0]))
+                            .has_spoiler(*spoiler);
+                        if cap.is_empty() {
+                            req
+                        } else {
+                            req.caption(cap.to_string()).parse_mode(ParseMode::Html)
+                        }
+                    })
+                    .await?
                 }
-            })
-            .await?;
-            first_id.get_or_insert(m.id);
+                MediaMode::Document => {
+                    tg_retry(|| {
+                        let req = bot.send_document(chat.clone(), InputFile::file(&chunk[0]));
+                        if cap.is_empty() {
+                            req
+                        } else {
+                            req.caption(cap.to_string()).parse_mode(ParseMode::Html)
+                        }
+                    })
+                    .await?
+                }
+            };
+            sent.push(m.id);
         } else {
             let msgs = tg_retry(|| {
-                bot.send_media_group(chat.clone(), build_documents_with_caption(chunk, cap))
+                let media = match mode {
+                    MediaMode::Photo { spoiler } => build_media(chunk, cap, *spoiler),
+                    MediaMode::Document => build_documents_with_caption(chunk, cap),
+                };
+                bot.send_media_group(chat.clone(), media)
             })
             .await?;
-            if let Some(m) = msgs.first() {
-                first_id.get_or_insert(m.id);
-            }
+            sent.extend(msgs.iter().map(|m| m.id));
         }
     }
-    Ok(first_id)
+    Ok(())
+}
+
+/// 后台删除目录:同步 remove_dir_all 移到 blocking 线程,不占用 async 任务
+/// (慢盘上删含多张几 MB 图片的目录会卡顿轮询)。先原子改名再删:目录名是确定性的
+/// (hanabi_<源>_<id>),失败后立即重发会对同名目录重新写入,与在途删除并发会误删
+/// 新文件;改名后删的是"退役"目录,新下载互不相干。fire-and-forget,失败仅意味着
+/// 目录残留,由孤儿清理兜底(改名保留 hanabi_ 前缀,仍在其扫描范围内)。
+fn remove_dir_all_bg(dir: PathBuf) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let doomed = dir.with_file_name(format!(
+        "{}.del{ts}",
+        dir.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("hanabi_tmp")
+    ));
+    let target = if std::fs::rename(&dir, &doomed).is_ok() {
+        doomed
+    } else {
+        dir
+    };
+    tokio::task::spawn_blocking(move || {
+        let _ = std::fs::remove_dir_all(&target);
+    });
 }
 
 /// 清理某作品的临时目录(原图 + 缩放图同处一目录)。
 fn cleanup(files: &[PathBuf]) {
     if let Some(parent) = files.first().and_then(|p| p.parent()) {
-        let _ = std::fs::remove_dir_all(parent);
+        remove_dir_all_bg(parent.to_path_buf());
     }
 }
 
 /// 启动清理:① 删超期未审 pending(消息+文件+记录);② 删 `/tmp/hanabi_*` 中
 /// 不被任何 pending 引用的孤儿目录(多为旧版本/重启遗留)。
 async fn cleanup_stale(state: &Arc<ReviewState>) {
+    // ⓪ 僵尸 publishing 兜底:DELETE/restore 因 DB 写失败未完成时,记录会永远停在
+    // publishing(按钮恒回"已在发布中",TTL 清理又只认 pending)。超过 TTL+24h 的
+    // publishing 不可能仍在途,恢复为 pending 交给下面的正常清理/重试。
+    {
+        let db = state.db.lock().await;
+        let zombie_cutoff = now_secs() - PENDING_TTL_SECS - 24 * 3600;
+        let _ = db.execute(
+            "UPDATE pending SET state='pending' WHERE state='publishing' AND created_at > 0 AND created_at < ?1",
+            [zombie_cutoff],
+        );
+    }
     // ① 超期 pending。
     let cutoff = now_secs() - PENDING_TTL_SECS;
     let expired: Vec<(i64, String, String)> = {
         let db = state.db.lock().await;
         let mut out = Vec::new();
         if let Ok(mut stmt) = db.prepare(
-            "SELECT token, files, msg_ids FROM pending WHERE created_at > 0 AND created_at < ?1",
+            // 只清 pending:publishing 表示有发布任务在途,清了会与其互踩
+            // (删其正在上传的文件、DELETE 其记录,失败后的 restore 变成空操作)。
+            "SELECT token, files, msg_ids FROM pending WHERE created_at > 0 AND created_at < ?1 AND state='pending'",
         ) {
             if let Ok(rows) = stmt.query_map([cutoff], |r| {
                 Ok((
@@ -706,7 +786,18 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
             }
         }
     }
-    if let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) {
+    // 评论任务的目录也在用(其 pending 行已删,仅存于内存 map),同样不能清。
+    {
+        let comments = state.pending_comments.lock().await;
+        for job in comments.values() {
+            referenced.insert(job.temp_dir.clone());
+        }
+    }
+    // 扫描/删除是同步 IO,整体移到 blocking 线程。
+    let _ = tokio::task::spawn_blocking(move || {
+        let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
         let mut orphans = 0;
         for e in rd.flatten() {
             let p = e.path();
@@ -714,15 +805,29 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("hanabi_"));
-            if is_hanabi && p.is_dir() && !referenced.contains(&p) {
-                let _ = std::fs::remove_dir_all(&p);
-                orphans += 1;
+            if !(is_hanabi && p.is_dir()) || referenced.contains(&p) {
+                continue;
             }
+            // 新目录避让:正在下载/正在发审批消息的作品目录此刻还没有 pending 记录
+            // (记录要等消息全部发出后才 INSERT,大图组上传可达数分钟),按修改时间
+            // 跳过近一小时内活跃的目录,防止误删在用文件。
+            let fresh = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|d| d.as_secs() < ORPHAN_MIN_AGE_SECS);
+            if fresh {
+                continue;
+            }
+            let _ = std::fs::remove_dir_all(&p);
+            orphans += 1;
         }
         if orphans > 0 {
             tracing::info!(orphans, "清理孤儿临时目录");
         }
-    }
+    })
+    .await;
 }
 
 #[async_trait]
@@ -755,69 +860,84 @@ impl Sink for TelegramSink {
         // 报错、投递卡死重试(批准后 send_group 复用同一批 prepared 文件,同样会退化,一致)。
         let oversized = any_oversized_for_photo(&prepared);
 
-        if n == 1 {
-            let msg = if oversized {
-                tg_retry(|| {
-                    bot.send_document(chat.clone(), InputFile::file(&prepared[0]))
-                        .caption(format!("【待审】\n{caption}"))
-                        .parse_mode(ParseMode::Html)
+        let send_result: Result<()> = async {
+            if n == 1 {
+                let msg = if oversized {
+                    tg_retry(|| {
+                        bot.send_document(chat.clone(), InputFile::file(&prepared[0]))
+                            .caption(format!("【待审】\n{caption}"))
+                            .parse_mode(ParseMode::Html)
+                            .reply_markup(keyboard.clone())
+                    })
+                    .await?
+                } else {
+                    tg_retry(|| {
+                        bot.send_photo(chat.clone(), InputFile::file(&prepared[0]))
+                            .caption(format!("【待审】\n{caption}"))
+                            .parse_mode(ParseMode::Html)
+                            .reply_markup(keyboard.clone())
+                    })
+                    .await?
+                };
+                review_ids.push(msg.id);
+            } else {
+                // 与发布侧同一套分批逻辑:sendMediaGroup 硬限 10,超 10 张的作品不分批
+                // 必收 400 → 不入库 → 每轮重下重发的死循环。
+                let first_cap = format!("【待审 · 共 {n} 张】\n{caption}");
+                let mode = if oversized {
+                    MediaMode::Document
+                } else {
+                    MediaMode::Photo { spoiler: false }
+                };
+                send_batches(bot, &chat, &prepared, &first_cap, &mode, &mut review_ids).await?;
+                let ctrl = tg_retry(|| {
+                    bot.send_message(chat.clone(), format!("👆 上面 {n} 张,请审批"))
                         .reply_markup(keyboard.clone())
                 })
-                .await?
-            } else {
-                tg_retry(|| {
-                    bot.send_photo(chat.clone(), InputFile::file(&prepared[0]))
-                        .caption(format!("【待审】\n{caption}"))
-                        .parse_mode(ParseMode::Html)
-                        .reply_markup(keyboard.clone())
-                })
-                .await?
-            };
-            review_ids.push(msg.id);
-        } else {
-            let first_cap = format!("【待审 · 共 {n} 张】\n{caption}");
-            let msgs = if oversized {
-                tg_retry(|| {
-                    bot.send_media_group(
-                        chat.clone(),
-                        build_documents_with_caption(&prepared, &first_cap),
-                    )
-                })
-                .await?
-            } else {
-                tg_retry(|| {
-                    bot.send_media_group(chat.clone(), build_media(&prepared, &first_cap, false))
-                })
-                .await?
-            };
-            review_ids.extend(msgs.iter().map(|m| m.id));
-            let ctrl = tg_retry(|| {
-                bot.send_message(chat.clone(), format!("👆 上面 {n} 张,请审批"))
-                    .reply_markup(keyboard.clone())
-            })
-            .await?;
-            review_ids.push(ctrl.id);
+                .await?;
+                review_ids.push(ctrl.id);
+            }
+            Ok(())
         }
+        .await;
 
         // 持久化 pending(发送成功后才写,保证按钮一定对得上)。
-        let files_str: Vec<String> = prepared
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let msg_ids: Vec<i32> = review_ids.iter().map(|m| m.0).collect();
-        let originals_str: Vec<String> = originals
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let files_json = serde_json::to_string(&files_str)?;
-        let msg_json = serde_json::to_string(&msg_ids)?;
-        let originals_json = serde_json::to_string(&originals_str)?;
-        {
-            let db = self.state.db.lock().await;
-            db.execute(
-                "INSERT OR REPLACE INTO pending(token, files, caption, msg_ids, originals, created_at, state) VALUES(?1,?2,?3,?4,?5,?6,'pending')",
-                rusqlite::params![token as i64, files_json, caption, msg_json, originals_json, now_secs()],
-            )?;
+        let insert_result: Result<()> = if send_result.is_ok() {
+            async {
+                let files_str: Vec<String> = prepared
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                let msg_ids: Vec<i32> = review_ids.iter().map(|m| m.0).collect();
+                let originals_str: Vec<String> = originals
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                let files_json = serde_json::to_string(&files_str)?;
+                let msg_json = serde_json::to_string(&msg_ids)?;
+                let originals_json = serde_json::to_string(&originals_str)?;
+                let db = self.state.db.lock().await;
+                db.execute(
+                    "INSERT OR REPLACE INTO pending(token, files, caption, msg_ids, originals, created_at, state, is_r18) VALUES(?1,?2,?3,?4,?5,?6,'pending',?7)",
+                    rusqlite::params![token as i64, files_json, caption, msg_json, originals_json, now_secs(), item.is_r18],
+                )?;
+                Ok(())
+            }
+            .await
+        } else {
+            Ok(())
+        };
+
+        // 发送或写库任一步失败:补偿删除已发出的消息,否则留下无 pending 记录的
+        // 孤儿审批组(按钮永远"该条已失效"),且 pipeline 不 mark_pushed、下轮重投
+        // 同一作品,私聊出现重复。
+        if let Err(e) = send_result.and(insert_result) {
+            // 补偿也带限流重试:触发补偿的最常见原因正是严重限流(tg_retry 5 次耗尽),
+            // 裸调用几乎必然再吃 429,补偿等于没做。
+            for mid in &review_ids {
+                let _ = tg_retry(|| bot.delete_message(chat.clone(), *mid)).await;
+            }
+            return Err(e);
         }
         Ok(())
     }
@@ -828,10 +948,11 @@ struct PendingWork {
     caption: String,
     msg_ids: Vec<i32>,
     originals: Vec<PathBuf>,
+    is_r18: bool,
 }
 
 fn decode_pending(row: PendingRow) -> Result<PendingWork> {
-    let (files_json, caption, msg_json, originals_json) = row;
+    let (files_json, caption, msg_json, originals_json, is_r18) = row;
     let files = serde_json::from_str::<Vec<String>>(&files_json)?
         .into_iter()
         .map(PathBuf::from)
@@ -847,6 +968,7 @@ fn decode_pending(row: PendingRow) -> Result<PendingWork> {
         caption,
         msg_ids,
         originals,
+        is_r18,
     })
 }
 
@@ -866,22 +988,24 @@ async fn finish_claimed(
             return Err(e);
         }
     };
-    let spoiler = work.caption.contains("🔞 R18");
+    let mut sent: Vec<MessageId> = Vec::new();
     let send_result = if publish {
         send_group(
             &state.bot,
             &state.publish_channel,
             &work.files,
             &work.caption,
-            spoiler,
+            work.is_r18, // 结构化字段决定剧透遮罩,不再从 caption 文本反推
+            &mut sent,
         )
         .await
     } else {
-        Ok(None)
+        Ok(())
     };
-    let first_id = match send_result {
-        Ok(first_id) => first_id,
-        Err(e) => {
+    let first_id = sent.first().copied();
+    if let Err(e) = send_result {
+        if first_id.is_none() {
+            // 一张都没发出:恢复 pending,原审批按钮/下次 /approve 可安全重试。
             let restore = {
                 let db = state.db.lock().await;
                 restore_pending(&db, token)
@@ -891,6 +1015,26 @@ async fn finish_claimed(
             }
             return Err(e);
         }
+        // 部分批次已进频道:恢复重试会从第一批重发造成频道重复,按已发布收尾并转人工。
+        tracing::warn!(error = %e, token, "发布部分成功,后续批次失败,按已发布收尾");
+        let _ = state
+            .bot
+            .send_message(
+                state.review_chat.clone(),
+                "⚠️ 该条仅部分图片发布成功(后续批次失败),已按已发布处理;请检查频道帖,必要时手动补发缺图",
+            )
+            .await;
+    }
+
+    // 先登记评论任务再做删消息等慢网络操作:频道帖发出后 Telegram 通常 1 秒内就把
+    // auto-forward 投到讨论组,若登记晚于删除循环(最多 11 条、每条一次往返),
+    // deliver_comment 查不到任务,原图静默不进评论区(auto-forward 是一次性事件)。
+    let registered = match (publish, first_id) {
+        (true, Some(mid)) if !work.originals.is_empty() => {
+            register_comment(state, mid.0, &work.originals).await;
+            true
+        }
+        _ => false,
     };
 
     for mid in &work.msg_ids {
@@ -904,11 +1048,8 @@ async fn finish_claimed(
         .lock()
         .await
         .execute("DELETE FROM pending WHERE token=?1", [token]);
-    match (publish, first_id) {
-        (true, Some(mid)) if !work.originals.is_empty() => {
-            register_comment(state, mid.0, &work.originals).await;
-        }
-        _ => cleanup(&work.files),
+    if !registered {
+        cleanup(&work.files);
     }
     delete_result.context("删除已完成的审批记录失败")?;
     Ok(())
@@ -986,7 +1127,13 @@ pub async fn run_review_loop(
                             if let Some(chan_msg_id) =
                                 match_auto_forward(&msg, &state.publish_channel)
                             {
-                                deliver_comment(&state, &msg, chan_msg_id).await;
+                                // 原图上传(几十 MB、分批、限流可再等数十秒)移出轮询
+                                // 循环:内联 await 会让按钮 3 秒内无法应答,阻塞超
+                                // 120s 时 sweep 还会把未消费的评论任务清掉。
+                                let st = state.clone();
+                                tokio::spawn(async move {
+                                    deliver_comment(&st, &msg, chan_msg_id).await;
+                                });
                             } else if let Err(e) =
                                 handle_command(&state, &msg, &trigger, &link).await
                             {
@@ -1033,13 +1180,25 @@ async fn handle_command(
                 .bot
                 .send_message(msg.chat.id, "🔗 收到链接,抓取中…")
                 .await?;
-            let _ = link
-                .send(LinkJob {
+            // try_send:与 /run 同理,抓取执行期间主循环不消费 link_rx(容量 16),
+            // 阻塞式 send 在通道满时会把整个 review loop 挂死。
+            if link
+                .try_send(LinkJob {
                     url,
                     user_msg_id: msg.id.0,
                     notice_msg_id: notice.id.0,
                 })
-                .await;
+                .is_err()
+            {
+                let _ = state
+                    .bot
+                    .edit_message_text(
+                        msg.chat.id,
+                        notice.id,
+                        "⏳ 链接队列已满,请稍后重发".to_string(),
+                    )
+                    .await;
+            }
         }
         return Ok(());
     }
@@ -1057,8 +1216,20 @@ async fn handle_command(
                 .await?;
         } else {
             let count = claimed.len();
+            let tokens: Vec<i64> = claimed.iter().map(|(t, _)| *t).collect();
             let task_state = state.clone();
-            tokio::spawn(publish_all_claimed(task_state, claimed));
+            tokio::spawn(async move {
+                // JoinError 兜底:批量任务 panic 时把仍卡在 publishing 的记录恢复为
+                // pending(restore 的条件 UPDATE 保证已完成/已恢复的不受影响)。
+                let inner = tokio::spawn(publish_all_claimed(task_state.clone(), claimed));
+                if let Err(join_err) = inner.await {
+                    tracing::error!(error = %join_err, "一键批准任务异常退出,恢复未完成项为待审");
+                    let db = task_state.db.lock().await;
+                    for t in tokens {
+                        let _ = restore_pending(&db, t);
+                    }
+                }
+            });
             state
                 .bot
                 .send_message(msg.chat.id, format!("⏳ 正在一键批准并发布 {count} 条…"))
@@ -1067,10 +1238,12 @@ async fn handle_command(
         return Ok(());
     }
     let reply: String = match cmd {
-        "/run" => {
-            let _ = trigger.send(()).await;
-            "🚀 开始手动抓取一轮,有命中会发审批消息过来".to_string()
-        }
+        // try_send:通道满(容量 8)时阻塞式 send 会把整个 review loop 挂死在这里
+        // (抓取执行期间主循环不消费 trigger),按钮/命令全部无响应。
+        "/run" => match trigger.try_send(()) {
+            Ok(()) => "🚀 开始手动抓取一轮,有命中会发审批消息过来".to_string(),
+            Err(_) => "⏳ 抓取已在排队/进行中,请稍候".to_string(),
+        },
         "/status" => {
             let count: i64 = {
                 let db = state.db.lock().await;
@@ -1146,6 +1319,14 @@ fn extract_supported_url(text: &str) -> Option<String> {
 }
 
 async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<()> {
+    // 权限校验:仅审批人本人可操作按钮(纵深防御,防 review_chat 被误配成可多人
+    // 触达的会话时他人代批直发频道)。只在 owner 为正(私聊形态,chat_id==user_id,
+    // 二者同值可比)时启用;owner 为负(群组 id)或 0(非数字降级形态)时用户 id
+    // 与 owner 不可比,跳过以维持旧行为——群组形态的权限语义由部署者自担。
+    if state.owner > 0 && q.from.id.0 as i64 != state.owner {
+        let _ = state.bot.answer_callback_query(q.id).text("无权限").await;
+        return Ok(());
+    }
     let data = q.data.clone().unwrap_or_default();
     let (action, token_str) = data.split_once(':').unwrap_or(("", ""));
     let token: i64 = token_str.parse().unwrap_or(-1);
@@ -1199,19 +1380,33 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
         .await;
 
     // 后台执行:批准→发频道;然后删私聊整组 + 清文件 + 删 pending。
-    // 失败(如限流)恢复 pending,发提示可重试。
+    // 失败(如限流)恢复 pending,发提示可重试。内层再包一个 task 检查 JoinError:
+    // finish_claimed panic 时该 token 会卡死在 publishing(按钮只回"已在发布中"、
+    // /approve 也不选它,直到重启),此处兜底恢复为 pending。
     let state = state.clone();
     tokio::spawn(async move {
-        if let Err(e) = finish_claimed(&state, token, row, is_ok).await {
-            tracing::warn!(error = %e, token, "审批操作失败,pending 保留可重试");
-            if is_ok {
-                let _ = state
-                    .bot
-                    .send_message(
-                        state.review_chat.clone(),
-                        "⚠️ 发布失败(可能限流),过会儿再点一次那条审批",
-                    )
-                    .await;
+        let inner = tokio::spawn({
+            let state = state.clone();
+            async move { finish_claimed(&state, token, row, is_ok).await }
+        });
+        match inner.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, token, "审批操作失败,pending 保留可重试");
+                if is_ok {
+                    let _ = state
+                        .bot
+                        .send_message(
+                            state.review_chat.clone(),
+                            "⚠️ 发布失败(可能限流),过会儿再点一次那条审批",
+                        )
+                        .await;
+                }
+            }
+            Err(join_err) => {
+                tracing::error!(error = %join_err, token, "审批任务异常退出,恢复待审状态");
+                let db = state.db.lock().await;
+                let _ = restore_pending(&db, token);
             }
         }
     });
@@ -1333,7 +1528,9 @@ mod tests {
                     created_at INTEGER NOT NULL DEFAULT 0
                 );
                 INSERT INTO pending(token, files, caption, msg_ids, created_at)
-                VALUES(1, '[]', 'legacy', '[]', 1);",
+                VALUES(1, '[]', 'legacy', '[]', 1);
+                INSERT INTO pending(token, files, caption, msg_ids, created_at)
+                VALUES(2, '[]', '🔞 R18' || char(10) || 'Title: t', '[]', 1);",
             )
             .unwrap();
         drop(legacy);
@@ -1354,10 +1551,20 @@ mod tests {
             .collect();
         assert!(cols.contains(&"originals".to_string()));
         assert!(cols.contains(&"state".to_string()));
+        assert!(cols.contains(&"is_r18".to_string()));
         let state: String = conn
             .query_row("SELECT state FROM pending WHERE token=1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(state, "pending");
+        // 旧库回填:caption 含旧版 R18 标记的行 is_r18 置 1,普通行保持 0。
+        let r18: i64 = conn
+            .query_row("SELECT is_r18 FROM pending WHERE token=2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(r18, 1);
+        let plain: i64 = conn
+            .query_row("SELECT is_r18 FROM pending WHERE token=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(plain, 0);
     }
 
     #[test]
@@ -1371,7 +1578,8 @@ mod tests {
                 msg_ids TEXT NOT NULL,
                 originals TEXT NOT NULL DEFAULT '[]',
                 created_at INTEGER NOT NULL DEFAULT 0,
-                state TEXT NOT NULL DEFAULT 'pending'
+                state TEXT NOT NULL DEFAULT 'pending',
+                is_r18 INTEGER NOT NULL DEFAULT 0
             );",
         )
         .unwrap();
@@ -1384,7 +1592,7 @@ mod tests {
 
         assert!(matches!(
             claim_pending(&db, 1).unwrap(),
-            PendingClaim::Claimed((_, caption, _, _)) if caption == "caption"
+            PendingClaim::Claimed((_, caption, _, _, _)) if caption == "caption"
         ));
         assert!(matches!(
             claim_pending(&db, 1).unwrap(),
@@ -1408,11 +1616,12 @@ mod tests {
                 msg_ids TEXT NOT NULL,
                 originals TEXT NOT NULL DEFAULT '[]',
                 created_at INTEGER NOT NULL DEFAULT 0,
-                state TEXT NOT NULL DEFAULT 'pending'
+                state TEXT NOT NULL DEFAULT 'pending',
+                is_r18 INTEGER NOT NULL DEFAULT 0
             );
-            INSERT INTO pending VALUES(1, '[]', 'first', '[]', '[]', 20, 'pending');
-            INSERT INTO pending VALUES(2, '[]', 'cancelled', '[]', '[]', 10, 'publishing');
-            INSERT INTO pending VALUES(3, '[]', 'oldest', '[]', '[]', 10, 'pending');",
+            INSERT INTO pending VALUES(1, '[]', 'first', '[]', '[]', 20, 'pending', 0);
+            INSERT INTO pending VALUES(2, '[]', 'cancelled', '[]', '[]', 10, 'publishing', 0);
+            INSERT INTO pending VALUES(3, '[]', 'oldest', '[]', '[]', 10, 'pending', 1);",
         )
         .unwrap();
 
@@ -1421,12 +1630,60 @@ mod tests {
         assert_eq!(tokens, vec![3, 1]);
         assert!(claimed
             .iter()
-            .all(|(_, (_, caption, _, _))| { caption == "oldest" || caption == "first" }));
+            .all(|(_, (_, caption, _, _, _))| { caption == "oldest" || caption == "first" }));
+        // is_r18 随行读出,发布时据此打剧透遮罩。
+        assert!(claimed.iter().any(|(t, (_, _, _, _, r18))| *t == 3 && *r18));
         assert!(claim_all_pending(&mut db).unwrap().is_empty());
         let cancelled_state: String = db
             .query_row("SELECT state FROM pending WHERE token=2", [], |r| r.get(0))
             .unwrap();
         assert_eq!(cancelled_state, "publishing");
+    }
+
+    #[test]
+    fn decode_pending_roundtrip_and_bad_json() {
+        // 正常行:JSON 数组解码为路径/消息 id,is_r18 透传。
+        let work = decode_pending((
+            r#"["/tmp/a.jpg","/tmp/b.jpg"]"#.into(),
+            "cap".into(),
+            "[10,11]".into(),
+            r#"["/tmp/a.jpg"]"#.into(),
+            true,
+        ))
+        .unwrap();
+        assert_eq!(work.files.len(), 2);
+        assert_eq!(work.msg_ids, vec![10, 11]);
+        assert_eq!(work.originals, vec![PathBuf::from("/tmp/a.jpg")]);
+        assert!(work.is_r18);
+
+        // originals 坏 JSON(旧版本残留/手改库)降级为空,不报错。
+        let work = decode_pending((
+            "[]".into(),
+            "cap".into(),
+            "[]".into(),
+            "not-json".into(),
+            false,
+        ))
+        .unwrap();
+        assert!(work.originals.is_empty());
+
+        // files/msg_ids 坏 JSON 必须报错(缺了它们无法完成审批动作)。
+        assert!(decode_pending((
+            "not-json".into(),
+            "cap".into(),
+            "[]".into(),
+            "[]".into(),
+            false
+        ))
+        .is_err());
+        assert!(decode_pending((
+            "[]".into(),
+            "cap".into(),
+            "not-json".into(),
+            "[]".into(),
+            false
+        ))
+        .is_err());
     }
 
     #[test]

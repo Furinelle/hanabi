@@ -46,6 +46,8 @@ mod tests {
         assert_eq!(t.tags, vec!["イラスト".to_string(), "原神".to_string()]);
         assert_eq!(t.pixiv_type, None);
         assert_eq!(t.images.len(), 1);
+        // gallery-dl 语义:nick=显示名(展示)、name=@handle(拼链接)。
         assert_eq!(t.author.name, "Artist B");
+        assert_eq!(t.author.url, "https://x.com/artist_b");
     }
 }

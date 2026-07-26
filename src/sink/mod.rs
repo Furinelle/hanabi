@@ -16,6 +16,13 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// HTML 属性值转义:在文本转义之外还须转 `"`。href="…" 由双引号包裹,外部可控的
+/// URL(X handle、抖音 sec_uid 拼出的作者链接)含引号会跳出属性注入任意标签,
+/// 或直接让 Telegram HTML 解析报 400 → 整条交付确定性失败无限重试。
+fn attr_escape(s: &str) -> String {
+    html_escape(s).replace('"', "&quot;")
+}
+
 /// caption 格式(HTML):
 /// ```text
 /// 🔞 R18            (仅 is_r18 时)
@@ -57,9 +64,9 @@ pub fn render_caption(item: &MediaItem) -> String {
     };
     s.push_str(&format!(
         "From <a href=\"{}\">{}</a> By <a href=\"{}\">{}</a>",
-        item.url,
+        attr_escape(&item.url),
         src,
-        item.author.url,
+        attr_escape(&item.author.url),
         html_escape(&item.author.name)
     ));
     s
@@ -119,6 +126,16 @@ mod tests {
         it.title = Some("a<b>&c".into());
         let c = render_caption(&it);
         assert!(c.contains("a&lt;b&gt;&amp;c"));
+    }
+
+    #[test]
+    fn caption_escapes_href_attribute() {
+        let mut it = item();
+        it.author.url = "https://x.com/a\"><b>x".into();
+        let c = render_caption(&it);
+        // 引号被转义,不会跳出 href 属性。
+        assert!(!c.contains("a\"><b>"));
+        assert!(c.contains("&quot;"));
     }
 
     #[test]

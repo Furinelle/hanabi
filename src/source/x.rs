@@ -91,13 +91,15 @@ pub fn parse_twitter(root: &Value, origin: &str) -> Vec<MediaItem> {
             continue;
         }
         let author = meta.get("author");
+        // gallery-dl twitter 提取器的字段语义与直觉相反(twitter.py _transform_user):
+        // name = screen_name(@handle)、nick = 显示名。展示用 nick,拼链接用 name。
         let author_name = author
-            .and_then(|a| a.get("name"))
+            .and_then(|a| a.get("nick"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
         let handle = author
-            .and_then(|a| a.get("nick"))
+            .and_then(|a| a.get("name"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let tags = meta

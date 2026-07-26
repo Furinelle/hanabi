@@ -92,6 +92,11 @@ pub fn parse_note(html: &str, origin: &str) -> Option<MediaItem> {
             .map(String::from)
             .or_else(|| v.as_u64().map(|n| n.to_string()))
     })?;
+    // 只接受纯数字 id:该值会拼进临时目录路径(hanabi_douyin_<id>),后续还会对
+    // 该路径 remove_dir_all;页面数据不可信,含 `/`、`..` 会造成路径穿越。
+    if aweme_id.is_empty() || !aweme_id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
 
     // 每张图取 url_list[0](tplv-dy-aweme-images,无水印全分辨率)。
     let images: Vec<ImageRef> = item
@@ -162,32 +167,38 @@ pub fn build_client() -> Result<reqwest::Client> {
 
 /// 抓 note 页并解析为 MediaItem。`url` 可为短链(自动跟随跳转)。
 pub async fn fetch_note(client: &reqwest::Client, url: &str, origin: &str) -> Result<MediaItem> {
-    let html = client
-        .get(url)
-        .send()
-        .await
-        .context("抖音页面请求失败")?
-        .text()
-        .await
-        .context("抖音页面读取失败")?;
+    let resp = client.get(url).send().await.context("抖音页面请求失败")?;
+    // 入口只校验了用户提交的原始 URL,client 会跟随最多 10 次重定向;
+    // 落点若跳出抖音域,页面内容完全不可信,拒绝解析。
+    let final_url = resp.url().to_string();
+    if !is_douyin_url(&final_url) {
+        anyhow::bail!("抖音链接重定向到非抖音域名,拒绝解析: {final_url}");
+    }
+    let html = resp.text().await.context("抖音页面读取失败")?;
     parse_note(&html, origin).context("抖音页面解析失败(无 _ROUTER_DATA / 结构变更 / 验证墙)")
 }
 
-/// 下载图文每张图到 dir,webp 转 jpg(Telegram sendPhoto 对 webp 不友好)。返回落地文件。
+/// 下载图文每张图到 dir,webp 转 jpg(Telegram sendPhoto 对 webp 不友好)。
+/// 返回(落地文件, 失败张数):部分失败时频道帖会缺图,调用方须提示用户。
 pub async fn download_images(
     client: &reqwest::Client,
     item: &MediaItem,
     dir: &Path,
-) -> Vec<PathBuf> {
+) -> (Vec<PathBuf>, usize) {
     let _ = std::fs::create_dir_all(dir);
+    crate::util::restrict_dir(dir);
     let mut out = Vec::new();
+    let mut failed = 0usize;
     for (i, img) in item.images.iter().enumerate() {
         match download_one(client, &img.url, dir, i).await {
             Ok(p) => out.push(p),
-            Err(e) => tracing::warn!(idx = i, error = %e, "抖音图片下载失败"),
+            Err(e) => {
+                failed += 1;
+                tracing::warn!(idx = i, error = %e, "抖音图片下载失败");
+            }
         }
     }
-    out
+    (out, failed)
 }
 
 async fn download_one(
@@ -205,8 +216,8 @@ async fn download_one(
         .await
         .context("图片读取失败")?;
     // 抖音图为 webp,转 jpg(q92)发 Telegram;转码放阻塞线程。
+    // Bytes 本身 Send + 'static 且可 Deref 到 &[u8],直接 move,免整图拷贝。
     let dir = dir.to_path_buf();
-    let bytes = bytes.to_vec();
     tokio::task::spawn_blocking(move || -> Result<PathBuf> {
         let img = image::load_from_memory(&bytes).context("解码图片失败")?;
         let out = dir.join(format!("{idx:03}.jpg"));

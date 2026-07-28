@@ -81,12 +81,31 @@ async fn main() -> Result<()> {
 
     let store = Store::open("hanabi.db")?;
     let chain = FilterChain::standard();
+    let gallery = if cfg.gallery.enabled() {
+        match hanabi::gallery::GalleryClient::new(
+            cfg.gallery.endpoint.clone(),
+            cfg.gallery.resolved_token(),
+        ) {
+            Ok(c) => {
+                tracing::info!(endpoint = %cfg.gallery.endpoint, "图库入库已启用(Shirogane)");
+                Some(c)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "图库客户端初始化失败,审批将不显示入库按钮");
+                None
+            }
+        }
+    } else {
+        tracing::info!("未配置 [gallery],跳过图库入库");
+        None
+    };
     // Arc 包裹:手动链接处理移入独立 task 时需克隆共享。
     let sink = Arc::new(TelegramSink::new(
         token,
         cfg.telegram.channel_id.clone(),
         cfg.telegram.publish_channel.clone(),
         "hanabi.db",
+        gallery,
     )?);
     // 手动触发通道:/run 命令经此通知抓取循环立即跑一轮。
     let (trigger_tx, mut trigger_rx) = tokio::sync::mpsc::channel::<()>(8);

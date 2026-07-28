@@ -14,6 +14,7 @@ use teloxide::types::{
 };
 use tokio::sync::Mutex;
 
+use crate::gallery::GalleryClient;
 use crate::model::MediaItem;
 use crate::sink::{needs_downscale, render_caption, Sink};
 
@@ -70,6 +71,8 @@ pub struct ReviewState {
     counter: AtomicU64,
     // 频道帖首条 msg_id → 待投递评论区的原图任务。
     pending_comments: Mutex<std::collections::HashMap<i32, CommentJob>>,
+    /// 可选图库入库客户端(Shirogane)。None 时不显示「发送并入库」。
+    gallery: Option<GalleryClient>,
 }
 
 impl ReviewState {
@@ -88,6 +91,7 @@ impl TelegramSink {
         review_chat_id: String,
         publish_channel_id: String,
         db_path: &str,
+        gallery: Option<GalleryClient>,
     ) -> Result<Self> {
         let owner: i64 = match parse_owner(&review_chat_id) {
             Some(n) => n,
@@ -119,7 +123,8 @@ impl TelegramSink {
                 originals  TEXT NOT NULL DEFAULT '[]',
                 created_at INTEGER NOT NULL DEFAULT 0,
                 state      TEXT NOT NULL DEFAULT 'pending',
-                is_r18     INTEGER NOT NULL DEFAULT 0
+                is_r18     INTEGER NOT NULL DEFAULT 0,
+                item_meta  TEXT NOT NULL DEFAULT '{}'
              );",
         )
         .context("初始化 pending 表失败")?;
@@ -155,6 +160,11 @@ impl TelegramSink {
                 [],
             );
         }
+        // item_meta: MediaItem JSON,审批「发送并入库」时带标签/来源入库。
+        let _ = conn.execute(
+            "ALTER TABLE pending ADD COLUMN item_meta TEXT NOT NULL DEFAULT '{}'",
+            [],
+        );
         // 进程崩溃时未完成的 publishing 没有活着的发送任务,启动后恢复为可重试状态。
         conn.execute(
             "UPDATE pending SET state='pending' WHERE state='publishing'",
@@ -197,6 +207,7 @@ impl TelegramSink {
                 db: Mutex::new(conn),
                 counter: AtomicU64::new(max_token as u64 + 1),
                 pending_comments: Mutex::new(std::collections::HashMap::new()),
+                gallery,
             }),
         })
     }
@@ -244,9 +255,35 @@ impl TelegramSink {
             }
             // 部分成功:整条重发会造成频道重复内容,按已发布收尾,转人工检查。
             tracing::warn!(error = %e, id = %item.source_id, "直发部分成功,后续批次失败");
+            // 部分成功也尝试入库(已有文件仍有意义)
+            self.maybe_ingest(item, files).await;
             return Ok(PublishOutcome::Partial);
         }
+        // 手动链接直发成功:同步入库(帖子自带标签)
+        self.maybe_ingest(item, files).await;
         Ok(PublishOutcome::Full)
+    }
+
+    async fn maybe_ingest(&self, item: &MediaItem, files: &[PathBuf]) {
+        let Some(gallery) = self.state.gallery.as_ref() else {
+            return;
+        };
+        // 优先用原图路径(files 在调用侧是下载原图)
+        if let Err(e) = gallery.ingest(item, files).await {
+            tracing::warn!(
+                id = %item.source_id,
+                error = %e,
+                "直发后图库入库失败(频道已发,可稍后重试入库)"
+            );
+            let _ = self
+                .state
+                .bot
+                .send_message(
+                    self.state.review_chat.clone(),
+                    format!("⚠️ 频道已发,但图库入库失败: {e}"),
+                )
+                .await;
+        }
     }
 
     /// 删审批私聊里的若干消息(手动链接发布后清理:用户链接 + "抓取中"提示)。
@@ -291,7 +328,7 @@ fn to_recipient(id: String) -> Recipient {
     }
 }
 
-type PendingRow = (String, String, String, String, bool);
+type PendingRow = (String, String, String, String, bool, String);
 
 /// 审批记录的原子抢占结果。只有从 pending 成功切到 publishing 的回调能真正发图。
 enum PendingClaim {
@@ -321,9 +358,9 @@ fn claim_pending(db: &rusqlite::Connection, token: i64) -> rusqlite::Result<Pend
         });
     }
     let row = db.query_row(
-        "SELECT files, caption, msg_ids, originals, is_r18 FROM pending WHERE token=?1",
+        "SELECT files, caption, msg_ids, originals, is_r18, COALESCE(item_meta, '{}') FROM pending WHERE token=?1",
         [token],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
     )?;
     Ok(PendingClaim::Claimed(row))
 }
@@ -359,9 +396,9 @@ fn claim_all_pending(db: &mut rusqlite::Connection) -> rusqlite::Result<Vec<(i64
         )?;
         if changed == 1 {
             let row = tx.query_row(
-                "SELECT files, caption, msg_ids, originals, is_r18 FROM pending WHERE token=?1",
+                "SELECT files, caption, msg_ids, originals, is_r18, COALESCE(item_meta, '{}') FROM pending WHERE token=?1",
                 [token],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )?;
             claimed.push((token, row));
         }
@@ -847,10 +884,23 @@ impl Sink for TelegramSink {
         let prepared = tokio::task::spawn_blocking(move || prepare_all(&files_owned)).await??;
 
         let token = self.state.next_token();
-        let keyboard = InlineKeyboardMarkup::new(vec![vec![
-            InlineKeyboardButton::callback("✅ 发送到频道", format!("ok:{token}")),
-            InlineKeyboardButton::callback("❌ 丢弃", format!("no:{token}")),
-        ]]);
+        let keyboard = if self.state.gallery.is_some() {
+            InlineKeyboardMarkup::new(vec![
+                vec![
+                    InlineKeyboardButton::callback("✅ 发送到频道", format!("ok:{token}")),
+                    InlineKeyboardButton::callback("📦 发送并入库", format!("ok_lib:{token}")),
+                ],
+                vec![InlineKeyboardButton::callback(
+                    "❌ 丢弃",
+                    format!("no:{token}"),
+                )],
+            ])
+        } else {
+            InlineKeyboardMarkup::new(vec![vec![
+                InlineKeyboardButton::callback("✅ 发送到频道", format!("ok:{token}")),
+                InlineKeyboardButton::callback("❌ 丢弃", format!("no:{token}")),
+            ]])
+        };
 
         let n = prepared.len();
         let bot = &self.state.bot;
@@ -916,10 +966,11 @@ impl Sink for TelegramSink {
                 let files_json = serde_json::to_string(&files_str)?;
                 let msg_json = serde_json::to_string(&msg_ids)?;
                 let originals_json = serde_json::to_string(&originals_str)?;
+                let item_meta = serde_json::to_string(item).unwrap_or_else(|_| "{}".into());
                 let db = self.state.db.lock().await;
                 db.execute(
-                    "INSERT OR REPLACE INTO pending(token, files, caption, msg_ids, originals, created_at, state, is_r18) VALUES(?1,?2,?3,?4,?5,?6,'pending',?7)",
-                    rusqlite::params![token as i64, files_json, caption, msg_json, originals_json, now_secs(), item.is_r18],
+                    "INSERT OR REPLACE INTO pending(token, files, caption, msg_ids, originals, created_at, state, is_r18, item_meta) VALUES(?1,?2,?3,?4,?5,?6,'pending',?7,?8)",
+                    rusqlite::params![token as i64, files_json, caption, msg_json, originals_json, now_secs(), item.is_r18, item_meta],
                 )?;
                 Ok(())
             }
@@ -949,10 +1000,11 @@ struct PendingWork {
     msg_ids: Vec<i32>,
     originals: Vec<PathBuf>,
     is_r18: bool,
+    item_meta: String,
 }
 
 fn decode_pending(row: PendingRow) -> Result<PendingWork> {
-    let (files_json, caption, msg_json, originals_json, is_r18) = row;
+    let (files_json, caption, msg_json, originals_json, is_r18, item_meta) = row;
     let files = serde_json::from_str::<Vec<String>>(&files_json)?
         .into_iter()
         .map(PathBuf::from)
@@ -969,16 +1021,19 @@ fn decode_pending(row: PendingRow) -> Result<PendingWork> {
         msg_ids,
         originals,
         is_r18,
+        item_meta,
     })
 }
 
 /// 完成一条已抢占的审批。发布/解析失败会恢复为 pending，供按钮或下一次
 /// `/approve` 重试；成功后删除审批消息、pending 记录并接续原图评论任务。
+/// `archive=true` 时在发布成功后额外入库 Shirogane。
 async fn finish_claimed(
     state: &Arc<ReviewState>,
     token: i64,
     row: PendingRow,
     publish: bool,
+    archive: bool,
 ) -> Result<()> {
     let work = match decode_pending(row) {
         Ok(work) => work,
@@ -1026,6 +1081,20 @@ async fn finish_claimed(
             .await;
     }
 
+    // 发布成功(或至少部分成功)且需要入库
+    if publish && first_id.is_some() && archive {
+        if let Err(e) = archive_pending_work(state, &work).await {
+            tracing::warn!(error = %e, token, "审批发布后图库入库失败");
+            let _ = state
+                .bot
+                .send_message(
+                    state.review_chat.clone(),
+                    format!("⚠️ 频道已发,但图库入库失败: {e}"),
+                )
+                .await;
+        }
+    }
+
     // 先登记评论任务再做删消息等慢网络操作:频道帖发出后 Telegram 通常 1 秒内就把
     // auto-forward 投到讨论组,若登记晚于删除循环(最多 11 条、每条一次往返),
     // deliver_comment 查不到任务,原图静默不进评论区(auto-forward 是一次性事件)。
@@ -1055,13 +1124,29 @@ async fn finish_claimed(
     Ok(())
 }
 
+async fn archive_pending_work(state: &Arc<ReviewState>, work: &PendingWork) -> Result<()> {
+    let Some(gallery) = state.gallery.as_ref() else {
+        anyhow::bail!("图库未配置");
+    };
+    let item: MediaItem = serde_json::from_str(&work.item_meta)
+        .context("pending item_meta 无法解析为 MediaItem(旧审批请丢弃重抓)")?;
+    // 优先原图;无则用发布用的缩放图
+    let paths = if !work.originals.is_empty() {
+        work.originals.as_slice()
+    } else {
+        work.files.as_slice()
+    };
+    gallery.ingest(&item, paths).await
+}
+
 /// 顺序发布 `/approve` 原子抢占到的全部记录。顺序发送避免瞬间把大量图组并发压给
 /// Telegram；单条失败不阻断后续项，失败记录恢复为 pending。
 async fn publish_all_claimed(state: Arc<ReviewState>, claimed: Vec<(i64, PendingRow)>) {
     let total = claimed.len();
     let mut succeeded = 0usize;
     for (token, row) in claimed {
-        match finish_claimed(&state, token, row, true).await {
+        // /approve 一键批准:只发频道,不默认入库(需要入库请点「发送并入库」)
+        match finish_claimed(&state, token, row, true, false).await {
             Ok(()) => succeeded += 1,
             Err(e) => tracing::warn!(error = %e, token, "一键批准中的单条发布失败"),
         }
@@ -1254,7 +1339,7 @@ async fn handle_command(
         }
         "/ping" => "pong 🏓".to_string(),
         "/help" => {
-            "命令列表:\n/run — 立即抓取一轮\n/approve — 批准并发布全部剩余待审\n/status — 待审数+运行状态\n/ping — 存活测试\n/help — 本帮助\n\n💡 先逐条点 ❌ 丢弃不想推送的图片，再发 /approve 一键发布其余图片\n💡 直接发 Pixiv/X 作品链接 → 自动抓取并发布到频道"
+            "命令列表:\n/run — 立即抓取一轮\n/approve — 批准并发布全部剩余待审(仅频道,不入库)\n/status — 待审数+运行状态\n/ping — 存活测试\n/help — 本帮助\n\n💡 审批按钮:✅ 发送到频道 / 📦 发送并入库 / ❌ 丢弃\n💡 先逐条点 ❌ 丢弃不想推送的图片，再发 /approve 一键发布其余图片\n💡 直接发 Pixiv/X 作品链接 → 自动抓取并发布到频道(配置图库后同步入库)"
                 .to_string()
         }
         _ => return Ok(()),
@@ -1331,7 +1416,7 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
     let (action, token_str) = data.split_once(':').unwrap_or(("", ""));
     let token: i64 = token_str.parse().unwrap_or(-1);
 
-    if action != "ok" && action != "no" {
+    if action != "ok" && action != "ok_lib" && action != "no" {
         let _ = state
             .bot
             .answer_callback_query(q.id)
@@ -1365,21 +1450,24 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
             return Ok(());
         }
     };
-    let is_ok = action == "ok";
+    let publish = action == "ok" || action == "ok_lib";
+    let archive = action == "ok_lib";
 
     // 立即应答,停止按钮转圈(必须 3 秒内,否则 callback query 过期)。
     // 发图/删消息这些耗时操作放后台,不让你盯着转圈等上传。
     let _ = state
         .bot
         .answer_callback_query(q.id)
-        .text(if is_ok {
+        .text(if archive {
+            "⏳ 发布并入库中…"
+        } else if publish {
             "⏳ 发布中…"
         } else {
             "❌ 已丢弃"
         })
         .await;
 
-    // 后台执行:批准→发频道;然后删私聊整组 + 清文件 + 删 pending。
+    // 后台执行:批准→发频道(+可选入库);然后删私聊整组 + 清文件 + 删 pending。
     // 失败(如限流)恢复 pending,发提示可重试。内层再包一个 task 检查 JoinError:
     // finish_claimed panic 时该 token 会卡死在 publishing(按钮只回"已在发布中"、
     // /approve 也不选它,直到重启),此处兜底恢复为 pending。
@@ -1387,13 +1475,13 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
     tokio::spawn(async move {
         let inner = tokio::spawn({
             let state = state.clone();
-            async move { finish_claimed(&state, token, row, is_ok).await }
+            async move { finish_claimed(&state, token, row, publish, archive).await }
         });
         match inner.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, token, "审批操作失败,pending 保留可重试");
-                if is_ok {
+                if publish {
                     let _ = state
                         .bot
                         .send_message(
@@ -1539,6 +1627,7 @@ mod tests {
             "7794592020".into(),
             "@chan".into(),
             path.to_str().unwrap(),
+            None,
         )
         .unwrap();
         let conn = rusqlite::Connection::open(&path).unwrap();
@@ -1552,6 +1641,7 @@ mod tests {
         assert!(cols.contains(&"originals".to_string()));
         assert!(cols.contains(&"state".to_string()));
         assert!(cols.contains(&"is_r18".to_string()));
+        assert!(cols.contains(&"item_meta".to_string()));
         let state: String = conn
             .query_row("SELECT state FROM pending WHERE token=1", [], |r| r.get(0))
             .unwrap();
@@ -1579,7 +1669,8 @@ mod tests {
                 originals TEXT NOT NULL DEFAULT '[]',
                 created_at INTEGER NOT NULL DEFAULT 0,
                 state TEXT NOT NULL DEFAULT 'pending',
-                is_r18 INTEGER NOT NULL DEFAULT 0
+                is_r18 INTEGER NOT NULL DEFAULT 0,
+                item_meta TEXT NOT NULL DEFAULT '{}'
             );",
         )
         .unwrap();
@@ -1592,7 +1683,7 @@ mod tests {
 
         assert!(matches!(
             claim_pending(&db, 1).unwrap(),
-            PendingClaim::Claimed((_, caption, _, _, _)) if caption == "caption"
+            PendingClaim::Claimed((_, caption, _, _, _, _)) if caption == "caption"
         ));
         assert!(matches!(
             claim_pending(&db, 1).unwrap(),
@@ -1617,11 +1708,12 @@ mod tests {
                 originals TEXT NOT NULL DEFAULT '[]',
                 created_at INTEGER NOT NULL DEFAULT 0,
                 state TEXT NOT NULL DEFAULT 'pending',
-                is_r18 INTEGER NOT NULL DEFAULT 0
+                is_r18 INTEGER NOT NULL DEFAULT 0,
+                item_meta TEXT NOT NULL DEFAULT '{}'
             );
-            INSERT INTO pending VALUES(1, '[]', 'first', '[]', '[]', 20, 'pending', 0);
-            INSERT INTO pending VALUES(2, '[]', 'cancelled', '[]', '[]', 10, 'publishing', 0);
-            INSERT INTO pending VALUES(3, '[]', 'oldest', '[]', '[]', 10, 'pending', 1);",
+            INSERT INTO pending VALUES(1, '[]', 'first', '[]', '[]', 20, 'pending', 0, '{}');
+            INSERT INTO pending VALUES(2, '[]', 'cancelled', '[]', '[]', 10, 'publishing', 0, '{}');
+            INSERT INTO pending VALUES(3, '[]', 'oldest', '[]', '[]', 10, 'pending', 1, '{}');",
         )
         .unwrap();
 
@@ -1630,9 +1722,9 @@ mod tests {
         assert_eq!(tokens, vec![3, 1]);
         assert!(claimed
             .iter()
-            .all(|(_, (_, caption, _, _, _))| { caption == "oldest" || caption == "first" }));
+            .all(|(_, (_, caption, _, _, _, _))| { caption == "oldest" || caption == "first" }));
         // is_r18 随行读出,发布时据此打剧透遮罩。
-        assert!(claimed.iter().any(|(t, (_, _, _, _, r18))| *t == 3 && *r18));
+        assert!(claimed.iter().any(|(t, (_, _, _, _, r18, _))| *t == 3 && *r18));
         assert!(claim_all_pending(&mut db).unwrap().is_empty());
         let cancelled_state: String = db
             .query_row("SELECT state FROM pending WHERE token=2", [], |r| r.get(0))
@@ -1649,6 +1741,7 @@ mod tests {
             "[10,11]".into(),
             r#"["/tmp/a.jpg"]"#.into(),
             true,
+            "{}".into(),
         ))
         .unwrap();
         assert_eq!(work.files.len(), 2);
@@ -1663,6 +1756,7 @@ mod tests {
             "[]".into(),
             "not-json".into(),
             false,
+            "{}".into(),
         ))
         .unwrap();
         assert!(work.originals.is_empty());
@@ -1673,7 +1767,8 @@ mod tests {
             "cap".into(),
             "[]".into(),
             "[]".into(),
-            false
+            false,
+            "{}".into(),
         ))
         .is_err());
         assert!(decode_pending((
@@ -1681,7 +1776,8 @@ mod tests {
             "cap".into(),
             "not-json".into(),
             "[]".into(),
-            false
+            false,
+            "{}".into(),
         ))
         .is_err());
     }

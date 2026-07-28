@@ -1,5 +1,6 @@
 pub mod config;
 pub mod filter;
+pub mod gallery;
 pub mod gallerydl;
 pub mod model;
 pub mod pipeline;

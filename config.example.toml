@@ -4,6 +4,12 @@ poll_interval_secs = 1800
 channel_id = "123456789"          # 审批私聊的数字 chat_id(命令/审批要求数字 id;bot_token 走环境变量 HANABI_BOT_TOKEN)
 publish_channel = "@your_channel" # 必填:批准后发布的频道(@username 或 -100 开头的数字 id),缺了点「发送到频道」必失败
 
+# 可选:Shirogane 图库(Cloudflare Workers)。配置后审批出现「📦 发送并入库」;
+# 手动发作品链接直发频道成功后也会自动入库。token 也可用环境变量 HANABI_GALLERY_TOKEN。
+# [gallery]
+# endpoint = "https://shirogane.your-subdomain.workers.dev"
+# token = "replace-with-ingest-token"
+
 [gallery_dl]
 config_path = "gallery-dl.conf"
 probe_range = "1-20"

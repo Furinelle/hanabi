@@ -10,8 +10,40 @@ pub struct Config {
     pub gallery_dl: GalleryDlCfg,
     #[serde(default)]
     pub x_image: XImageCfg,
+    /// 可选:Shirogane 图库入库(CF Workers)。未配置时不显示「发送并入库」按钮。
+    #[serde(default)]
+    pub gallery: GalleryCfg,
     #[serde(rename = "source", default)]
     pub sources: Vec<SourceCfg>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct GalleryCfg {
+    /// 图库 Workers 根地址,如 `https://shirogane.xxx.workers.dev`
+    #[serde(default)]
+    pub endpoint: String,
+    /// 入库 token(与 Worker secret INGEST_TOKEN 一致)。也可用环境变量 HANABI_GALLERY_TOKEN。
+    #[serde(default)]
+    pub token: String,
+}
+
+impl GalleryCfg {
+    pub fn enabled(&self) -> bool {
+        let token = if self.token.is_empty() {
+            std::env::var("HANABI_GALLERY_TOKEN").unwrap_or_default()
+        } else {
+            self.token.clone()
+        };
+        !self.endpoint.trim().is_empty() && !token.trim().is_empty()
+    }
+
+    pub fn resolved_token(&self) -> String {
+        if !self.token.is_empty() {
+            self.token.clone()
+        } else {
+            std::env::var("HANABI_GALLERY_TOKEN").unwrap_or_default()
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

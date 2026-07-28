@@ -1,4 +1,4 @@
-//! Shirogane 图库入库客户端：把本地图片 + 作品元数据 POST 到 CF Workers。
+//! Vitrine 图库入库客户端：把本地图片 + 作品元数据 POST 到 CF Workers。
 
 use std::path::Path;
 
@@ -75,7 +75,7 @@ impl GalleryClient {
             .multipart(form)
             .send()
             .await
-            .context("请求 shirogane /api/ingest 失败")?;
+            .context("请求 Vitrine /api/ingest 失败")?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {

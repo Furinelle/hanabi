@@ -71,7 +71,7 @@ pub struct ReviewState {
     counter: AtomicU64,
     // 频道帖首条 msg_id → 待投递评论区的原图任务。
     pending_comments: Mutex<std::collections::HashMap<i32, CommentJob>>,
-    /// 可选图库入库客户端(Shirogane)。None 时不显示「发送并入库」。
+    /// 可选图库入库客户端(Vitrine)。None 时不显示「发送并入库」。
     gallery: Option<GalleryClient>,
 }
 
@@ -1027,7 +1027,7 @@ fn decode_pending(row: PendingRow) -> Result<PendingWork> {
 
 /// 完成一条已抢占的审批。发布/解析失败会恢复为 pending，供按钮或下一次
 /// `/approve` 重试；成功后删除审批消息、pending 记录并接续原图评论任务。
-/// `archive=true` 时在发布成功后额外入库 Shirogane。
+/// `archive=true` 时在发布成功后额外入库 Vitrine。
 async fn finish_claimed(
     state: &Arc<ReviewState>,
     token: i64,
@@ -1572,7 +1572,7 @@ mod tests {
 
     #[test]
     fn parse_owner_numeric_only() {
-        assert_eq!(parse_owner("7794592020"), Some(7794592020));
+        assert_eq!(parse_owner("-1001234567890"), Some(-1001234567890));
         assert_eq!(parse_owner("@my_channel"), None);
         assert_eq!(parse_owner(""), None);
     }
@@ -1624,7 +1624,7 @@ mod tests {
         drop(legacy);
         let _sink = TelegramSink::new(
             "123:abc".into(),
-            "7794592020".into(),
+            "-1001234567890".into(),
             "@chan".into(),
             path.to_str().unwrap(),
             None,
@@ -1724,7 +1724,9 @@ mod tests {
             .iter()
             .all(|(_, (_, caption, _, _, _, _))| { caption == "oldest" || caption == "first" }));
         // is_r18 随行读出,发布时据此打剧透遮罩。
-        assert!(claimed.iter().any(|(t, (_, _, _, _, r18, _))| *t == 3 && *r18));
+        assert!(claimed
+            .iter()
+            .any(|(t, (_, _, _, _, r18, _))| *t == 3 && *r18));
         assert!(claim_all_pending(&mut db).unwrap().is_empty());
         let cancelled_state: String = db
             .query_row("SELECT state FROM pending WHERE token=2", [], |r| r.get(0))

@@ -10,7 +10,7 @@ pub struct Config {
     pub gallery_dl: GalleryDlCfg,
     #[serde(default)]
     pub x_image: XImageCfg,
-    /// 可选:Shirogane 图库入库(CF Workers)。未配置时不显示「发送并入库」按钮。
+    /// 可选:Vitrine 图库入库(CF Workers)。未配置时不显示「发送并入库」按钮。
     #[serde(default)]
     pub gallery: GalleryCfg,
     #[serde(rename = "source", default)]
@@ -19,7 +19,7 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct GalleryCfg {
-    /// 图库 Workers 根地址,如 `https://shirogane.xxx.workers.dev`
+    /// 图库 Workers 根地址,如 `https://vitrine.xxx.workers.dev`
     #[serde(default)]
     pub endpoint: String,
     /// 入库 token(与 Worker secret INGEST_TOKEN 一致)。也可用环境变量 HANABI_GALLERY_TOKEN。

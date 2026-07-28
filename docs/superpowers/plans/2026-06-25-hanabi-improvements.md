@@ -198,7 +198,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 ```rust
 #[test]
 fn parse_owner_numeric_only() {
-    assert_eq!(parse_owner("7794592020"), Some(7794592020));
+    assert_eq!(parse_owner("-1001234567890"), Some(-1001234567890));
     assert_eq!(parse_owner("@my_channel"), None);
     assert_eq!(parse_owner(""), None);
 }
@@ -918,7 +918,7 @@ fn pending_table_has_originals_column() {
     let path = dir.path().join("p.db");
     let _sink = TelegramSink::new(
         "123:abc".into(),
-        "7794592020".into(),
+        "-1001234567890".into(),
         "@chan".into(),
         path.to_str().unwrap(),
     )

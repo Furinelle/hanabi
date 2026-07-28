@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
             cfg.gallery.resolved_token(),
         ) {
             Ok(c) => {
-                tracing::info!(endpoint = %cfg.gallery.endpoint, "图库入库已启用(Shirogane)");
+                tracing::info!(endpoint = %cfg.gallery.endpoint, "图库入库已启用(Vitrine)");
                 Some(c)
             }
             Err(e) => {

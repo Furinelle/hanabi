@@ -407,14 +407,23 @@ fn claim_all_pending(db: &mut rusqlite::Connection) -> rusqlite::Result<Vec<(i64
     Ok(claimed)
 }
 
-fn command_menu() -> Vec<BotCommand> {
-    vec![
+fn command_menu(gallery_enabled: bool) -> Vec<BotCommand> {
+    let mut commands = vec![
         BotCommand::new("run", "立即抓取一轮"),
         BotCommand::new("approve", "批准并发布全部剩余待审"),
+    ];
+    if gallery_enabled {
+        commands.push(BotCommand::new(
+            "approve_archive",
+            "批准、发布并入库全部剩余待审",
+        ));
+    }
+    commands.extend([
         BotCommand::new("status", "查看待审数和运行状态"),
         BotCommand::new("ping", "存活测试"),
         BotCommand::new("help", "查看命令列表"),
-    ]
+    ]);
+    commands
 }
 
 /// 若 msg 是 `publish_channel` 帖子自动转发到讨论组的那条(评论锚点),返回被转发的
@@ -1003,6 +1012,10 @@ struct PendingWork {
     item_meta: String,
 }
 
+struct FinishOutcome {
+    archive_failed: bool,
+}
+
 fn decode_pending(row: PendingRow) -> Result<PendingWork> {
     let (files_json, caption, msg_json, originals_json, is_r18, item_meta) = row;
     let files = serde_json::from_str::<Vec<String>>(&files_json)?
@@ -1034,7 +1047,7 @@ async fn finish_claimed(
     row: PendingRow,
     publish: bool,
     archive: bool,
-) -> Result<()> {
+) -> Result<FinishOutcome> {
     let work = match decode_pending(row) {
         Ok(work) => work,
         Err(e) => {
@@ -1082,8 +1095,10 @@ async fn finish_claimed(
     }
 
     // 发布成功(或至少部分成功)且需要入库
+    let mut archive_failed = false;
     if publish && first_id.is_some() && archive {
         if let Err(e) = archive_pending_work(state, &work).await {
+            archive_failed = true;
             tracing::warn!(error = %e, token, "审批发布后图库入库失败");
             let _ = state
                 .bot
@@ -1121,7 +1136,7 @@ async fn finish_claimed(
         cleanup(&work.files);
     }
     delete_result.context("删除已完成的审批记录失败")?;
-    Ok(())
+    Ok(FinishOutcome { archive_failed })
 }
 
 async fn archive_pending_work(state: &Arc<ReviewState>, work: &PendingWork) -> Result<()> {
@@ -1139,20 +1154,35 @@ async fn archive_pending_work(state: &Arc<ReviewState>, work: &PendingWork) -> R
     gallery.ingest(&item, paths).await
 }
 
-/// 顺序发布 `/approve` 原子抢占到的全部记录。顺序发送避免瞬间把大量图组并发压给
-/// Telegram；单条失败不阻断后续项，失败记录恢复为 pending。
-async fn publish_all_claimed(state: Arc<ReviewState>, claimed: Vec<(i64, PendingRow)>) {
+/// 顺序处理 `/approve` 或 `/approve_archive` 原子抢占到的全部记录。顺序发送避免
+/// 瞬间把大量图组并发压给 Telegram；单条失败不阻断后续项，失败记录恢复为 pending。
+async fn publish_all_claimed(
+    state: Arc<ReviewState>,
+    claimed: Vec<(i64, PendingRow)>,
+    archive: bool,
+) {
     let total = claimed.len();
     let mut succeeded = 0usize;
+    let mut archive_failed = 0usize;
     for (token, row) in claimed {
-        // /approve 一键批准:只发频道,不默认入库(需要入库请点「发送并入库」)
-        match finish_claimed(&state, token, row, true, false).await {
-            Ok(()) => succeeded += 1,
+        match finish_claimed(&state, token, row, true, archive).await {
+            Ok(outcome) => {
+                succeeded += 1;
+                if outcome.archive_failed {
+                    archive_failed += 1;
+                }
+            }
             Err(e) => tracing::warn!(error = %e, token, "一键批准中的单条发布失败"),
         }
     }
     let failed = total - succeeded;
-    let summary = if failed == 0 {
+    let summary = if archive && failed == 0 && archive_failed == 0 {
+        format!("✅ 一键批准并入库完成：已发布并入库 {succeeded} 条")
+    } else if archive {
+        format!(
+            "⚠️ 一键批准并入库完成：发布成功 {succeeded} 条，发布失败 {failed} 条，入库失败 {archive_failed} 条；发布失败项仍保留待审，可再次 /approve_archive"
+        )
+    } else if failed == 0 {
         format!("✅ 一键批准完成：已发布 {succeeded} 条")
     } else {
         format!("⚠️ 一键批准完成：成功 {succeeded} 条，失败 {failed} 条；失败项仍保留待审，可再次 /approve")
@@ -1175,7 +1205,11 @@ pub async fn run_review_loop(
 ) {
     // 启动先清一次超期/孤儿(顺手清掉旧版本遗留的临时图)。
     cleanup_stale(&state).await;
-    if let Err(e) = state.bot.set_my_commands(command_menu()).await {
+    if let Err(e) = state
+        .bot
+        .set_my_commands(command_menu(state.gallery.is_some()))
+        .await
+    {
         tracing::warn!(error = %e, "注册 Telegram 命令菜单失败");
     }
     let mut last_cleanup = now_secs();
@@ -1243,7 +1277,8 @@ pub async fn run_review_loop(
 }
 
 /// 处理 `/` 命令(仅文本消息)。**仅响应审批私聊本人**(owner),陌生人忽略。
-/// /run 触发抓取;/approve 批准全部剩余待审;/status /ping /help 即时回复;
+/// /run 触发抓取；/approve 批准全部剩余待审；/approve_archive 批准并入库；
+/// /status /ping /help 即时回复；
 /// 非命令的 Pixiv/X 链接交抓取循环直发频道。
 async fn handle_command(
     state: &Arc<ReviewState>,
@@ -1289,7 +1324,15 @@ async fn handle_command(
     }
     let cmd = text.split_whitespace().next().unwrap_or("");
     let cmd = cmd.split('@').next().unwrap_or(cmd);
-    if cmd == "/approve" {
+    if cmd == "/approve" || cmd == "/approve_archive" {
+        let archive = cmd == "/approve_archive";
+        if archive && state.gallery.is_none() {
+            state
+                .bot
+                .send_message(msg.chat.id, "⚠️ 图库未配置，未执行一键批准并入库")
+                .await?;
+            return Ok(());
+        }
         let claimed = {
             let mut db = state.db.lock().await;
             claim_all_pending(&mut db)?
@@ -1306,7 +1349,7 @@ async fn handle_command(
             tokio::spawn(async move {
                 // JoinError 兜底:批量任务 panic 时把仍卡在 publishing 的记录恢复为
                 // pending(restore 的条件 UPDATE 保证已完成/已恢复的不受影响)。
-                let inner = tokio::spawn(publish_all_claimed(task_state.clone(), claimed));
+                let inner = tokio::spawn(publish_all_claimed(task_state.clone(), claimed, archive));
                 if let Err(join_err) = inner.await {
                     tracing::error!(error = %join_err, "一键批准任务异常退出,恢复未完成项为待审");
                     let db = task_state.db.lock().await;
@@ -1317,7 +1360,14 @@ async fn handle_command(
             });
             state
                 .bot
-                .send_message(msg.chat.id, format!("⏳ 正在一键批准并发布 {count} 条…"))
+                .send_message(
+                    msg.chat.id,
+                    if archive {
+                        format!("⏳ 正在一键批准、发布并入库 {count} 条…")
+                    } else {
+                        format!("⏳ 正在一键批准并发布 {count} 条…")
+                    },
+                )
                 .await?;
         }
         return Ok(());
@@ -1339,8 +1389,14 @@ async fn handle_command(
         }
         "/ping" => "pong 🏓".to_string(),
         "/help" => {
-            "命令列表:\n/run — 立即抓取一轮\n/approve — 批准并发布全部剩余待审(仅频道,不入库)\n/status — 待审数+运行状态\n/ping — 存活测试\n/help — 本帮助\n\n💡 审批按钮:✅ 发送到频道 / 📦 发送并入库 / ❌ 丢弃\n💡 先逐条点 ❌ 丢弃不想推送的图片，再发 /approve 一键发布其余图片\n💡 直接发 Pixiv/X 作品链接 → 自动抓取并发布到频道(配置图库后同步入库)"
-                .to_string()
+            let archive_help = if state.gallery.is_some() {
+                "\n/approve_archive — 批准、发布并入库全部剩余待审"
+            } else {
+                ""
+            };
+            format!(
+                "命令列表:\n/run — 立即抓取一轮\n/approve — 批准并发布全部剩余待审(仅频道,不入库){archive_help}\n/status — 待审数+运行状态\n/ping — 存活测试\n/help — 本帮助\n\n💡 审批按钮:✅ 发送到频道 / 📦 发送并入库 / ❌ 丢弃\n💡 先逐条点 ❌ 丢弃不想推送的图片，再发 /approve 或 /approve_archive 一键处理其余图片\n💡 直接发 Pixiv/X 作品链接 → 自动抓取并发布到频道(配置图库后同步入库)"
+            )
         }
         _ => return Ok(()),
     };
@@ -1478,7 +1534,7 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
             async move { finish_claimed(&state, token, row, publish, archive).await }
         });
         match inner.await {
-            Ok(Ok(())) => {}
+            Ok(Ok(_)) => {}
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, token, "审批操作失败,pending 保留可重试");
                 if publish {
@@ -1786,8 +1842,14 @@ mod tests {
 
     #[test]
     fn command_menu_contains_one_click_approve() {
-        let menu = command_menu();
+        let menu = command_menu(true);
         assert!(menu.iter().any(|cmd| cmd.command == "approve"));
+        assert!(menu.iter().any(|cmd| cmd.command == "approve_archive"));
+
+        let menu_without_gallery = command_menu(false);
+        assert!(menu_without_gallery
+            .iter()
+            .all(|cmd| cmd.command != "approve_archive"));
     }
 
     #[test]

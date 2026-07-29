@@ -2,6 +2,11 @@
 
 本项目所有重要变更记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [Unreleased]
+
+### 新增
+- **`/approve_archive` 一键批准并入库**：配置 Vitrine 时自动加入 Telegram 命令菜单；原子抢占并顺序处理全部剩余待审项，逐条发布到频道后同步入库，复用 `/approve` 的幂等与失败恢复机制。
+
 ## [0.7.1] - 2026-07-29
 
 ### 修复

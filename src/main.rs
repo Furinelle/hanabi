@@ -393,6 +393,14 @@ async fn download_in_blocking(
         .unwrap_or_default()
 }
 
+async fn discard_download_dir(dir: std::path::PathBuf) {
+    let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir)).await;
+}
+
+fn douyin_download_complete(downloaded: usize, failed: usize) -> bool {
+    downloaded > 0 && failed == 0
+}
+
 /// 处理抖音图文链接:reqwest 抓分享页 → 解析 → 下原图(无水印)→ 直发频道。
 async fn handle_douyin(job: hanabi::sink::telegram::LinkJob, sink: &TelegramSink) -> Result<()> {
     use hanabi::source::douyin;
@@ -407,12 +415,30 @@ async fn handle_douyin(job: hanabi::sink::telegram::LinkJob, sink: &TelegramSink
             } else {
                 let dir = std::env::temp_dir().join(format!("hanabi_douyin_{}", item.source_id));
                 let (files, failed) = douyin::download_images(&client, &item, &dir).await;
-                if files.is_empty() {
-                    tracing::warn!(id = %item.source_id, "抖音图片全部下载失败");
-                    notice = Some("⚠️ 抖音图片全部下载失败,未发布".to_string());
+                let download_complete = douyin_download_complete(files.len(), failed);
+                if failed > 0 {
+                    debug_assert!(!download_complete);
+                    // 原子发布:重试/备用 CDN 后仍缺任何一张时,整条不发布也不 mark_pushed。
+                    // 否则重发链接会因去重跳过,或发布完整作品时重复已发的部分图片。
+                    tracing::warn!(
+                        id = %item.source_id,
+                        downloaded = files.len(),
+                        failed,
+                        "抖音图片重试后仍下载不完整,本次未发布"
+                    );
+                    discard_download_dir(dir).await;
+                    notice = Some(if files.is_empty() {
+                        "⚠️ 抖音图片重试后仍全部下载失败,本次未发布;请重新发送链接重试".to_string()
+                    } else {
+                        format!(
+                            "⚠️ {failed} 张图片重试后仍下载失败,为避免频道帖不完整本次未发布;请重新发送链接重试"
+                        )
+                    });
+                } else if !download_complete {
+                    tracing::warn!(id = %item.source_id, "抖音作品没有可发布图片");
+                    notice = Some("⚠️ 抖音作品没有可发布图片,未发布".to_string());
                 } else {
                     let outcome = sink.publish_direct(&item, &files).await?;
-                    // Partial 也入库:频道帖已存在,重发会重复(与 finish_claimed 一致)。
                     if let Err(e) = store.mark_pushed(&item) {
                         tracing::warn!(id = %item.source_id, error = %e, "标记已推送失败");
                     }
@@ -422,12 +448,6 @@ async fn handle_douyin(job: hanabi::sink::telegram::LinkJob, sink: &TelegramSink
                             "⚠️ 部分图片发布失败,频道帖不完整;已按已发布记录,请人工补图"
                                 .to_string(),
                         );
-                    } else if failed > 0 {
-                        // 部分下载失败:频道帖缺图且去重已记录(不会自动重发),转人工。
-                        tracing::warn!(id = %item.source_id, failed, "抖音部分图片下载失败,频道帖不完整");
-                        notice = Some(format!(
-                            "⚠️ 已发布,但 {failed} 张下载失败,频道帖不完整;如需补齐请人工处理"
-                        ));
                     }
                 }
             }
@@ -456,7 +476,7 @@ async fn handle_douyin(job: hanabi::sink::telegram::LinkJob, sink: &TelegramSink
 
 #[cfg(test)]
 mod tests {
-    use super::secs_until_next_slot;
+    use super::{douyin_download_complete, secs_until_next_slot};
 
     #[test]
     fn slot_aligns_to_interval_in_local_tz() {
@@ -467,5 +487,13 @@ mod tests {
         assert_eq!(secs_until_next_slot(28800, 8, 72000), 14400);
         // tz_offset=0 时同一 now=57600 → local 16:00,距 24:00 槽 8h。
         assert_eq!(secs_until_next_slot(28800, 0, 57600), 28800);
+    }
+
+    #[test]
+    fn douyin_partial_download_is_not_publishable() {
+        assert!(douyin_download_complete(4, 0));
+        assert!(!douyin_download_complete(3, 1));
+        assert!(!douyin_download_complete(0, 4));
+        assert!(!douyin_download_complete(0, 0));
     }
 }

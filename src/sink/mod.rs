@@ -105,6 +105,7 @@ mod tests {
             images: vec![ImageRef {
                 url: "i".into(),
                 referer: None,
+                fallback_urls: vec![],
             }],
             origin: "fav_artists".into(),
         }

@@ -35,6 +35,9 @@ pub struct Author {
 pub struct ImageRef {
     pub url: String,
     pub referer: Option<String>,
+    /// 同一图片的备用 CDN 地址。旧 pending JSON 没有该字段时保持兼容。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +85,7 @@ mod tests {
             images: vec![ImageRef {
                 url: "i".into(),
                 referer: None,
+                fallback_urls: vec![],
             }],
             origin: "fav_artists".into(),
         }
@@ -91,5 +95,12 @@ mod tests {
     fn dedup_key_combines_kind_and_id() {
         let item = sample();
         assert_eq!(item.dedup_key(), ("pixiv".to_string(), "123".to_string()));
+    }
+
+    #[test]
+    fn image_ref_deserializes_legacy_json_without_fallback_urls() {
+        let image: ImageRef =
+            serde_json::from_str(r#"{"url":"https://example.test/a.jpg","referer":null}"#).unwrap();
+        assert!(image.fallback_urls.is_empty());
     }
 }

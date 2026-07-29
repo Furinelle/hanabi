@@ -85,7 +85,11 @@ pub fn parse_twitter(root: &Value, origin: &str) -> Vec<MediaItem> {
             Some(n) => n.to_string(),
             None => continue,
         };
-        let image = ImageRef { url, referer: None };
+        let image = ImageRef {
+            url,
+            referer: None,
+            fallback_urls: vec![],
+        };
         if let Some(existing) = by_id.get_mut(&id) {
             existing.images.push(image);
             continue;

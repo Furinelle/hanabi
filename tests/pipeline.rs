@@ -28,6 +28,7 @@ fn item(id: &str, bookmarks: u32) -> MediaItem {
         images: vec![ImageRef {
             url: "i".into(),
             referer: None,
+            fallback_urls: vec![],
         }],
         origin: "mock".into(),
     }

@@ -1,9 +1,13 @@
 //! 抖音图文(note)解析:gallery-dl 不支持抖音,这里用 reqwest 直接抓分享页。
 //! 路线(免签名,对标 versenilvis/douyin-downloader):移动端 UA 跟随短链 → note 页 HTML
-//! → 抠 `window._ROUTER_DATA` JSON → 取 images[].url_list[0](无水印全分辨率)、作者、desc 标签。
+//! → 抠 `window._ROUTER_DATA` JSON → 取 images[].url_list(无水印全分辨率 + 备用 CDN)、作者、desc 标签。
 //! 比 pixiv/x 脆:抖音改 `_ROUTER_DATA` 结构或加验证墙时会失效,失败优雅提示即可。
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -13,6 +17,9 @@ use crate::model::{Author, ImageRef, MediaItem, SourceKind};
 /// 抖音 CDN 对桌面 UA 返回拦截页,必须移动端 UA(对标现有解析项目)。
 const MOBILE_UA: &str = "Mozilla/5.0 (Linux; Android 11; SAMSUNG SM-G973U) \
 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+const IMAGE_MAX_ATTEMPTS: usize = 3;
+const IMAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const IMAGE_RETRY_BASE_MS: u64 = if cfg!(test) { 1 } else { 400 };
 
 /// 是否抖音链接(短链 v.douyin.com / www.douyin.com / iesdouyin.com)。
 pub fn is_douyin_url(url: &str) -> bool {
@@ -98,20 +105,34 @@ pub fn parse_note(html: &str, origin: &str) -> Option<MediaItem> {
         return None;
     }
 
-    // 每张图取 url_list[0](tplv-dy-aweme-images,无水印全分辨率)。
+    // 每张图保留完整 url_list:首项为主地址,其余作为 CDN 故障时的备用地址。
     let images: Vec<ImageRef> = item
         .get("images")?
         .as_array()?
         .iter()
         .filter_map(|img| {
-            img.get("url_list")
+            let urls: Vec<String> = img
+                .get("url_list")
                 .and_then(|u| u.as_array())
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_str())
-                .map(|url| ImageRef {
-                    url: url.to_string(),
-                    referer: None,
-                })
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str())
+                .filter(|url| !url.trim().is_empty())
+                .map(str::to_string)
+                .collect();
+            let url = urls.first()?.clone();
+            let mut seen = HashSet::from([url.as_str()]);
+            let fallback_urls = urls
+                .iter()
+                .skip(1)
+                .filter(|candidate| seen.insert(candidate.as_str()))
+                .cloned()
+                .collect();
+            Some(ImageRef {
+                url,
+                referer: None,
+                fallback_urls,
+            })
         })
         .collect();
     if images.is_empty() {
@@ -190,11 +211,11 @@ pub async fn download_images(
     let mut out = Vec::new();
     let mut failed = 0usize;
     for (i, img) in item.images.iter().enumerate() {
-        match download_one(client, &img.url, dir, i).await {
+        match download_one(client, img, dir, i).await {
             Ok(p) => out.push(p),
             Err(e) => {
                 failed += 1;
-                tracing::warn!(idx = i, error = %e, "抖音图片下载失败");
+                tracing::warn!(idx = i, error = %format!("{e:#}"), "抖音图片下载失败");
             }
         }
     }
@@ -203,20 +224,76 @@ pub async fn download_images(
 
 async fn download_one(
     client: &reqwest::Client,
-    url: &str,
+    image_ref: &ImageRef,
     dir: &Path,
     idx: usize,
 ) -> Result<PathBuf> {
-    let bytes = client
-        .get(url)
-        .send()
-        .await
-        .context("图片请求失败")?
-        .bytes()
-        .await
-        .context("图片读取失败")?;
-    // 抖音图为 webp,转 jpg(q92)发 Telegram;转码放阻塞线程。
-    // Bytes 本身 Send + 'static 且可 Deref 到 &[u8],直接 move,免整图拷贝。
+    let mut seen = HashSet::new();
+    let urls: Vec<&str> = std::iter::once(image_ref.url.as_str())
+        .chain(image_ref.fallback_urls.iter().map(String::as_str))
+        .filter(|url| !url.trim().is_empty() && seen.insert(*url))
+        .collect();
+    if urls.is_empty() {
+        anyhow::bail!("图片没有可用 URL");
+    }
+
+    let mut errors = Vec::with_capacity(IMAGE_MAX_ATTEMPTS);
+    for attempt in 0..IMAGE_MAX_ATTEMPTS {
+        let url = urls[attempt % urls.len()];
+        let host = reqwest::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_else(|| "<invalid-host>".to_string());
+        let result: Result<PathBuf> = async {
+            let response = client
+                .get(url)
+                .header(reqwest::header::REFERER, "https://www.douyin.com/")
+                .timeout(IMAGE_REQUEST_TIMEOUT)
+                .send()
+                .await
+                .context("发送图片请求失败")?
+                .error_for_status()
+                .context("图片响应状态异常")?;
+            let bytes = response.bytes().await.context("读取图片响应失败")?.to_vec();
+            transcode_to_jpeg(bytes, dir, idx).await
+        }
+        .await;
+
+        match result {
+            Ok(path) => return Ok(path),
+            Err(error) => {
+                let detail = format!(
+                    "attempt {}/{} host={host}: {error:#}",
+                    attempt + 1,
+                    IMAGE_MAX_ATTEMPTS
+                );
+                tracing::warn!(
+                    idx,
+                    attempt = attempt + 1,
+                    max_attempts = IMAGE_MAX_ATTEMPTS,
+                    host,
+                    error = %format!("{error:#}"),
+                    "抖音图片下载尝试失败"
+                );
+                errors.push(detail);
+            }
+        }
+
+        if attempt + 1 < IMAGE_MAX_ATTEMPTS {
+            let delay_ms = IMAGE_RETRY_BASE_MS * (1_u64 << attempt);
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+    }
+
+    anyhow::bail!(
+        "图片经过 {IMAGE_MAX_ATTEMPTS} 次尝试仍失败: {}",
+        errors.join(" | ")
+    )
+}
+
+async fn transcode_to_jpeg(bytes: Vec<u8>, dir: &Path, idx: usize) -> Result<PathBuf> {
+    // 抖音图通常为 webp,转 jpg(q92)发 Telegram;转码放阻塞线程。
+    // 字节缓冲 Send + 'static,直接 move 到 blocking 任务。
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<PathBuf> {
         let img = image::load_from_memory(&bytes).context("解码图片失败")?;
@@ -234,6 +311,8 @@ async fn download_one(
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+
     use super::*;
 
     #[test]
@@ -282,7 +361,74 @@ mod tests {
         assert_eq!(it.images.len(), 2);
         assert_eq!(it.page_count, 2);
         assert!(it.images[0].url.contains("aweme-images"));
+        assert_eq!(it.images[0].fallback_urls, vec!["https://p11/a"]);
+        assert!(it.images[1].fallback_urls.is_empty());
         assert!(!it.is_r18);
+    }
+
+    #[tokio::test]
+    async fn download_one_rotates_to_fallback_url_after_http_failure() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .unwrap();
+        let png = cursor.into_inner();
+
+        let server = std::thread::spawn(move || {
+            let mut paths = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let n = stream.read(&mut request).unwrap();
+                let first_line = String::from_utf8_lossy(&request[..n])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let path = first_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                paths.push(path.clone());
+
+                if path == "/primary" {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                } else {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        png.len()
+                    )
+                    .unwrap();
+                    stream.write_all(&png).unwrap();
+                }
+            }
+            paths
+        });
+
+        let image_ref = ImageRef {
+            url: format!("http://{addr}/primary"),
+            referer: None,
+            fallback_urls: vec![format!("http://{addr}/fallback")],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = download_one(&build_client().unwrap(), &image_ref, dir.path(), 0)
+            .await
+            .unwrap();
+        assert_eq!(path.file_name().unwrap(), "000.jpg");
+        assert!(image::open(path).is_ok());
+        assert_eq!(
+            server.join().unwrap(),
+            vec!["/primary".to_string(), "/fallback".to_string()]
+        );
     }
 
     #[test]

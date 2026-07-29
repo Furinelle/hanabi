@@ -70,6 +70,7 @@ pub fn parse_pixiv(root: &Value, origin: &str) -> Vec<MediaItem> {
         let image = ImageRef {
             url,
             referer: Some(PIXIV_REFERER.to_string()),
+            fallback_urls: vec![],
         };
 
         if let Some(existing) = by_id.get_mut(&id) {

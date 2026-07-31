@@ -17,6 +17,8 @@ use crate::model::{Author, ImageRef, MediaItem, SourceKind};
 /// 抖音 CDN 对桌面 UA 返回拦截页,必须移动端 UA(对标现有解析项目)。
 const MOBILE_UA: &str = "Mozilla/5.0 (Linux; Android 11; SAMSUNG SM-G973U) \
 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+const PAGE_MAX_ATTEMPTS: usize = 3;
+const PAGE_RETRY_BASE_MS: u64 = if cfg!(test) { 1 } else { 500 };
 const IMAGE_MAX_ATTEMPTS: usize = 3;
 const IMAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const IMAGE_RETRY_BASE_MS: u64 = if cfg!(test) { 1 } else { 400 };
@@ -188,15 +190,93 @@ pub fn build_client() -> Result<reqwest::Client> {
 
 /// 抓 note 页并解析为 MediaItem。`url` 可为短链(自动跟随跳转)。
 pub async fn fetch_note(client: &reqwest::Client, url: &str, origin: &str) -> Result<MediaItem> {
-    let resp = client.get(url).send().await.context("抖音页面请求失败")?;
-    // 入口只校验了用户提交的原始 URL,client 会跟随最多 10 次重定向;
-    // 落点若跳出抖音域,页面内容完全不可信,拒绝解析。
-    let final_url = resp.url().to_string();
-    if !is_douyin_url(&final_url) {
-        anyhow::bail!("抖音链接重定向到非抖音域名,拒绝解析: {final_url}");
+    fetch_note_with_validator(client, url, origin, is_douyin_url).await
+}
+
+async fn fetch_note_with_validator<F>(
+    client: &reqwest::Client,
+    url: &str,
+    origin: &str,
+    final_url_allowed: F,
+) -> Result<MediaItem>
+where
+    F: Fn(&str) -> bool,
+{
+    let mut last_error = None;
+    for attempt in 1..=PAGE_MAX_ATTEMPTS {
+        let result: Result<(MediaItem, String, u16, usize)> = async {
+            let resp =
+                client.get(url).send().await.map_err(|error| {
+                    anyhow::anyhow!("抖音页面请求失败: {}", error.without_url())
+                })?;
+            let status = resp.status();
+            let final_url = resp.url().clone();
+            let mut safe_final_url = final_url.clone();
+            safe_final_url.set_query(None);
+            safe_final_url.set_fragment(None);
+
+            // 入口只校验了用户提交的原始 URL,client 会跟随最多 10 次重定向;
+            // 落点若跳出抖音域,页面内容完全不可信,拒绝解析。
+            if !final_url_allowed(final_url.as_str()) {
+                anyhow::bail!("抖音链接重定向到非抖音域名,拒绝解析: {}", safe_final_url);
+            }
+
+            if !status.is_success() {
+                anyhow::bail!("抖音页面响应状态异常 status={status} final_url={safe_final_url}");
+            }
+            let html = resp
+                .text()
+                .await
+                .map_err(|error| anyhow::anyhow!("抖音页面读取失败: {}", error.without_url()))?;
+            let response_bytes = html.len();
+            let item = parse_note(&html, origin).with_context(|| {
+                format!(
+                    "抖音页面解析失败(无 _ROUTER_DATA / 结构变更 / 验证墙) \
+                     status={status} final_url={safe_final_url} response_bytes={response_bytes}"
+                )
+            })?;
+            Ok((
+                item,
+                safe_final_url.to_string(),
+                status.as_u16(),
+                response_bytes,
+            ))
+        }
+        .await;
+
+        match result {
+            Ok((item, final_url, status, response_bytes)) => {
+                if attempt > 1 {
+                    tracing::info!(
+                        attempt,
+                        max_attempts = PAGE_MAX_ATTEMPTS,
+                        final_url,
+                        status,
+                        response_bytes,
+                        "抖音页面重试成功"
+                    );
+                }
+                return Ok(item);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = PAGE_MAX_ATTEMPTS,
+                    error = %format!("{error:#}"),
+                    "抖音页面抓取或解析尝试失败"
+                );
+                last_error = Some(error);
+            }
+        }
+
+        if attempt < PAGE_MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(PAGE_RETRY_BASE_MS * attempt as u64)).await;
+        }
     }
-    let html = resp.text().await.context("抖音页面读取失败")?;
-    parse_note(&html, origin).context("抖音页面解析失败(无 _ROUTER_DATA / 结构变更 / 验证墙)")
+
+    Err(last_error
+        .expect("PAGE_MAX_ATTEMPTS 必须大于 0")
+        .context(format!("抖音页面在 {PAGE_MAX_ATTEMPTS} 次尝试后仍无法解析")))
 }
 
 /// 下载图文每张图到 dir,webp 转 jpg(Telegram sendPhoto 对 webp 不友好)。
@@ -364,6 +444,72 @@ mod tests {
         assert_eq!(it.images[0].fallback_urls, vec!["https://p11/a"]);
         assert!(it.images[1].fallback_urls.is_empty());
         assert!(!it.is_r18);
+    }
+
+    #[tokio::test]
+    async fn fetch_note_retries_transient_page_without_router_data() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let valid_html = r#"<html><script>window._ROUTER_DATA = {
+            "loaderData": { "note_(id)/page": { "videoInfoRes": { "item_list": [ {
+                "aweme_id": "7668600536471822181",
+                "desc": "一些蕾米壁纸#绝区零",
+                "images": [ { "url_list": ["https://p3.douyinpic.com/image.webp"] } ],
+                "author": { "nickname": "tester", "sec_uid": "MS4wTEST" }
+            } ] } } }
+        };</script></html>"#
+            .to_string();
+
+        let server = std::thread::spawn(move || {
+            let responses = [
+                "<html><title>抖音</title><body>transient page</body></html>".to_string(),
+                valid_html,
+            ];
+            let mut paths = Vec::new();
+            for body in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let n = stream.read(&mut request).unwrap();
+                let first_line = String::from_utf8_lossy(&request[..n])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                paths.push(
+                    first_line
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+            paths
+        });
+
+        let item = fetch_note_with_validator(
+            &build_client().unwrap(),
+            &format!("http://{addr}/share/note/7668600536471822181"),
+            "manual",
+            |_| true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(item.source_id, "7668600536471822181");
+        assert_eq!(item.images.len(), 1);
+        assert_eq!(
+            server.join().unwrap(),
+            vec![
+                "/share/note/7668600536471822181".to_string(),
+                "/share/note/7668600536471822181".to_string()
+            ]
+        );
     }
 
     #[tokio::test]

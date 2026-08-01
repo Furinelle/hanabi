@@ -1,6 +1,7 @@
-//! 抖音图文(note)解析:gallery-dl 不支持抖音,这里用 reqwest 直接抓分享页。
+//! 抖音图文(note/slides)解析:gallery-dl 不支持抖音,这里用 reqwest 直接抓分享页。
 //! 路线(免签名,对标 versenilvis/douyin-downloader):移动端 UA 跟随短链 → note 页 HTML
 //! → 抠 `window._ROUTER_DATA` JSON → 取 images[].url_list(无水印全分辨率 + 备用 CDN)、作者、desc 标签。
+//! 混合图/视频 slides 页无 SSR 数据时,改请求 slidesinfo,只取 clip_type=2 的静态图片。
 //! 比 pixiv/x 脆:抖音改 `_ROUTER_DATA` 结构或加验证墙时会失效,失败优雅提示即可。
 
 use std::{
@@ -90,11 +91,13 @@ fn find_note_item(v: &Value) -> Option<&Value> {
     }
 }
 
-/// 解析 note 页 HTML → MediaItem。纯函数(便于测试),网络抓取见 `fetch_note`。
-pub fn parse_note(html: &str, origin: &str) -> Option<MediaItem> {
-    let root = extract_router_data(html)?;
-    let item = find_note_item(&root)?;
+#[derive(Clone, Copy)]
+enum ImagePolicy {
+    All,
+    StaticSlidesOnly,
+}
 
+fn parse_item(item: &Value, origin: &str, image_policy: ImagePolicy) -> Option<MediaItem> {
     // aweme_id 可能是数字或字符串。
     let aweme_id = item.get("aweme_id").and_then(|v| {
         v.as_str()
@@ -108,10 +111,20 @@ pub fn parse_note(html: &str, origin: &str) -> Option<MediaItem> {
     }
 
     // 每张图保留完整 url_list:首项为主地址,其余作为 CDN 故障时的备用地址。
+    // slidesinfo 的 images 同时包含视频卡片:clip_type=2 才是静态图;
+    // 其他 clip_type(1/3/4)以及显式带 video 的条目都不应当成图片封面发布。
     let images: Vec<ImageRef> = item
         .get("images")?
         .as_array()?
         .iter()
+        .filter(|img| match image_policy {
+            ImagePolicy::All => true,
+            ImagePolicy::StaticSlidesOnly => {
+                img.get("clip_type").and_then(Value::as_u64) == Some(2)
+                    || (img.get("clip_type").is_none()
+                        && img.get("video").is_none_or(Value::is_null))
+            }
+        })
         .filter_map(|img| {
             let urls: Vec<String> = img
                 .get("url_list")
@@ -175,6 +188,35 @@ pub fn parse_note(html: &str, origin: &str) -> Option<MediaItem> {
     })
 }
 
+/// 解析 note 页 HTML → MediaItem。纯函数(便于测试),网络抓取见 `fetch_note`。
+pub fn parse_note(html: &str, origin: &str) -> Option<MediaItem> {
+    let root = extract_router_data(html)?;
+    let item = find_note_item(&root)?;
+    parse_item(item, origin, ImagePolicy::All)
+}
+
+/// 解析 slidesinfo JSON,只保留静态图片,忽略视频/动态照片卡片。
+fn parse_slides_info(body: &str, origin: &str) -> Option<MediaItem> {
+    let root: Value = serde_json::from_str(body).ok()?;
+    if root.get("status_code").and_then(Value::as_i64) != Some(0) {
+        return None;
+    }
+    let item = find_note_item(&root)?;
+    parse_item(item, origin, ImagePolicy::StaticSlidesOnly)
+}
+
+fn slides_id(url: &reqwest::Url) -> Option<&str> {
+    let mut segments = url.path_segments()?;
+    if segments.next()? != "share" || segments.next()? != "slides" {
+        return None;
+    }
+    let id = segments.next()?;
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(id)
+}
+
 /// 构造抖音抓取用的 reqwest client:移动端 UA + 跟随短链跳转 + trust_dns(musl 静态二进制
 /// getaddrinfo 会失败,同 teloxide 客户端的处理)。
 pub fn build_client() -> Result<reqwest::Client> {
@@ -229,12 +271,49 @@ where
                 .await
                 .map_err(|error| anyhow::anyhow!("抖音页面读取失败: {}", error.without_url()))?;
             let response_bytes = html.len();
-            let item = parse_note(&html, origin).with_context(|| {
-                format!(
-                    "抖音页面解析失败(无 _ROUTER_DATA / 结构变更 / 验证墙) \
-                     status={status} final_url={safe_final_url} response_bytes={response_bytes}"
-                )
-            })?;
+            let item = if let Some(id) = slides_id(&final_url) {
+                let mut api_url = final_url.clone();
+                api_url.set_path("/web/api/v2/aweme/slidesinfo/");
+                api_url.set_query(None);
+                api_url.set_fragment(None);
+                api_url
+                    .query_pairs_mut()
+                    .append_pair("aweme_ids", &format!("[{id}]"))
+                    .append_pair("request_source", "200");
+                let api_resp = client
+                    .get(api_url)
+                    .header(reqwest::header::REFERER, final_url.as_str())
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!("抖音 slidesinfo 请求失败: {}", error.without_url())
+                    })?;
+                let api_status = api_resp.status();
+                let api_final_url = api_resp.url().clone();
+                if !final_url_allowed(api_final_url.as_str()) {
+                    anyhow::bail!("抖音 slidesinfo 重定向到非抖音域名,拒绝解析");
+                }
+                if !api_status.is_success() {
+                    anyhow::bail!("抖音 slidesinfo 响应状态异常 status={api_status}");
+                }
+                let body = api_resp.text().await.map_err(|error| {
+                    anyhow::anyhow!("抖音 slidesinfo 读取失败: {}", error.without_url())
+                })?;
+                parse_slides_info(&body, origin).with_context(|| {
+                    format!(
+                        "抖音 slidesinfo 解析失败(无静态图片 / 结构变更 / 验证墙) \
+                         status={api_status} response_bytes={}",
+                        body.len()
+                    )
+                })?
+            } else {
+                parse_note(&html, origin).with_context(|| {
+                    format!(
+                        "抖音页面解析失败(无 _ROUTER_DATA / 结构变更 / 验证墙) \
+                         status={status} final_url={safe_final_url} response_bytes={response_bytes}"
+                    )
+                })?
+            };
             Ok((
                 item,
                 safe_final_url.to_string(),
@@ -446,6 +525,65 @@ mod tests {
         assert!(!it.is_r18);
     }
 
+    #[test]
+    fn parse_slides_info_keeps_only_static_images() {
+        let body = r#"{
+            "status_code": 0,
+            "aweme_details": [ {
+                "aweme_id": "7668950916557299363",
+                "desc": "午后 #桑多涅 #原神 #画画",
+                "author": { "nickname": "Hanna", "sec_uid": "MS4wSLIDES" },
+                "images": [
+                    {
+                        "clip_type": 2,
+                        "url_list": ["https://p3.douyinpic.com/first.webp"]
+                    },
+                    {
+                        "clip_type": 2,
+                        "url_list": ["https://p3.douyinpic.com/second.webp"]
+                    },
+                    {
+                        "clip_type": 4,
+                        "url_list": ["https://p3.douyinpic.com/video-cover.webp"],
+                        "video": { "duration": 20034, "play_addr": { "url_list": ["https://v.example/video"] } }
+                    }
+                ]
+            } ]
+        }"#;
+
+        let item = parse_slides_info(body, "manual").expect("应解析出静态图片");
+        assert_eq!(item.source_id, "7668950916557299363");
+        assert_eq!(item.images.len(), 2);
+        assert_eq!(item.page_count, 2);
+        assert!(item.images[0].url.ends_with("first.webp"));
+        assert!(item.images[1].url.ends_with("second.webp"));
+        assert!(item
+            .images
+            .iter()
+            .all(|image| !image.url.contains("video-cover")));
+    }
+
+    #[test]
+    fn detects_numeric_slides_id_only() {
+        assert_eq!(
+            slides_id(
+                &reqwest::Url::parse("https://www.iesdouyin.com/share/slides/7668950916557299363/")
+                    .unwrap()
+            ),
+            Some("7668950916557299363")
+        );
+        assert_eq!(
+            slides_id(&reqwest::Url::parse("https://www.iesdouyin.com/share/note/123/").unwrap()),
+            None
+        );
+        assert_eq!(
+            slides_id(
+                &reqwest::Url::parse("https://www.iesdouyin.com/share/slides/../video/").unwrap()
+            ),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn fetch_note_retries_transient_page_without_router_data() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -510,6 +648,78 @@ mod tests {
                 "/share/note/7668600536471822181".to_string()
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_note_uses_slidesinfo_and_ignores_video_clips() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let slides_info = r#"{
+            "status_code": 0,
+            "aweme_details": [ {
+                "aweme_id": "7668950916557299363",
+                "desc": "午后 #桑多涅",
+                "images": [
+                    { "clip_type": 2, "url_list": ["https://p3/first.webp"] },
+                    { "clip_type": 2, "url_list": ["https://p3/second.webp"] },
+                    {
+                        "clip_type": 4,
+                        "url_list": ["https://p3/video-cover.webp"],
+                        "video": { "play_addr": { "url_list": ["https://v/video.mp4"] } }
+                    }
+                ]
+            } ]
+        }"#
+        .to_string();
+
+        let server = std::thread::spawn(move || {
+            let responses = [
+                "<html><body>slides client shell without router data</body></html>".to_string(),
+                slides_info,
+            ];
+            let mut paths = Vec::new();
+            for body in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let n = stream.read(&mut request).unwrap();
+                paths.push(
+                    String::from_utf8_lossy(&request[..n])
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+            paths
+        });
+
+        let item = fetch_note_with_validator(
+            &build_client().unwrap(),
+            &format!("http://{addr}/share/slides/7668950916557299363/"),
+            "manual",
+            |_| true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(item.source_id, "7668950916557299363");
+        assert_eq!(item.images.len(), 2);
+        assert_eq!(item.page_count, 2);
+
+        let paths = server.join().unwrap();
+        assert_eq!(paths[0], "/share/slides/7668950916557299363/");
+        assert!(paths[1].starts_with("/web/api/v2/aweme/slidesinfo/?"));
+        assert!(paths[1].contains("aweme_ids=%5B7668950916557299363%5D"));
+        assert!(paths[1].contains("request_source=200"));
     }
 
     #[tokio::test]

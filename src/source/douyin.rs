@@ -5,15 +5,23 @@
 //! 比 pixiv/x 脆:抖音改 `_ROUTER_DATA` 结构或加验证墙时会失效,失败优雅提示即可。
 
 use std::{
+    cmp::Reverse,
     collections::HashSet,
+    io::Write,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     time::Duration,
 };
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::config::{DouyinCfg, SourceCfg, SourceFilterCfg};
 use crate::model::{Author, ImageRef, MediaItem, SourceKind};
+use crate::source::Source;
+use crate::store::Store;
 
 /// 抖音 CDN 对桌面 UA 返回拦截页,必须移动端 UA(对标现有解析项目)。
 const MOBILE_UA: &str = "Mozilla/5.0 (Linux; Android 11; SAMSUNG SM-G973U) \
@@ -97,6 +105,127 @@ enum ImagePolicy {
     StaticSlidesOnly,
 }
 
+fn extract_media_urls(source: &Value) -> Vec<String> {
+    match source {
+        Value::String(url) if !url.trim().is_empty() => vec![url.clone()],
+        Value::Array(values) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|url| !url.trim().is_empty())
+            .map(str::to_string)
+            .collect(),
+        Value::Object(map) => map
+            .get("url_list")
+            .or_else(|| map.get("urlList"))
+            .map(extract_media_urls)
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn positive_int(value: Option<&Value>) -> u64 {
+    value
+        .and_then(|v| {
+            v.as_u64().or_else(|| {
+                v.as_str()
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                    .filter(|n| *n > 0.0)
+                    .map(|n| n as u64)
+            })
+        })
+        .unwrap_or(0)
+}
+
+fn image_resolution_score(metadata: &Value) -> u64 {
+    let width = positive_int(metadata.get("width").or_else(|| metadata.get("w")));
+    let height = positive_int(metadata.get("height").or_else(|| metadata.get("h")));
+    if width > 0 && height > 0 {
+        width.saturating_mul(height)
+    } else {
+        width.max(height)
+    }
+}
+
+fn is_watermarked_url(url: &str) -> bool {
+    let normalized = url.to_ascii_lowercase();
+    [
+        "tplv-dy-water",
+        "dy-water",
+        "owner_watermark",
+        "watermark_image",
+        "watermark=1",
+        "playwm",
+    ]
+    .iter()
+    .any(|hint| normalized.contains(hint))
+}
+
+type ImageRankKey = (u8, u8, Reverse<u64>, u8);
+
+fn ranked_image_urls(item: &Value) -> Vec<String> {
+    // 与 douyin-downloader 一致：无水印列表 > 原图 > 展示图 > 通用 url_list > 下载图 > 水印图；
+    // 同档优先更高分辨率、非 webp。每张图保留所有镜像供下载失败时轮换。
+    let mut entries: Vec<(ImageRankKey, String)> = Vec::new();
+    let mut add = |source: Option<&Value>, metadata: &Value, rank: u8| {
+        for url in source.into_iter().flat_map(extract_media_urls) {
+            let watermark = u8::from(rank >= 4 || is_watermarked_url(&url));
+            let webp = u8::from(
+                reqwest::Url::parse(&url)
+                    .ok()
+                    .is_some_and(|u| u.path().to_ascii_lowercase().contains(".webp")),
+            );
+            entries.push((
+                (
+                    watermark,
+                    rank,
+                    Reverse(image_resolution_score(metadata)),
+                    webp,
+                ),
+                url,
+            ));
+        }
+    };
+
+    add(item.get("watermark_free_download_url_list"), item, 0);
+    if let Some(origin) = item.get("origin_image") {
+        add(Some(origin), origin, 1);
+    }
+    if let Some(display) = item.get("display_image") {
+        add(Some(display), display, 2);
+    }
+    add(Some(item), item, 3);
+    if let Some(download) = item.get("download_url") {
+        add(Some(download), download, 4);
+    }
+    if let Some(download) = item.get("download_addr") {
+        add(Some(download), download, 5);
+    }
+    add(item.get("download_url_list"), item, 6);
+    if let Some(watermark) = item.get("owner_watermark_image") {
+        add(Some(watermark), watermark, 7);
+    }
+
+    entries.sort_by_key(|(key, _)| *key);
+    let mut seen = HashSet::new();
+    entries
+        .into_iter()
+        .map(|(_, url)| url)
+        .filter(|url| seen.insert(url.clone()))
+        .collect()
+}
+
+fn gallery_items(item: &Value) -> Option<&Vec<Value>> {
+    item.get("image_post_info")
+        .and_then(|post| post.get("images").or_else(|| post.get("image_list")))
+        .and_then(Value::as_array)
+        .filter(|images| !images.is_empty())
+        .or_else(|| {
+            item.get("images")
+                .or_else(|| item.get("image_list"))
+                .and_then(Value::as_array)
+        })
+}
+
 fn parse_item(item: &Value, origin: &str, image_policy: ImagePolicy) -> Option<MediaItem> {
     // aweme_id 可能是数字或字符串。
     let aweme_id = item.get("aweme_id").and_then(|v| {
@@ -113,9 +242,7 @@ fn parse_item(item: &Value, origin: &str, image_policy: ImagePolicy) -> Option<M
     // 每张图保留完整 url_list:首项为主地址,其余作为 CDN 故障时的备用地址。
     // slidesinfo 的 images 同时包含视频卡片:clip_type=2 才是静态图;
     // 其他 clip_type(1/3/4)以及显式带 video 的条目都不应当成图片封面发布。
-    let images: Vec<ImageRef> = item
-        .get("images")?
-        .as_array()?
+    let images: Vec<ImageRef> = gallery_items(item)?
         .iter()
         .filter(|img| match image_policy {
             ImagePolicy::All => true,
@@ -126,15 +253,7 @@ fn parse_item(item: &Value, origin: &str, image_policy: ImagePolicy) -> Option<M
             }
         })
         .filter_map(|img| {
-            let urls: Vec<String> = img
-                .get("url_list")
-                .and_then(|u| u.as_array())
-                .into_iter()
-                .flatten()
-                .filter_map(|v| v.as_str())
-                .filter(|url| !url.trim().is_empty())
-                .map(str::to_string)
-                .collect();
+            let urls = ranked_image_urls(img);
             let url = urls.first()?.clone();
             let mut seen = HashSet::from([url.as_str()]);
             let fallback_urls = urls
@@ -186,6 +305,168 @@ fn parse_item(item: &Value, origin: &str, image_policy: ImagePolicy) -> Option<M
         images,
         origin: origin.to_string(),
     })
+}
+
+/// 解析作者作品接口中的一个 aweme。纯视频没有图库字段，会被自然跳过。
+pub fn parse_user_aweme(item: &Value, origin: &str) -> Option<MediaItem> {
+    parse_item(item, origin, ImagePolicy::All)
+}
+
+#[derive(Debug, Serialize)]
+struct FeedBridgeRequest {
+    target: String,
+    max_pages: u32,
+    browser_fallback: bool,
+    browser_headless: bool,
+    known_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeedBridgeResponse {
+    #[serde(default)]
+    sec_user_id: String,
+    #[serde(default)]
+    pages_fetched: u32,
+    #[serde(default)]
+    restricted: bool,
+    #[serde(default)]
+    browser_fallback_used: bool,
+    #[serde(default)]
+    items: Vec<Value>,
+}
+
+fn truncate_stderr(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let mut compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() > 1200 {
+        compact = compact.chars().take(1200).collect::<String>() + "…";
+    }
+    compact
+}
+
+fn run_feed_helper(
+    runtime: &DouyinCfg,
+    target: String,
+    known_ids: Vec<String>,
+) -> Result<FeedBridgeResponse> {
+    let helper_path =
+        std::env::var("HANABI_DOUYIN_HELPER").unwrap_or_else(|_| runtime.helper_path.clone());
+    let request = FeedBridgeRequest {
+        target,
+        max_pages: runtime.max_pages,
+        browser_fallback: runtime.browser_fallback,
+        browser_headless: runtime.browser_headless,
+        known_ids,
+    };
+    let input = serde_json::to_vec(&request).context("序列化抖音作者桥接请求失败")?;
+
+    let mut command = Command::new(&runtime.python_command);
+    command.arg("-u").arg(&helper_path);
+    if !runtime.cookie_file.trim().is_empty() {
+        command.env("HANABI_DOUYIN_COOKIE_FILE", runtime.cookie_file.trim());
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "启动抖音作者桥接器失败: command={} helper={helper_path}",
+                runtime.python_command
+            )
+        })?;
+    child
+        .stdin
+        .take()
+        .context("抖音作者桥接器 stdin 不可用")?
+        .write_all(&input)
+        .context("写入抖音作者桥接请求失败")?;
+    let output = child.wait_with_output().context("等待抖音作者桥接器失败")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "抖音作者桥接器失败 exit={}: {}",
+            output.status,
+            truncate_stderr(&output.stderr)
+        );
+    }
+    serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "解析抖音作者桥接器 JSON 失败(stdout={} bytes, stderr={})",
+            output.stdout.len(),
+            truncate_stderr(&output.stderr)
+        )
+    })
+}
+
+/// 定时抓取抖音作者主页公开图文作品。签名、Cookie 与可选 Playwright 兜底由
+/// `tools/douyin_user_feed.py` 调用 douyin-downloader 处理，Rust 侧只接收原始 aweme JSON。
+pub struct DouyinUserSource {
+    cfg: SourceCfg,
+    runtime: DouyinCfg,
+}
+
+impl DouyinUserSource {
+    pub fn new(cfg: SourceCfg, runtime: DouyinCfg) -> Result<Self> {
+        if runtime.python_command.trim().is_empty() {
+            anyhow::bail!("[douyin].python_command 不能为空");
+        }
+        if runtime.helper_path.trim().is_empty() {
+            anyhow::bail!("[douyin].helper_path 不能为空");
+        }
+        if runtime.max_pages == 0 || runtime.max_pages > 100 {
+            anyhow::bail!("[douyin].max_pages 必须在 1..=100");
+        }
+        Ok(Self { cfg, runtime })
+    }
+}
+
+#[async_trait]
+impl Source for DouyinUserSource {
+    fn name(&self) -> &str {
+        &self.cfg.name
+    }
+
+    fn filter_cfg(&self) -> &SourceFilterCfg {
+        &self.cfg.filters
+    }
+
+    async fn fetch(&self, _store: &Store) -> Result<Vec<MediaItem>> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for target in self.cfg.targets.clone() {
+            let runtime = self.runtime.clone();
+            let target_for_log = target.clone();
+            // 最终增量幂等由 pipeline 的 SQLite already_pushed 统一完成。
+            let known = Vec::new();
+            let response =
+                tokio::task::spawn_blocking(move || run_feed_helper(&runtime, target, known))
+                    .await
+                    .context("抖音作者桥接任务 join 失败")??;
+
+            let raw_count = response.items.len();
+            let before = out.len();
+            for raw in response.items {
+                if let Some(item) = parse_user_aweme(&raw, &self.cfg.name) {
+                    if seen.insert(item.source_id.clone()) {
+                        out.push(item);
+                    }
+                }
+            }
+            tracing::info!(
+                source = %self.cfg.name,
+                target = %target_for_log,
+                sec_user_id = %response.sec_user_id,
+                pages = response.pages_fetched,
+                restricted = response.restricted,
+                browser_fallback = response.browser_fallback_used,
+                raw_items = raw_count,
+                image_items = out.len() - before,
+                "抖音作者作品发现完成"
+            );
+        }
+        Ok(out)
+    }
 }
 
 /// 解析 note 页 HTML → MediaItem。纯函数(便于测试),网络抓取见 `fetch_note`。
@@ -519,10 +800,65 @@ mod tests {
         assert_eq!(it.tags, vec!["若葉睦", "wakaba"]);
         assert_eq!(it.images.len(), 2);
         assert_eq!(it.page_count, 2);
-        assert!(it.images[0].url.contains("aweme-images"));
-        assert_eq!(it.images[0].fallback_urls, vec!["https://p11/a"]);
+        // douyin-downloader 排序规则同档优先非 webp；另一镜像仍保留为 fallback。
+        assert_eq!(it.images[0].url, "https://p11/a");
+        assert!(it.images[0].fallback_urls[0].contains("aweme-images"));
         assert!(it.images[1].fallback_urls.is_empty());
         assert!(!it.is_r18);
+    }
+
+    #[test]
+    fn parse_user_aweme_supports_image_post_info_and_prefers_original() {
+        let raw: Value = serde_json::from_str(
+            r#"{
+                "aweme_id": "7600000000000000001",
+                "desc": "作者主页图集#壁纸",
+                "author": {"nickname": "Artist", "sec_uid": "MS4wUSER"},
+                "image_post_info": {"images": [{
+                    "origin_image": {
+                        "width": 3000, "height": 4000,
+                        "url_list": ["https://p3.example/original.jpeg", "https://p9.example/original.jpeg"]
+                    },
+                    "display_image": {
+                        "width": 6000, "height": 8000,
+                        "url_list": ["https://p3.example/display.webp"]
+                    },
+                    "owner_watermark_image": {
+                        "url_list": ["https://p3.example/tplv-dy-water.webp"]
+                    }
+                }]}
+            }"#,
+        )
+        .unwrap();
+
+        let item = parse_user_aweme(&raw, "artist_feed").unwrap();
+        assert_eq!(item.source, SourceKind::Douyin);
+        assert_eq!(item.source_id, "7600000000000000001");
+        assert_eq!(item.author.name, "Artist");
+        assert_eq!(item.origin, "artist_feed");
+        assert_eq!(item.images[0].url, "https://p3.example/original.jpeg");
+        assert_eq!(
+            item.images[0].fallback_urls,
+            vec![
+                "https://p9.example/original.jpeg",
+                "https://p3.example/display.webp",
+                "https://p3.example/tplv-dy-water.webp"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_user_aweme_skips_pure_video() {
+        let raw: Value = serde_json::from_str(
+            r#"{
+                "aweme_id": "7600000000000000002",
+                "desc": "video",
+                "author": {"nickname": "Artist", "sec_uid": "MS4wUSER"},
+                "video": {"play_addr": {"url_list": ["https://v.example/video.mp4"]}}
+            }"#,
+        )
+        .unwrap();
+        assert!(parse_user_aweme(&raw, "artist_feed").is_none());
     }
 
     #[test]

@@ -6,3 +6,7 @@
 config.toml
 gallery-dl.conf
 .env
+.venv/
+.douyin-cookies.json
+__pycache__/
+*.pyc

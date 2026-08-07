@@ -6,11 +6,11 @@
   <sub>Illustration: <a href="https://www.pixiv.net/artworks/141191404">pixiv #141191404</a></sub>
 </p>
 
-二次元图片 Telegram 推送 bot，带**人工审批制**。从 Pixiv（关注画师新作 / 排行榜）和 X（List）抓取插画，先发到你的私聊等审批，你点按钮决定是否发布到频道。
+二次元图片 Telegram 推送 bot，带**人工审批制**。从 Pixiv（关注画师新作 / 排行榜）、X（List）和抖音作者主页抓取插画，先发到你的私聊等审批，你点按钮决定是否发布到频道。
 
 ## 特性
 
-- 🔍 **多源抓取**：Pixiv 关注画师新作 + Pixiv 周榜（按标签）+ X List
+- 🔍 **多源抓取**：Pixiv 关注画师新作 + Pixiv 周榜（按标签）+ X List + 抖音作者图文作品
 - 🖼️ **人工审批**：作品先发审批私聊（单图直发 / 多图整组 + 控制消息），附 `✅ 发送到频道` / `📦 发送并入库`（配置 Vitrine 时）/ `❌ 丢弃`；同一按钮连点只会执行一次，第二次会显示「已在发布中」；点击后整组消息自动删除
 - 📦 **图库入库**：可选对接 Cloudflare 图库 [Vitrine](https://github.com/Furinelle/vitrine)：审批「发送并入库」或手动链接直发频道成功后，用帖子自带标签写入图库
 - ✅ **一键批准剩余项**：先逐条点 `❌ 丢弃` 排除不想推送的作品，再点命令菜单中的 `/approve`（仅发布）或 `/approve_archive`（发布并入库），按审批顺序处理所有剩余待审项；重复执行不会重复发布
@@ -28,6 +28,7 @@
 
 - Rust（`cargo build --release`）
 - gallery-dl：`pipx install gallery-dl`
+- `douyin_user` 来源：Python 3.9+ 与固定版本的 [`jiji262/douyin-downloader`](https://github.com/jiji262/douyin-downloader)（Docker 镜像已内置）
 - 一个 Telegram bot（@BotFather 创建，拿 token）
 
 ## 认证（`gallery-dl.conf`）
@@ -38,6 +39,23 @@
 - **X** `extractor.twitter.cookies`：浏览器（建议小号）登录后从 DevTools → Cookies 复制 `auth_token` 和 `ct0`
 
 > X 还设了 `"videos": false`、`"retweets": false`（只要图片原作）和 `"size": "orig"`（4K 原画质）。
+
+抖音作者源的登录态不进 TOML。按需设置 Cookie header 或 JSON Cookie 文件：
+
+```bash
+export HANABI_DOUYIN_COOKIE='ttwid=...; msToken=...; passport_csrf_token=...'
+# 或
+export HANABI_DOUYIN_COOKIE_FILE=/root/hanabi/.douyin-cookies.json
+```
+
+非 Docker 安装桥接依赖：
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install aiohttp pyyaml gmssl==3.2.2
+.venv/bin/pip install --no-deps \
+  'git+https://github.com/jiji262/douyin-downloader.git@ad7338fdc474c14e2063370540a362cd8a953b43'
+```
 
 ## 配置（`config.toml`）
 
@@ -54,6 +72,14 @@ publish_channel = "@your_channel"   # 批准后发布的频道（绑定讨论组
 [gallery_dl]
 config_path = "gallery-dl.conf"  # 必填：gallery-dl 认证配置路径
 probe_range = "1-50"
+
+[douyin]
+python_command = ".venv/bin/python"
+helper_path = "tools/douyin_user_feed.py"
+max_pages = 3                 # 每页 20 条
+cookie_file = ".douyin-cookies.json" # 仅路径；Cookie 文件 chmod 600 且不提交
+browser_fallback = false      # API 翻页受限时可启用 Playwright 兜底
+browser_headless = false
 
 # 可选：X 图片下载画质。download 阶段以 -o extractor.twitter.size=orig 追加；
 # 与 gallery-dl.conf 里的 "size" 各管一段（probe 用 conf、download 用这里），两处都设才稳。
@@ -80,6 +106,13 @@ name = "x_artists_list"
 kind = "x_list"
 targets = ["https://x.com/i/lists/<id>"]
 filters = { r18 = true, min_likes = 50 }
+
+# 抖音作者主页/作者短链；纯视频跳过，图集和 Live Photo 的静态图片进入审批。
+[[source]]
+name = "douyin_artist"
+kind = "douyin_user"
+targets = ["https://www.douyin.com/user/<sec_user_id>"]
+filters = { r18 = false, require_media = true }
 ```
 
 > `bot_token` **不进**配置文件，走环境变量 `HANABI_BOT_TOKEN`。
@@ -180,7 +213,7 @@ docker run -d --name hanabi \
 
 单 Rust 二进制 + 两个并发任务：
 
-- **抓取循环**（`main` loop）：`Source`（gallery-dl 抓取后端）→ `FilterChain` → `TelegramSink`（发审批消息），sqlite 去重（`mark_pushed` 在发审批后执行 = 审过即去重）
+- **抓取循环**（`main` loop）：`Source`（Pixiv/X 使用 gallery-dl；抖音作者使用 douyin-downloader JSON 桥）→ `FilterChain` → `TelegramSink`（发审批消息），sqlite 去重（`mark_pushed` 在发审批后执行 = 审过即去重）
 - **审批回调任务**（`run_review_loop`）：短轮询 `get_updates`（避代理长连接超时），处理按钮回调（批准→发频道+删私聊）和 `/` 命令；`pending.state` 通过条件更新原子抢占，保证同一审批只会启动一次上传；`/run` 经 mpsc 通道触发抓取循环立即跑一轮
 
 两阶段抓取：`probe`（`gallery-dl -j` 拉元数据过滤）→ `download`（只下通过的作品）。设计/计划见 `docs/superpowers/`。

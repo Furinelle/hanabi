@@ -11,6 +11,7 @@ use hanabi::model::{MediaItem, SourceKind};
 use hanabi::pipeline::run_once;
 use hanabi::sink::telegram::TelegramSink;
 use hanabi::sink::Sink;
+use hanabi::source::douyin::DouyinUserSource;
 use hanabi::source::pixiv::PixivSource;
 use hanabi::source::x::{download_extra, XSource};
 use hanabi::source::Source;
@@ -134,8 +135,14 @@ async fn main() -> Result<()> {
             "x_list" | "x_foryou" => {
                 sources.push(Box::new(XSource::new(s.clone(), gdl.clone())));
             }
+            "douyin_user" => {
+                sources.push(Box::new(DouyinUserSource::new(
+                    s.clone(),
+                    cfg.douyin.clone(),
+                )?));
+            }
             other => anyhow::bail!(
-                "源 {} 的 kind 无效: {other}(可选: pixiv_user | pixiv_bookmarks | pixiv_ranking | x_list | x_foryou)",
+                "源 {} 的 kind 无效: {other}(可选: pixiv_user | pixiv_bookmarks | pixiv_ranking | x_list | x_foryou | douyin_user)",
                 s.name
             ),
         }
@@ -146,13 +153,33 @@ async fn main() -> Result<()> {
     // (单核 VPS 上 worker 只有 1 个,同步阻塞会让审批按钮/命令全部冻结)。
     let gdl_dl = gdl.clone();
     let x_size_dl = x_size.clone();
+    let douyin_client_dl = hanabi::source::douyin::build_client()?;
     let download = move |item: MediaItem| {
         let gdl = gdl_dl.clone();
         let x_size = x_size_dl.clone();
+        let douyin_client = douyin_client_dl.clone();
         async move {
-            tokio::task::spawn_blocking(move || download_work(&gdl, &item, x_size.as_deref()))
-                .await
-                .unwrap_or_default()
+            if item.source == SourceKind::Douyin {
+                let dir = std::env::temp_dir().join(format!("hanabi_douyin_{}", item.source_id));
+                let (files, failed) =
+                    hanabi::source::douyin::download_images(&douyin_client, &item, &dir).await;
+                if failed == 0 {
+                    files
+                } else {
+                    tracing::warn!(
+                        id = %item.source_id,
+                        downloaded = files.len(),
+                        failed,
+                        "抖音作者作品下载不完整,不交付审批,下轮重试"
+                    );
+                    discard_download_dir(dir).await;
+                    Vec::new()
+                }
+            } else {
+                tokio::task::spawn_blocking(move || download_work(&gdl, &item, x_size.as_deref()))
+                    .await
+                    .unwrap_or_default()
+            }
         }
     };
 

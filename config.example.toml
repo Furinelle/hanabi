@@ -14,6 +14,16 @@ publish_channel = "@your_channel" # 必填:批准后发布的频道(@username �
 config_path = "gallery-dl.conf"
 probe_range = "1-20"
 
+# 抖音作者主页抓取：桥接 jiji262/douyin-downloader 的签名、游标与可选浏览器兜底。
+# Cookie 不写进配置，使用 HANABI_DOUYIN_COOKIE 或 HANABI_DOUYIN_COOKIE_FILE。
+[douyin]
+python_command = "python3"
+helper_path = "tools/douyin_user_feed.py"
+max_pages = 3                 # 每页 20 条；首次回填超过 60 条时调大
+cookie_file = ".douyin-cookies.json" # chmod 600，已在 .gitignore
+browser_fallback = false      # 需另装 playwright + chromium
+browser_headless = false      # 人工过验证码时保持 false
+
 [x_image]
 size = "orig"
 
@@ -46,3 +56,9 @@ name = "x_foryou"
 kind = "x_foryou"
 targets = ["https://x.com/home"]
 filters = { r18 = false, min_likes = 2000, require_media = true, tags = ["イラスト"] }
+
+[[source]]
+name = "douyin_artist"
+kind = "douyin_user"
+targets = ["https://www.douyin.com/user/MS4wLjABAAAA_replace_me"]
+filters = { r18 = false, require_media = true }

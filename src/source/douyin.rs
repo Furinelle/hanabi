@@ -399,6 +399,44 @@ fn run_feed_helper(
     })
 }
 
+/// 通过 douyin-downloader 桥接器抓取一个作者主页，并只返回可发布的图文作品。
+/// 可用于定时 `douyin_user` 来源，也可用于手动发送作者主页链接的多作品流程。
+pub async fn fetch_user_feed(
+    runtime: &DouyinCfg,
+    target: &str,
+    origin: &str,
+) -> Result<Vec<MediaItem>> {
+    let runtime = runtime.clone();
+    let target_owned = target.to_string();
+    let response =
+        tokio::task::spawn_blocking(move || run_feed_helper(&runtime, target_owned, Vec::new()))
+            .await
+            .context("抖音作者桥接任务 join 失败")??;
+
+    let raw_count = response.items.len();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in response.items {
+        if let Some(item) = parse_user_aweme(&raw, origin) {
+            if seen.insert(item.source_id.clone()) {
+                out.push(item);
+            }
+        }
+    }
+    tracing::info!(
+        source = origin,
+        target,
+        sec_user_id = %response.sec_user_id,
+        pages = response.pages_fetched,
+        restricted = response.restricted,
+        browser_fallback = response.browser_fallback_used,
+        raw_items = raw_count,
+        image_items = out.len(),
+        "抖音作者作品发现完成"
+    );
+    Ok(out)
+}
+
 /// 定时抓取抖音作者主页公开图文作品。签名、Cookie 与可选 Playwright 兜底由
 /// `tools/douyin_user_feed.py` 调用 douyin-downloader 处理，Rust 侧只接收原始 aweme JSON。
 pub struct DouyinUserSource {
@@ -434,36 +472,13 @@ impl Source for DouyinUserSource {
     async fn fetch(&self, _store: &Store) -> Result<Vec<MediaItem>> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
-        for target in self.cfg.targets.clone() {
-            let runtime = self.runtime.clone();
-            let target_for_log = target.clone();
+        for target in &self.cfg.targets {
             // 最终增量幂等由 pipeline 的 SQLite already_pushed 统一完成。
-            let known = Vec::new();
-            let response =
-                tokio::task::spawn_blocking(move || run_feed_helper(&runtime, target, known))
-                    .await
-                    .context("抖音作者桥接任务 join 失败")??;
-
-            let raw_count = response.items.len();
-            let before = out.len();
-            for raw in response.items {
-                if let Some(item) = parse_user_aweme(&raw, &self.cfg.name) {
-                    if seen.insert(item.source_id.clone()) {
-                        out.push(item);
-                    }
+            for item in fetch_user_feed(&self.runtime, target, &self.cfg.name).await? {
+                if seen.insert(item.source_id.clone()) {
+                    out.push(item);
                 }
             }
-            tracing::info!(
-                source = %self.cfg.name,
-                target = %target_for_log,
-                sec_user_id = %response.sec_user_id,
-                pages = response.pages_fetched,
-                restricted = response.restricted,
-                browser_fallback = response.browser_fallback_used,
-                raw_items = raw_count,
-                image_items = out.len() - before,
-                "抖音作者作品发现完成"
-            );
         }
         Ok(out)
     }
@@ -509,6 +524,33 @@ pub fn build_client() -> Result<reqwest::Client> {
         .trust_dns(true)
         .build()
         .context("构造 douyin reqwest client 失败")
+}
+
+/// 跟随分享短链并返回已校验、已去查询参数的抖音落点。作者短链需要先在 Rust
+/// 侧解析一次，避免把 `/share/user/...` 误送给仅解析 note 页的 `_ROUTER_DATA` 路径。
+pub async fn resolve_douyin_url(client: &reqwest::Client, url: &str) -> Result<reqwest::Url> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| anyhow::anyhow!("抖音短链解析失败: {}", error.without_url()))?;
+    let status = response.status();
+    let mut final_url = response.url().clone();
+    if !is_douyin_url(final_url.as_str()) {
+        anyhow::bail!("抖音短链重定向到非抖音域名");
+    }
+    if !status.is_success() {
+        anyhow::bail!("抖音短链响应状态异常 status={status}");
+    }
+    final_url.set_query(None);
+    final_url.set_fragment(None);
+    Ok(final_url)
+}
+
+/// 是否为作者主页落点（网页主页或移动端分享主页）。
+pub fn is_user_profile_url(url: &reqwest::Url) -> bool {
+    let path = url.path();
+    path.starts_with("/user/") || path.starts_with("/share/user/")
 }
 
 /// 抓 note 页并解析为 MediaItem。`url` 可为短链(自动跟随跳转)。
@@ -918,6 +960,19 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn detects_user_profile_landing_paths() {
+        assert!(is_user_profile_url(
+            &reqwest::Url::parse("https://www.douyin.com/user/MS4wTEST").unwrap()
+        ));
+        assert!(is_user_profile_url(
+            &reqwest::Url::parse("https://www.iesdouyin.com/share/user/MS4wTEST").unwrap()
+        ));
+        assert!(!is_user_profile_url(
+            &reqwest::Url::parse("https://www.douyin.com/note/123").unwrap()
+        ));
     }
 
     #[tokio::test]

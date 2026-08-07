@@ -124,6 +124,7 @@ async fn main() -> Result<()> {
     });
 
     let x_size = cfg.x_image.size.clone();
+    let douyin_runtime = cfg.douyin.clone();
     // kind 白名单:拼错时旧逻辑静默按 X 源解析 pixiv 输出,恒 0 命中且无提示;
     // 启动即报错,尽早暴露配置问题。
     let mut sources: Vec<Box<dyn Source>> = Vec::new();
@@ -224,6 +225,7 @@ async fn main() -> Result<()> {
                 let gdl = gdl.clone();
                 let sink = sink.clone();
                 let x_size = x_size.clone();
+                let douyin_runtime = douyin_runtime.clone();
                 let inflight = inflight.clone();
                 tokio::spawn(async move {
                     let url = job.url.clone();
@@ -240,7 +242,15 @@ async fn main() -> Result<()> {
                         set: inflight.clone(),
                         url: url.clone(),
                     };
-                    if let Err(e) = handle_link(job, &gdl, x_size.as_deref(), &sink).await {
+                    if let Err(e) = handle_link(
+                        job,
+                        &gdl,
+                        x_size.as_deref(),
+                        &douyin_runtime,
+                        &sink,
+                    )
+                    .await
+                    {
                         tracing::warn!(error = %e, "手动链接处理失败");
                         // 失败反馈:把"抓取中"改成失败提示,不再永久残留
                         // (成功路径由 handle_link 自行删除这两条消息)。
@@ -279,11 +289,12 @@ async fn handle_link(
     job: hanabi::sink::telegram::LinkJob,
     gdl: &Arc<GalleryDl>,
     x_size: Option<&str>,
+    douyin_runtime: &hanabi::config::DouyinCfg,
     sink: &TelegramSink,
 ) -> Result<()> {
     // 抖音:gallery-dl 不支持,走独立的 reqwest 解析路径(直发频道,同单作品)。
     if hanabi::source::douyin::is_douyin_url(&job.url) {
-        return handle_douyin(job, sink).await;
+        return handle_douyin(job, douyin_runtime, sink).await;
     }
     // 自开 Store 连接:Store 持 rusqlite::Connection(!Sync)不能跨 spawn 共享;
     // Task1 已加 busy_timeout, 多连接并发安全。
@@ -428,12 +439,115 @@ fn douyin_download_complete(downloaded: usize, failed: usize) -> bool {
     downloaded > 0 && failed == 0
 }
 
-/// 处理抖音图文链接:reqwest 抓分享页 → 解析 → 下原图(无水印)→ 直发频道。
-async fn handle_douyin(job: hanabi::sink::telegram::LinkJob, sink: &TelegramSink) -> Result<()> {
+/// 抖音作者主页属于多作品链接：逐条下载后进入审批，与 Pixiv/X 主页一致。
+async fn handle_douyin_user(
+    job: hanabi::sink::telegram::LinkJob,
+    items: Vec<MediaItem>,
+    store: Store,
+    client: &reqwest::Client,
+    sink: &TelegramSink,
+) -> Result<()> {
+    let mut delivered = 0usize;
+    let mut failed = 0usize;
+    for item in &items {
+        if store.already_pushed(item)? {
+            continue;
+        }
+        let dir = std::env::temp_dir().join(format!("hanabi_douyin_{}", item.source_id));
+        let (files, image_failures) =
+            hanabi::source::douyin::download_images(client, item, &dir).await;
+        if image_failures > 0 || files.is_empty() {
+            failed += 1;
+            tracing::warn!(
+                id = %item.source_id,
+                downloaded = files.len(),
+                failed = image_failures,
+                "抖音作者作品下载不完整,未交付审批"
+            );
+            discard_download_dir(dir).await;
+            continue;
+        }
+        match sink.deliver(item, &files).await {
+            Ok(()) => {
+                delivered += 1;
+                if let Err(e) = store.mark_pushed(item) {
+                    tracing::warn!(id = %item.source_id, error = %e, "标记已推送失败,可能重复投递");
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                tracing::warn!(id = %item.source_id, error = %e, "抖音作者作品交付审批失败");
+            }
+        }
+    }
+
+    sink.delete_review_messages(&[job.user_msg_id]).await;
+    if failed > 0 {
+        sink.edit_review_text(
+            job.notice_msg_id,
+            &format!(
+                "⚠️ {failed} 个作品下载/投递失败(本次进审批 {delivered} 个);失败项未入库,可重发链接重试"
+            ),
+        )
+        .await;
+    } else {
+        sink.delete_review_messages(&[job.notice_msg_id]).await;
+    }
+    Ok(())
+}
+
+/// 处理抖音链接：单个图文直发频道；作者主页批量抓取后进入审批。
+async fn handle_douyin(
+    job: hanabi::sink::telegram::LinkJob,
+    runtime: &hanabi::config::DouyinCfg,
+    sink: &TelegramSink,
+) -> Result<()> {
     use hanabi::source::douyin;
     let store = Store::open("hanabi.db").context("handle_douyin 打开 Store 失败")?;
     let client = douyin::build_client()?;
-    match douyin::fetch_note(&client, &job.url, "manual").await {
+    let resolved_url = match douyin::resolve_douyin_url(&client, &job.url).await {
+        Ok(url) => Some(url),
+        Err(error) => {
+            tracing::warn!(error = %error, "抖音短链预解析失败,继续走原链接重试");
+            None
+        }
+    };
+    let resolved_target = resolved_url
+        .as_ref()
+        .map(reqwest::Url::as_str)
+        .unwrap_or(&job.url);
+
+    // 明确落到作者主页时直接走作者桥；既避免 note 页三次无效解析，也避免 Python
+    // 再解析一遍短链时遇到偶发超时。
+    if resolved_url
+        .as_ref()
+        .is_some_and(douyin::is_user_profile_url)
+    {
+        match douyin::fetch_user_feed(runtime, resolved_target, "manual").await {
+            Ok(items) if !items.is_empty() => {
+                tracing::info!(items = items.len(), "手动抖音作者主页解析成功,进入批量审批");
+                return handle_douyin_user(job, items, store, &client, sink).await;
+            }
+            Ok(_) => {
+                sink.delete_review_messages(&[job.user_msg_id]).await;
+                sink.edit_review_text(job.notice_msg_id, "ℹ️ 该作者主页没有可用图文作品")
+                    .await;
+                return Ok(());
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "抖音作者主页解析失败");
+                sink.delete_review_messages(&[job.user_msg_id]).await;
+                sink.edit_review_text(
+                    job.notice_msg_id,
+                    "ℹ️ 抖音作者主页解析失败(可能需刷新 Cookie)",
+                )
+                .await;
+                return Ok(());
+            }
+        }
+    }
+
+    match douyin::fetch_note(&client, resolved_target, "manual").await {
         Ok(item) => {
             // 结束时留给用户的提示;None = 全部顺利,静默删掉两条消息即可。
             let mut notice: Option<String> = None;
@@ -491,11 +605,27 @@ async fn handle_douyin(job: hanabi::sink::telegram::LinkJob, sink: &TelegramSink
                 }
             }
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "抖音解析失败");
-            sink.delete_review_messages(&[job.user_msg_id]).await;
-            sink.edit_review_text(job.notice_msg_id, "ℹ️ 抖音解析失败(可能改版或需验证)")
-                .await;
+        Err(note_error) => {
+            // 作者短链最终会落到 /share/user/...，自然没有 note 页的 _ROUTER_DATA。
+            // 用作者桥接器再判一次：成功即按多作品主页处理；两条路径都失败才反馈解析失败。
+            match douyin::fetch_user_feed(runtime, &job.url, "manual").await {
+                Ok(items) if !items.is_empty() => {
+                    tracing::info!(items = items.len(), "手动抖音作者主页解析成功,进入批量审批");
+                    handle_douyin_user(job, items, store, &client, sink).await?;
+                }
+                Ok(_) => {
+                    tracing::warn!(error = %note_error, "抖音作者主页没有可用图文作品");
+                    sink.delete_review_messages(&[job.user_msg_id]).await;
+                    sink.edit_review_text(job.notice_msg_id, "ℹ️ 该作者主页没有可用图文作品")
+                        .await;
+                }
+                Err(user_error) => {
+                    tracing::warn!(note_error = %note_error, user_error = %user_error, "抖音解析失败");
+                    sink.delete_review_messages(&[job.user_msg_id]).await;
+                    sink.edit_review_text(job.notice_msg_id, "ℹ️ 抖音解析失败(可能改版或需验证)")
+                        .await;
+                }
+            }
         }
     }
     Ok(())

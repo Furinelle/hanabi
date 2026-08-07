@@ -115,6 +115,8 @@ targets = ["https://www.douyin.com/user/<sec_user_id>"]
 filters = { r18 = false, require_media = true }
 ```
 
+手动把抖音作者主页或作者短链发给 bot 时，会像 Pixiv/X 作者主页一样批量抓取图文作品并进入审批；单个抖音图文链接仍直接发布到频道。
+
 > `bot_token` **不进**配置文件，走环境变量 `HANABI_BOT_TOKEN`。
 
 ## 运行

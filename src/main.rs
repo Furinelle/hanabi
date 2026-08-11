@@ -547,7 +547,7 @@ async fn handle_douyin(
         }
     }
 
-    match douyin::fetch_note(&client, resolved_target, "manual").await {
+    match douyin::fetch_note(&client, runtime, resolved_target, "manual").await {
         Ok(item) => {
             // 结束时留给用户的提示;None = 全部顺利,静默删掉两条消息即可。
             let mut notice: Option<String> = None;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hanabi <-> jiji262/douyin-downloader author-feed bridge.
+"""Hanabi <-> jiji262/douyin-downloader bridge.
 
 The upstream project owns the volatile Douyin signing/session/browser logic.
 This bridge keeps Hanabi's contract deliberately small: JSON request on stdin,
@@ -146,6 +146,9 @@ async def _run(request: dict[str, Any]) -> dict[str, Any]:
     ) = _load_upstream()
 
     target = _extract_target(request.get("target"))
+    operation = str(request.get("operation") or "feed").strip().lower()
+    if operation not in {"feed", "detail"}:
+        raise RuntimeError(f"不支持的 operation: {operation}")
     max_pages = max(1, min(int(request.get("max_pages") or 3), 100))
     known_ids = {
         str(value)
@@ -168,8 +171,23 @@ async def _run(request: dict[str, Any]) -> dict[str, Any]:
         if is_short_url(target):
             resolved = await client.resolve_short_url(normalize_short_url(target))
             if not resolved:
-                raise RuntimeError("作者短链解析失败")
+                raise RuntimeError("抖音短链解析失败")
             resolved_url = resolved
+
+        if operation == "detail":
+            match = re.search(r"/(?:note|video|slides)/(\d+)", resolved_url)
+            if not match:
+                raise RuntimeError(
+                    f"链接没有解析为作品页: {resolved_url.split('?', 1)[0]}"
+                )
+            aweme_id = match.group(1)
+            item = await client.get_video_detail(aweme_id)
+            if not isinstance(item, dict) or _aweme_id(item) != aweme_id:
+                raise RuntimeError("作品详情接口返回空数据，可能是 Cookie/签名失效或触发验证")
+            return {
+                "resolved_url": resolved_url.split("?", 1)[0],
+                "item": item,
+            }
 
         match = re.search(r"/user/([A-Za-z0-9_-]+)", resolved_url)
         if not match:

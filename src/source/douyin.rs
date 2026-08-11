@@ -313,7 +313,8 @@ pub fn parse_user_aweme(item: &Value, origin: &str) -> Option<MediaItem> {
 }
 
 #[derive(Debug, Serialize)]
-struct FeedBridgeRequest {
+struct DouyinBridgeRequest {
+    operation: &'static str,
     target: String,
     max_pages: u32,
     browser_fallback: bool,
@@ -322,7 +323,9 @@ struct FeedBridgeRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct FeedBridgeResponse {
+struct DouyinBridgeResponse {
+    #[serde(default)]
+    resolved_url: String,
     #[serde(default)]
     sec_user_id: String,
     #[serde(default)]
@@ -333,6 +336,8 @@ struct FeedBridgeResponse {
     browser_fallback_used: bool,
     #[serde(default)]
     items: Vec<Value>,
+    #[serde(default)]
+    item: Option<Value>,
 }
 
 fn truncate_stderr(stderr: &[u8]) -> String {
@@ -344,14 +349,16 @@ fn truncate_stderr(stderr: &[u8]) -> String {
     compact
 }
 
-fn run_feed_helper(
+fn run_douyin_helper(
     runtime: &DouyinCfg,
+    operation: &'static str,
     target: String,
     known_ids: Vec<String>,
-) -> Result<FeedBridgeResponse> {
+) -> Result<DouyinBridgeResponse> {
     let helper_path =
         std::env::var("HANABI_DOUYIN_HELPER").unwrap_or_else(|_| runtime.helper_path.clone());
-    let request = FeedBridgeRequest {
+    let request = DouyinBridgeRequest {
+        operation,
         target,
         max_pages: runtime.max_pages,
         browser_fallback: runtime.browser_fallback,
@@ -408,10 +415,11 @@ pub async fn fetch_user_feed(
 ) -> Result<Vec<MediaItem>> {
     let runtime = runtime.clone();
     let target_owned = target.to_string();
-    let response =
-        tokio::task::spawn_blocking(move || run_feed_helper(&runtime, target_owned, Vec::new()))
-            .await
-            .context("抖音作者桥接任务 join 失败")??;
+    let response = tokio::task::spawn_blocking(move || {
+        run_douyin_helper(&runtime, "feed", target_owned, Vec::new())
+    })
+    .await
+    .context("抖音作者桥接任务 join 失败")??;
 
     let raw_count = response.items.len();
     let mut out = Vec::new();
@@ -554,8 +562,39 @@ pub fn is_user_profile_url(url: &reqwest::Url) -> bool {
 }
 
 /// 抓 note 页并解析为 MediaItem。`url` 可为短链(自动跟随跳转)。
-pub async fn fetch_note(client: &reqwest::Client, url: &str, origin: &str) -> Result<MediaItem> {
-    fetch_note_with_validator(client, url, origin, is_douyin_url).await
+pub async fn fetch_note(
+    client: &reqwest::Client,
+    runtime: &DouyinCfg,
+    url: &str,
+    origin: &str,
+) -> Result<MediaItem> {
+    match fetch_note_with_validator(client, url, origin, is_douyin_url).await {
+        Ok(item) => Ok(item),
+        Err(page_error) => {
+            let runtime = runtime.clone();
+            let target = url.to_string();
+            let response = tokio::task::spawn_blocking(move || {
+                run_douyin_helper(&runtime, "detail", target, Vec::new())
+            })
+            .await
+            .context("抖音作品详情桥接任务 join 失败")?
+            .with_context(|| format!("页面解析失败后作品详情桥接也失败: {page_error:#}"))?;
+            let raw = response.item.context("抖音作品详情桥接响应缺少 item")?;
+            let image_policy = if response.resolved_url.contains("/slides/") {
+                ImagePolicy::StaticSlidesOnly
+            } else {
+                ImagePolicy::All
+            };
+            let item = parse_item(&raw, origin, image_policy)
+                .context("抖音作品详情没有可发布的静态图片")?;
+            tracing::info!(
+                id = %item.source_id,
+                page_error = %format!("{page_error:#}"),
+                "抖音页面解析失败后通过签名详情接口恢复"
+            );
+            Ok(item)
+        }
+    }
 }
 
 async fn fetch_note_with_validator<F>(
@@ -1039,6 +1078,61 @@ mod tests {
                 "/share/note/7668600536471822181".to_string()
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_note_falls_back_to_signed_detail_bridge() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..PAGE_MAX_ATTEMPTS {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).unwrap();
+                let body = "<html><body>transient page without router data</body></html>";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let helper = temp.path().join("detail_helper.py");
+        std::fs::write(
+            &helper,
+            r#"import json, sys
+request = json.load(sys.stdin)
+assert request["operation"] == "detail"
+json.dump({"item": {
+    "aweme_id": "7669448423591181257",
+    "desc": "桥接恢复#原神",
+    "author": {"nickname": "tester", "sec_uid": "MS4wDETAIL"},
+    "images": [{"url_list": ["https://p3.douyinpic.com/detail.webp"]}]
+}}, sys.stdout)
+"#,
+        )
+        .unwrap();
+        let runtime = DouyinCfg {
+            python_command: "python3".to_string(),
+            helper_path: helper.to_string_lossy().into_owned(),
+            ..DouyinCfg::default()
+        };
+
+        let item = fetch_note(
+            &build_client().unwrap(),
+            &runtime,
+            &format!("http://{addr}/share/note/7669448423591181257"),
+            "manual",
+        )
+        .await
+        .unwrap();
+        assert_eq!(item.source_id, "7669448423591181257");
+        assert_eq!(item.images.len(), 1);
+        assert_eq!(item.title.as_deref(), Some("桥接恢复"));
+        server.join().unwrap();
     }
 
     #[tokio::test]

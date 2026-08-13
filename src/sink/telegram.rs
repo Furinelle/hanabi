@@ -22,6 +22,8 @@ use crate::sink::{needs_downscale, render_caption, Sink};
 const MAX_DIMENSION: u32 = 4096;
 /// pending 保留时长上限(秒);超期未审批自动清理(删消息+文件+记录)。
 const PENDING_TTL_SECS: i64 = 7 * 24 * 3600;
+/// 最近一次丢弃可撤销的保留时间。与 pending 一致，避免误丢弃文件永久占盘。
+const UNDO_TTL_SECS: i64 = PENDING_TTL_SECS;
 
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
@@ -125,6 +127,18 @@ impl TelegramSink {
                 state      TEXT NOT NULL DEFAULT 'pending',
                 is_r18     INTEGER NOT NULL DEFAULT 0,
                 item_meta  TEXT NOT NULL DEFAULT '{}'
+             );
+             CREATE TABLE IF NOT EXISTS review_actions(
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                action     TEXT NOT NULL,
+                token      INTEGER NOT NULL,
+                files      TEXT NOT NULL DEFAULT '[]',
+                caption    TEXT NOT NULL DEFAULT '',
+                originals  TEXT NOT NULL DEFAULT '[]',
+                is_r18     INTEGER NOT NULL DEFAULT 0,
+                item_meta  TEXT NOT NULL DEFAULT '{}',
+                acted_at   INTEGER NOT NULL,
+                state      TEXT NOT NULL DEFAULT 'available'
              );",
         )
         .context("初始化 pending 表失败")?;
@@ -171,6 +185,11 @@ impl TelegramSink {
             [],
         )
         .context("恢复中断的审批发布失败")?;
+        conn.execute(
+            "UPDATE review_actions SET state='available' WHERE state='restoring'",
+            [],
+        )
+        .context("恢复中断的撤销操作失败")?;
         // counter 从已有最大 token 续上,避免重启后 token 与旧记录冲突。
         let max_token: i64 = conn
             .query_row("SELECT COALESCE(MAX(token), 0) FROM pending", [], |r| {
@@ -337,6 +356,149 @@ enum PendingClaim {
     Publishing,
 }
 
+struct UndoAction {
+    id: i64,
+    row: PendingRow,
+}
+
+enum UndoClaim {
+    Claimed(UndoAction),
+    Empty,
+    Irreversible(String),
+}
+
+/// 原子完成一条审批并登记为“最近一次动作”。只保留最新 available 动作；若旧动作
+/// 是可撤销丢弃，返回其文件供事务提交后清理。正在 restoring 的旧动作由对应 /undo
+/// 任务持有，不能在这里删除或清文件。
+fn complete_and_record_action(
+    db: &mut rusqlite::Connection,
+    token: i64,
+    action: &str,
+    row: Option<&PendingRow>,
+) -> rusqlite::Result<Vec<Vec<PathBuf>>> {
+    let tx = db.transaction()?;
+    let changed = tx.execute(
+        "DELETE FROM pending WHERE token=?1 AND state='publishing'",
+        [token],
+    )?;
+    if changed != 1 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+
+    let (files, caption, originals, is_r18, item_meta) = match row {
+        Some((files, caption, _, originals, is_r18, item_meta)) => (
+            files.as_str(),
+            caption.as_str(),
+            originals.as_str(),
+            *is_r18,
+            item_meta.as_str(),
+        ),
+        None => ("[]", "", "[]", false, "{}"),
+    };
+    tx.execute(
+        "INSERT INTO review_actions(action,token,files,caption,originals,is_r18,item_meta,acted_at,state)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'available')",
+        rusqlite::params![
+            action,
+            token,
+            files,
+            caption,
+            originals,
+            is_r18,
+            item_meta,
+            now_secs()
+        ],
+    )?;
+    let new_id = tx.last_insert_rowid();
+
+    let old_discards: Vec<(String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT files, originals FROM review_actions
+             WHERE id<>?1 AND state='available' AND action='discard'",
+        )?;
+        let rows = stmt
+            .query_map([new_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    tx.execute(
+        "DELETE FROM review_actions WHERE id<>?1 AND state='available'",
+        [new_id],
+    )?;
+    tx.commit()?;
+
+    Ok(old_discards
+        .into_iter()
+        .filter_map(|(files, originals)| {
+            let raw = serde_json::from_str::<Vec<String>>(&originals)
+                .ok()
+                .filter(|v| !v.is_empty())
+                .or_else(|| serde_json::from_str::<Vec<String>>(&files).ok())?;
+            Some(raw.into_iter().map(PathBuf::from).collect())
+        })
+        .collect())
+}
+
+/// 抢占调用时的最近一次动作。只有最近动作本身是丢弃才可恢复，避免在一次发布之后
+/// 错把更早的丢弃当作“最后一次动作”撤销。
+fn claim_latest_undo(db: &mut rusqlite::Connection) -> rusqlite::Result<UndoClaim> {
+    let tx = db.transaction()?;
+    let action = tx
+        .query_row(
+            "SELECT id,action,token,files,caption,originals,is_r18,item_meta
+             FROM review_actions WHERE state='available' ORDER BY id DESC LIMIT 1",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, bool>(6)?,
+                    r.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((id, action, _token, files, caption, originals, is_r18, item_meta)) = action else {
+        tx.commit()?;
+        return Ok(UndoClaim::Empty);
+    };
+    if action != "discard" {
+        tx.commit()?;
+        return Ok(UndoClaim::Irreversible(action));
+    }
+    let changed = tx.execute(
+        "UPDATE review_actions SET state='restoring' WHERE id=?1 AND state='available'",
+        [id],
+    )?;
+    if changed != 1 {
+        tx.commit()?;
+        return Ok(UndoClaim::Empty);
+    }
+    tx.commit()?;
+    Ok(UndoClaim::Claimed(UndoAction {
+        id,
+        row: (files, caption, "[]".into(), originals, is_r18, item_meta),
+    }))
+}
+
+fn finish_undo(db: &rusqlite::Connection, id: i64) -> rusqlite::Result<usize> {
+    db.execute(
+        "DELETE FROM review_actions WHERE id=?1 AND state='restoring'",
+        [id],
+    )
+}
+
+fn restore_undo(db: &rusqlite::Connection, id: i64) -> rusqlite::Result<usize> {
+    db.execute(
+        "UPDATE review_actions SET state='available' WHERE id=?1 AND state='restoring'",
+        [id],
+    )
+}
+
 /// 原子把待审记录抢为发布中，并取出其发送数据。
 ///
 /// 两次 callback 都可能同时到达；条件 UPDATE 让数据库只允许一个回调从 pending
@@ -419,6 +581,7 @@ fn command_menu(gallery_enabled: bool) -> Vec<BotCommand> {
         ));
     }
     commands.extend([
+        BotCommand::new("undo", "撤销最近一次误丢弃"),
         BotCommand::new("status", "查看待审数和运行状态"),
         BotCommand::new("ping", "存活测试"),
         BotCommand::new("help", "查看命令列表"),
@@ -766,6 +929,43 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
             [zombie_cutoff],
         );
     }
+    // ⓪-b 只保留最近一个 available 动作，并让过期丢弃释放文件。restoring 由正在
+    // 执行的 /undo 持有，不能在此清理。
+    let undo_cutoff = now_secs() - UNDO_TTL_SECS;
+    let stale_undo_files: Vec<String> = {
+        let db = state.db.lock().await;
+        let newest: Option<i64> = db
+            .query_row(
+                "SELECT MAX(id) FROM review_actions WHERE state='available'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(None);
+        let mut out = Vec::new();
+        if let Ok(mut stmt) = db.prepare(
+            "SELECT files FROM review_actions
+             WHERE state='available' AND action='discard'
+               AND (acted_at < ?1 OR id <> COALESCE(?2, -1))",
+        ) {
+            if let Ok(rows) = stmt.query_map(rusqlite::params![undo_cutoff, newest], |r| {
+                r.get::<_, String>(0)
+            }) {
+                out.extend(rows.flatten());
+            }
+        }
+        let _ = db.execute(
+            "DELETE FROM review_actions
+             WHERE state='available' AND (acted_at < ?1 OR id <> COALESCE(?2, -1))",
+            rusqlite::params![undo_cutoff, newest],
+        );
+        out
+    };
+    for files_json in stale_undo_files {
+        if let Ok(files) = serde_json::from_str::<Vec<String>>(&files_json) {
+            let paths: Vec<PathBuf> = files.into_iter().map(PathBuf::from).collect();
+            cleanup(&paths);
+        }
+    }
     // ① 超期 pending。
     let cutoff = now_secs() - PENDING_TTL_SECS;
     let expired: Vec<(i64, String, String)> = {
@@ -816,6 +1016,12 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
         let db = state.db.lock().await;
         let mut out = Vec::new();
         if let Ok(mut stmt) = db.prepare("SELECT files FROM pending") {
+            if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+                out.extend(rows.flatten());
+            }
+        }
+        if let Ok(mut stmt) = db.prepare("SELECT files FROM review_actions WHERE action='discard'")
+        {
             if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
                 out.extend(rows.flatten());
             }
@@ -1048,6 +1254,7 @@ async fn finish_claimed(
     publish: bool,
     archive: bool,
 ) -> Result<FinishOutcome> {
+    let action_row = row.clone();
     let work = match decode_pending(row) {
         Ok(work) => work,
         Err(e) => {
@@ -1121,21 +1328,49 @@ async fn finish_claimed(
         _ => false,
     };
 
+    // pending 删除与“最近一次动作”登记放在同一事务。丢弃时保留完整行和文件，
+    // 让 /undo 能重新生成审批卡片；发布动作只登记类型，用于阻止误撤销更早丢弃。
+    let action = if !publish {
+        "discard"
+    } else if archive && !archive_failed {
+        "publish_archive"
+    } else {
+        "publish"
+    };
+    let replaced_discards = {
+        let mut db = state.db.lock().await;
+        complete_and_record_action(
+            &mut db,
+            token,
+            action,
+            if publish { None } else { Some(&action_row) },
+        )
+    };
+    let replaced_discards = match replaced_discards {
+        Ok(paths) => paths,
+        Err(e) => {
+            if !publish {
+                let db = state.db.lock().await;
+                let _ = restore_pending(&db, token);
+            }
+            return Err(e).context("登记最近审批动作失败");
+        }
+    };
+
     for mid in &work.msg_ids {
         let _ = state
             .bot
             .delete_message(state.review_chat.clone(), MessageId(*mid))
             .await;
     }
-    let delete_result = state
-        .db
-        .lock()
-        .await
-        .execute("DELETE FROM pending WHERE token=?1", [token]);
-    if !registered {
+    // 新动作覆盖旧的可撤销丢弃后，旧文件不再有恢复价值；事务提交后再清理。
+    for paths in replaced_discards {
+        cleanup(&paths);
+    }
+    // 当前丢弃的文件由 review_actions 持有；发布文件仍按原评论任务语义清理。
+    if publish && !registered {
         cleanup(&work.files);
     }
-    delete_result.context("删除已完成的审批记录失败")?;
     Ok(FinishOutcome { archive_failed })
 }
 
@@ -1278,6 +1513,7 @@ pub async fn run_review_loop(
 
 /// 处理 `/` 命令(仅文本消息)。**仅响应审批私聊本人**(owner),陌生人忽略。
 /// /run 触发抓取；/approve 批准全部剩余待审；/approve_archive 批准并入库；
+/// /undo 撤销最近一次误丢弃并重新生成审批卡片；
 /// /status /ping /help 即时回复；
 /// 非命令的 Pixiv/X 链接交抓取循环直发频道。
 async fn handle_command(
@@ -1324,6 +1560,88 @@ async fn handle_command(
     }
     let cmd = text.split_whitespace().next().unwrap_or("");
     let cmd = cmd.split('@').next().unwrap_or(cmd);
+    if cmd == "/undo" {
+        let claim = {
+            let mut db = state.db.lock().await;
+            claim_latest_undo(&mut db)?
+        };
+        match claim {
+            UndoClaim::Empty => {
+                state
+                    .bot
+                    .send_message(msg.chat.id, "ℹ️ 当前没有可撤销的审批动作")
+                    .await?;
+            }
+            UndoClaim::Irreversible(action) => {
+                let label = match action.as_str() {
+                    "publish_archive" => "发送并入库",
+                    "publish" => "发送到频道",
+                    _ => "已完成操作",
+                };
+                state
+                    .bot
+                    .send_message(
+                        msg.chat.id,
+                        format!(
+                            "ℹ️ 最近一次动作是“{label}”，已产生外部发布；/undo 仅恢复最近一次误丢弃"
+                        ),
+                    )
+                    .await?;
+            }
+            UndoClaim::Claimed(action) => {
+                let action_id = action.id;
+                let decoded = decode_pending(action.row);
+                let result: Result<()> = async {
+                    let work = decoded?;
+                    let item: MediaItem = serde_json::from_str(&work.item_meta)
+                        .context("最近丢弃记录的作品元数据无效")?;
+                    let originals = if work.originals.is_empty() {
+                        work.files
+                    } else {
+                        work.originals
+                    };
+                    if originals.is_empty() || originals.iter().any(|p| !p.is_file()) {
+                        anyhow::bail!("最近丢弃记录的图片文件已过期");
+                    }
+                    TelegramSink {
+                        state: state.clone(),
+                    }
+                    .deliver(&item, &originals)
+                    .await
+                }
+                .await;
+                match result {
+                    Ok(()) => {
+                        let removed = {
+                            let db = state.db.lock().await;
+                            finish_undo(&db, action_id)?
+                        };
+                        if removed != 1 {
+                            tracing::error!(action_id, "撤销成功后清理动作记录失败");
+                        }
+                        state
+                            .bot
+                            .send_message(msg.chat.id, "↩️ 已撤销最近一次丢弃，审批卡片已恢复")
+                            .await?;
+                    }
+                    Err(e) => {
+                        let db = state.db.lock().await;
+                        let _ = restore_undo(&db, action_id);
+                        drop(db);
+                        tracing::warn!(error = %e, action_id, "撤销最近丢弃失败");
+                        state
+                            .bot
+                            .send_message(
+                                msg.chat.id,
+                                format!("⚠️ 撤销失败，记录已保留可重试：{e}"),
+                            )
+                            .await?;
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
     if cmd == "/approve" || cmd == "/approve_archive" {
         let archive = cmd == "/approve_archive";
         if archive && state.gallery.is_none() {
@@ -1395,7 +1713,7 @@ async fn handle_command(
                 ""
             };
             format!(
-                "命令列表:\n/run — 立即抓取一轮\n/approve — 批准并发布全部剩余待审(仅频道,不入库){archive_help}\n/status — 待审数+运行状态\n/ping — 存活测试\n/help — 本帮助\n\n💡 审批按钮:✅ 发送到频道 / 📦 发送并入库 / ❌ 丢弃\n💡 先逐条点 ❌ 丢弃不想推送的图片，再发 /approve 或 /approve_archive 一键处理其余图片\n💡 直接发 Pixiv/X 作品链接 → 自动抓取并发布到频道(配置图库后同步入库)"
+                "命令列表:\n/run — 立即抓取一轮\n/approve — 批准并发布全部剩余待审(仅频道,不入库){archive_help}\n/undo — 撤销最近一次误丢弃并恢复审批卡片\n/status — 待审数+运行状态\n/ping — 存活测试\n/help — 本帮助\n\n💡 审批按钮:✅ 发送到频道 / 📦 发送并入库 / ❌ 丢弃\n💡 误点丢弃后立即发 /undo 可恢复；若最近动作已是发布，则不会误撤销更早的丢弃\n💡 先逐条点 ❌ 丢弃不想推送的图片，再发 /approve 或 /approve_archive 一键处理其余图片\n💡 直接发 Pixiv/X 作品链接 → 自动抓取并发布到频道(配置图库后同步入库)"
             )
         }
         _ => return Ok(()),
@@ -1845,11 +2163,102 @@ mod tests {
         let menu = command_menu(true);
         assert!(menu.iter().any(|cmd| cmd.command == "approve"));
         assert!(menu.iter().any(|cmd| cmd.command == "approve_archive"));
+        assert!(menu.iter().any(|cmd| cmd.command == "undo"));
 
         let menu_without_gallery = command_menu(false);
         assert!(menu_without_gallery
             .iter()
             .all(|cmd| cmd.command != "approve_archive"));
+    }
+
+    #[test]
+    fn discarded_action_can_be_claimed_once_and_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.db");
+        let _sink = TelegramSink::new(
+            "123:abc".into(),
+            "-1001234567890".into(),
+            "@chan".into(),
+            path.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let mut db = rusqlite::Connection::open(&path).unwrap();
+        db.execute(
+            "INSERT INTO pending(token,files,caption,msg_ids,originals,created_at,state,is_r18,item_meta)
+             VALUES(1,'[\"/tmp/a.jpg\"]','cap','[9]','[\"/tmp/a.jpg\"]',1,'publishing',0,'{\"source\":\"x\"}')",
+            [],
+        )
+        .unwrap();
+        let row: PendingRow = (
+            "[\"/tmp/a.jpg\"]".into(),
+            "cap".into(),
+            "[9]".into(),
+            "[\"/tmp/a.jpg\"]".into(),
+            false,
+            "{\"source\":\"x\"}".into(),
+        );
+        assert!(
+            complete_and_record_action(&mut db, 1, "discard", Some(&row))
+                .unwrap()
+                .is_empty()
+        );
+        let pending: i64 = db
+            .query_row("SELECT COUNT(*) FROM pending", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pending, 0);
+
+        let UndoClaim::Claimed(first) = claim_latest_undo(&mut db).unwrap() else {
+            panic!("discard should be undoable")
+        };
+        assert_eq!(first.row.1, "cap");
+        assert!(matches!(
+            claim_latest_undo(&mut db).unwrap(),
+            UndoClaim::Empty
+        ));
+        assert_eq!(restore_undo(&db, first.id).unwrap(), 1);
+        assert!(matches!(
+            claim_latest_undo(&mut db).unwrap(),
+            UndoClaim::Claimed(_)
+        ));
+    }
+
+    #[test]
+    fn newer_publish_blocks_undo_of_older_discard_and_releases_its_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.db");
+        let _sink = TelegramSink::new(
+            "123:abc".into(),
+            "-1001234567890".into(),
+            "@chan".into(),
+            path.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let mut db = rusqlite::Connection::open(&path).unwrap();
+        for token in [1, 2] {
+            db.execute(
+                "INSERT INTO pending(token,files,caption,msg_ids,originals,created_at,state,is_r18,item_meta)
+                 VALUES(?1,'[\"/tmp/a.jpg\"]','cap','[9]','[\"/tmp/a.jpg\"]',1,'publishing',0,'{}')",
+                [token],
+            )
+            .unwrap();
+        }
+        let row: PendingRow = (
+            "[\"/tmp/a.jpg\"]".into(),
+            "cap".into(),
+            "[9]".into(),
+            "[\"/tmp/a.jpg\"]".into(),
+            false,
+            "{}".into(),
+        );
+        complete_and_record_action(&mut db, 1, "discard", Some(&row)).unwrap();
+        let released = complete_and_record_action(&mut db, 2, "publish", None).unwrap();
+        assert_eq!(released, vec![vec![PathBuf::from("/tmp/a.jpg")]]);
+        assert!(matches!(
+            claim_latest_undo(&mut db).unwrap(),
+            UndoClaim::Irreversible(action) if action == "publish"
+        ));
     }
 
     #[test]

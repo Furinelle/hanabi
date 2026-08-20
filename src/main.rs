@@ -43,11 +43,7 @@ impl Drop for InflightGuard {
 /// 下载单个作品到独立临时目录(X 用 size=orig)。供定时抓取与手动链接共用。
 /// 同步阻塞(子进程等待可达数分钟),调用方必须放 spawn_blocking。
 fn download_work(gdl: &GalleryDl, item: &MediaItem, x_size: Option<&str>) -> Vec<PathBuf> {
-    let dir = std::env::temp_dir().join(format!(
-        "hanabi_{}_{}",
-        item.source.as_str(),
-        item.source_id
-    ));
+    let dir = hanabi::util::pending_dir(item.source.as_str(), &item.source_id);
     let _ = std::fs::create_dir_all(&dir);
     hanabi::util::restrict_dir(&dir);
     let extra = match item.source {
@@ -118,6 +114,24 @@ async fn main() -> Result<()> {
         trigger_tx,
         link_tx,
     ));
+    if let Ok(raw) = std::env::var("HANABI_PUBLISH_PENDING_TOKENS") {
+        let tokens: Vec<i64> = raw
+            .split(',')
+            .filter_map(|part| part.trim().parse().ok())
+            .collect();
+        if !tokens.is_empty() {
+            let summary = sink.publish_pending_tokens(&tokens, true).await;
+            tracing::info!(
+                requested = summary.requested,
+                succeeded = summary.succeeded,
+                failed = summary.failed,
+                missing = summary.missing,
+                busy = summary.busy,
+                archive_failed = summary.archive_failed,
+                "维护任务:指定审批发布并入库完成"
+            );
+        }
+    }
     let gdl = Arc::new(GalleryDl {
         config_path: cfg.gallery_dl.config_path.clone(),
         probe_range: cfg.gallery_dl.probe_range.clone(),
@@ -161,7 +175,7 @@ async fn main() -> Result<()> {
         let douyin_client = douyin_client_dl.clone();
         async move {
             if item.source == SourceKind::Douyin {
-                let dir = std::env::temp_dir().join(format!("hanabi_douyin_{}", item.source_id));
+                let dir = hanabi::util::pending_dir("douyin", &item.source_id);
                 let (files, failed) =
                     hanabi::source::douyin::download_images(&douyin_client, &item, &dir).await;
                 if failed == 0 {
@@ -453,7 +467,7 @@ async fn handle_douyin_user(
         if store.already_pushed(item)? {
             continue;
         }
-        let dir = std::env::temp_dir().join(format!("hanabi_douyin_{}", item.source_id));
+        let dir = hanabi::util::pending_dir("douyin", &item.source_id);
         let (files, image_failures) =
             hanabi::source::douyin::download_images(client, item, &dir).await;
         if image_failures > 0 || files.is_empty() {
@@ -554,7 +568,7 @@ async fn handle_douyin(
             if store.already_pushed(&item)? {
                 tracing::info!(id = %item.source_id, "抖音作品已发过,跳过");
             } else {
-                let dir = std::env::temp_dir().join(format!("hanabi_douyin_{}", item.source_id));
+                let dir = hanabi::util::pending_dir("douyin", &item.source_id);
                 let (files, failed) = douyin::download_images(&client, &item, &dir).await;
                 let download_complete = douyin_download_complete(files.len(), failed);
                 if failed > 0 {

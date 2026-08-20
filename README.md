@@ -20,6 +20,7 @@
 - 🤖 **AI 生成标签**：Pixiv `illust_ai_type==2` 的作品 caption 标签首位自动加 `#AI生成`
 - 🎯 **分源过滤**：R18 / 收藏数 / 点赞数 / 标签白名单 / 只插画 / 页数上限
 - 🧯 **失败可见**：手动链接抓取/发布失败时，「抓取中」提示会改写成具体原因（解析为空、下载 0 张、部分批次失败、队列已满），不静默装成功；超 10 张的作品审批与发布自动按 10 分批
+- 💾 **待审图片跨重启保留**：下载文件默认保存在工作目录的 `pending/`，不再依赖会被系统重启清空的 `/tmp`；可用 `HANABI_PENDING_ROOT` 指向单独的持久卷
 - ↩️ **误丢弃可撤销**：`/undo` 恢复最近一次误点 `❌ 丢弃` 的作品并重新生成审批卡片；最近动作已是发布时不会误撤销更早记录
 - ⌨️ **命令控制**：`/run` 手动抓一轮、`/approve` 一键批准发布、`/approve_archive` 一键批准并入库（配置 Vitrine 时）、`/undo`、`/status`、`/ping`、`/help`
 - ⏰ **定时轮询**：`poll_interval_secs` 可配（如一天三次 = 28800），`tz_offset_hours` 可配时区（默认 +8）
@@ -129,6 +130,21 @@ cargo run --release
 
 bot 启动后：抓取循环按 `poll_interval_secs` 定时跑，审批回调任务并发监听按钮/命令。
 
+待审原图和 Telegram 发送文件默认保存在当前工作目录的 `pending/`。生产环境必须让该目录与 `hanabi.db` 一样落在持久磁盘；也可以显式指定绝对路径：
+
+```bash
+export HANABI_PENDING_ROOT=/var/lib/hanabi/pending
+```
+
+如果旧版本因重启清空 `/tmp/hanabi_*`，先停止 Hanabi，再用数据库内保存的作品元数据重新下载 Pixiv/X 待审图片：
+
+```bash
+cargo run --release --bin restore_pending --            # 恢复全部待审项
+cargo run --release --bin restore_pending -- 306 310    # 只恢复指定 token
+```
+
+恢复工具复用 `config.toml` 与 gallery-dl 登录态，并原子更新 pending 文件路径；当前不支持恢复抖音待审项。需要按已确认的审批记录定向发布并入库时，可在单次启动前设置 `HANABI_PUBLISH_PENDING_TOKENS=306,310`，处理完成后必须立即移除该环境变量，避免后续重启重复触发。
+
 ## 命令（私聊 bot 发送）
 
 | 命令 | 作用 |
@@ -198,7 +214,7 @@ From <Pixiv|X|抖音>(作品链接) By 作者名(作者链接)
 
 ### Linux（systemd，VPS）
 
-见 `deploy/hanabi.service`。将仓库 clone 到 VPS，装 rust + gallery-dl，传入 `gallery-dl.conf` / `config.toml`，配置 systemd service（`HANABI_BOT_TOKEN` 经 service 环境变量注入），`systemctl enable --now hanabi`。
+见 `deploy/hanabi.service`。将仓库 clone 到 VPS，装 rust + gallery-dl，传入 `gallery-dl.conf` / `config.toml`，配置 systemd service（`HANABI_BOT_TOKEN` 经 service 环境变量注入），`systemctl enable --now hanabi`。`WorkingDirectory` 必须位于持久磁盘；默认会在其下创建 `pending/`。
 
 ### macOS（launchd）
 
@@ -209,15 +225,17 @@ From <Pixiv|X|抖音>(作品链接) By 作者名(作者链接)
 镜像内含 gallery-dl，无需另装：
 
 ```bash
+mkdir -p pending
 docker run -d --name hanabi \
   -e HANABI_BOT_TOKEN="<bot token>" \
   -v $PWD/config.toml:/data/config.toml:ro \
   -v $PWD/gallery-dl.conf:/data/gallery-dl.conf:ro \
   -v $PWD/hanabi.db:/data/hanabi.db \
+  -v $PWD/pending:/data/pending \
   ghcr.io/furinelle/hanabi:latest
 ```
 
-> `config.toml` 里 `gallery_dl.config_path` 设为 `/data/gallery-dl.conf`。镜像随 `v*` tag 自动构建推送到 GHCR。
+> `config.toml` 里 `gallery_dl.config_path` 设为 `/data/gallery-dl.conf`。`hanabi.db` 与 `/data/pending` 必须同时持久化，保证容器重建后旧审批按钮仍有对应图片。镜像随 `v*` tag 自动构建推送到 GHCR。
 
 ## 架构
 

@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+### 新增
+- 增加 `restore_pending` 运维工具，可按全部或指定 token 复用数据库内作品元数据重新下载 Pixiv/X 待审原图、重建 Telegram 发送文件并原子更新路径。
+- 增加一次性 `HANABI_PUBLISH_PENDING_TOKENS` 维护入口，只原子抢占显式列出的待审项，并复用正常审批流程发布频道、入库 Vitrine、清理审批消息和登记评论任务。
+
+### 修复
+- **VPS 重启后旧审批必然发布失败**：待审图片此前保存在 `/tmp/hanabi_*`，SQLite pending 记录虽然持久化，系统重启清空文件后按钮会报 `No such file or directory`，却被笼统提示为“可能限流”。现在文件默认写入工作目录的持久 `pending/`，可通过 `HANABI_PENDING_ROOT` 覆盖；孤儿清理也只扫描该目录。
+- **发送并入库时偶发漏发评论区原图**：频道帖发布后立即登记 auto-forward 评论任务，再执行可能耗时的 Vitrine 上传，避免图库上传晚于 Telegram 一次性自动转发事件。
+
+### 文档
+- README 补充 systemd/Docker 持久化 `pending/` 的要求，以及事故恢复和定向补发流程。
+
 ## [0.9.0] - 2026-08-13
 
 ### 新增

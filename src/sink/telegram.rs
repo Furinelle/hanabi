@@ -87,6 +87,16 @@ pub struct TelegramSink {
     state: Arc<ReviewState>,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PublishPendingSummary {
+    pub requested: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub missing: usize,
+    pub busy: usize,
+    pub archive_failed: usize,
+}
+
 impl TelegramSink {
     pub fn new(
         token: String,
@@ -281,6 +291,79 @@ impl TelegramSink {
         // 手动链接直发成功:同步入库(帖子自带标签)
         self.maybe_ingest(item, files).await;
         Ok(PublishOutcome::Full)
+    }
+
+    /// 维护入口：只处理显式指定的待审 token，复用正常审批的原子抢占、频道发布、
+    /// 图库入库、评论区原图和审批消息清理流程。不会触碰未列出的 pending。
+    pub async fn publish_pending_tokens(
+        &self,
+        tokens: &[i64],
+        archive: bool,
+    ) -> PublishPendingSummary {
+        let mut summary = PublishPendingSummary {
+            requested: tokens.len(),
+            ..PublishPendingSummary::default()
+        };
+        for &token in tokens {
+            let claim = {
+                let db = self.state.db.lock().await;
+                claim_pending(&db, token)
+            };
+            let row = match claim {
+                Ok(PendingClaim::Claimed(row)) => row,
+                Ok(PendingClaim::Missing) => {
+                    summary.missing += 1;
+                    continue;
+                }
+                Ok(PendingClaim::Publishing) => {
+                    summary.busy += 1;
+                    continue;
+                }
+                Err(e) => {
+                    summary.failed += 1;
+                    tracing::warn!(error = %e, token, "维护任务抢占审批失败");
+                    continue;
+                }
+            };
+            match finish_claimed(&self.state, token, row, true, archive).await {
+                Ok(outcome) => {
+                    summary.succeeded += 1;
+                    if outcome.archive_failed {
+                        summary.archive_failed += 1;
+                    }
+                }
+                Err(e) => {
+                    summary.failed += 1;
+                    tracing::warn!(error = %e, token, "维护任务发布审批失败");
+                }
+            }
+        }
+        let text = if archive {
+            format!(
+                "✅ 恢复审批处理完成：请求 {} 条，发布成功 {} 条，发布失败 {} 条，图库失败 {} 条，已失效 {} 条，处理中 {} 条",
+                summary.requested,
+                summary.succeeded,
+                summary.failed,
+                summary.archive_failed,
+                summary.missing,
+                summary.busy
+            )
+        } else {
+            format!(
+                "✅ 恢复审批处理完成：请求 {} 条，发布成功 {} 条，发布失败 {} 条，已失效 {} 条，处理中 {} 条",
+                summary.requested,
+                summary.succeeded,
+                summary.failed,
+                summary.missing,
+                summary.busy
+            )
+        };
+        let _ = self
+            .state
+            .bot
+            .send_message(self.state.review_chat.clone(), text)
+            .await;
+        summary
     }
 
     async fn maybe_ingest(&self, item: &MediaItem, files: &[PathBuf]) {
@@ -773,7 +856,8 @@ fn prepare(path: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
-fn prepare_all(files: &[PathBuf]) -> Result<Vec<PathBuf>> {
+/// 供维护工具在恢复待审原图后重建与正常审批一致的发送文件。
+pub fn prepare_all(files: &[PathBuf]) -> Result<Vec<PathBuf>> {
     files.iter().map(|p| prepare(p)).collect()
 }
 
@@ -915,7 +999,7 @@ fn cleanup(files: &[PathBuf]) {
     }
 }
 
-/// 启动清理:① 删超期未审 pending(消息+文件+记录);② 删 `/tmp/hanabi_*` 中
+/// 启动清理:① 删超期未审 pending(消息+文件+记录);② 删持久待审目录中
 /// 不被任何 pending 引用的孤儿目录(多为旧版本/重启遗留)。
 async fn cleanup_stale(state: &Arc<ReviewState>) {
     // ⓪ 僵尸 publishing 兜底:DELETE/restore 因 DB 写失败未完成时,记录会永远停在
@@ -1047,7 +1131,7 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
     }
     // 扫描/删除是同步 IO,整体移到 blocking 线程。
     let _ = tokio::task::spawn_blocking(move || {
-        let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else {
+        let Ok(rd) = std::fs::read_dir(crate::util::pending_root()) else {
             return;
         };
         let mut orphans = 0;
@@ -1301,6 +1385,17 @@ async fn finish_claimed(
             .await;
     }
 
+    // 频道帖发出后立即登记评论任务。Telegram 通常会在约 1 秒内把频道帖
+    // auto-forward 到讨论组；图库入库可能耗时较久，必须放在它后面，避免错过
+    // 这次一次性的转发事件。
+    let registered = match (publish, first_id) {
+        (true, Some(mid)) if !work.originals.is_empty() => {
+            register_comment(state, mid.0, &work.originals).await;
+            true
+        }
+        _ => false,
+    };
+
     // 发布成功(或至少部分成功)且需要入库
     let mut archive_failed = false;
     if publish && first_id.is_some() && archive {
@@ -1316,17 +1411,6 @@ async fn finish_claimed(
                 .await;
         }
     }
-
-    // 先登记评论任务再做删消息等慢网络操作:频道帖发出后 Telegram 通常 1 秒内就把
-    // auto-forward 投到讨论组,若登记晚于删除循环(最多 11 条、每条一次往返),
-    // deliver_comment 查不到任务,原图静默不进评论区(auto-forward 是一次性事件)。
-    let registered = match (publish, first_id) {
-        (true, Some(mid)) if !work.originals.is_empty() => {
-            register_comment(state, mid.0, &work.originals).await;
-            true
-        }
-        _ => false,
-    };
 
     // pending 删除与“最近一次动作”登记放在同一事务。丢弃时保留完整行和文件，
     // 让 /undo 能重新生成审批卡片；发布动作只登记类型，用于阻止误撤销更早丢弃。

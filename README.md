@@ -229,23 +229,30 @@ From <Pixiv|X|抖音>(作品链接) By 作者名(作者链接)
 
 `deploy/ai.hanabi.plist` → `~/Library/LaunchAgents/`，改占位后 `launchctl load`。
 
-### Docker（GHCR 镜像）
+### Docker Compose（推荐用于 VPS）
 
-镜像内含 gallery-dl，无需另装：
+镜像内含 gallery-dl、`gallery_repair` 与 `restore_pending`。生产必须固定不可变版本，不能使用 `latest`。把 DB、pending、outbox 和配置作为一个状态目录挂到容器内固定的 `/opt/hanabi`，这样 SQLite 中已有的绝对图片路径在换 VPS 或重建容器后仍然有效：
 
 ```bash
-mkdir -p pending gallery-outbox
-docker run -d --name hanabi \
-  -e HANABI_BOT_TOKEN="<bot token>" \
-  -v $PWD/config.toml:/data/config.toml:ro \
-  -v $PWD/gallery-dl.conf:/data/gallery-dl.conf:ro \
-  -v $PWD/hanabi.db:/data/hanabi.db \
-  -v $PWD/pending:/data/pending \
-  -v $PWD/gallery-outbox:/data/gallery-outbox \
-  ghcr.io/furinelle/hanabi:latest
+install -d -m 0700 /var/lib/hanabi /opt/hanabi-container
+cp deploy/compose.yaml /opt/hanabi-container/compose.yaml
+
+# /opt/hanabi-container/.env（不入库）
+HANABI_IMAGE=ghcr.io/furinelle/hanabi:<固定版本>
+HANABI_UID=<宿主机状态目录属主 UID>
+HANABI_GID=<宿主机状态目录属组 GID>
+HANABI_STATE_DIR=/var/lib/hanabi
+
+# /opt/hanabi-container/hanabi.env（chmod 600，不入库）
+HANABI_BOT_TOKEN=<bot token>
+HANABI_GALLERY_TOKEN=<gallery token>
+
+cd /opt/hanabi-container
+docker compose config --quiet
+docker compose up -d
 ```
 
-> `config.toml` 里 `gallery_dl.config_path` 设为 `/data/gallery-dl.conf`。`hanabi.db`、`/data/pending` 与 `/data/gallery-outbox` 必须同时持久化，保证容器重建后旧审批按钮和图库补偿任务仍有对应图片。镜像随 `v*` tag 自动构建推送到 GHCR。
+`/var/lib/hanabi` 内至少包含 `config.toml`、`gallery-dl.conf`、`hanabi.db`、`pending/` 与 `gallery-outbox/`，目录及文件应只允许运行 UID 读取。迁移时先停旧实例并执行 SQLite WAL checkpoint，再整体复制该目录；目标验证完成前不能启动第二个 Telegram polling 实例。Compose 使用只读根文件系统、空 capabilities、`no-new-privileges` 和有界日志轮转。
 
 ## 架构
 

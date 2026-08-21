@@ -10,3 +10,8 @@ gallery-dl.conf
 .douyin-cookies.json
 __pycache__/
 *.pyc
+/pending/
+/gallery-outbox/
+/gallery-repair-downloads/
+/recovery-gallery-*/
+/backups/

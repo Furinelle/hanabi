@@ -1,0 +1,30 @@
+services:
+  hanabi:
+    image: ${HANABI_IMAGE:?set HANABI_IMAGE in .env to an immutable tag}
+    container_name: hanabi
+    user: ${HANABI_UID:?set HANABI_UID in .env}:${HANABI_GID:?set HANABI_GID in .env}
+    working_dir: /opt/hanabi
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    env_file:
+      - ./hanabi.env
+    environment:
+      HANABI_CONFIG: /opt/hanabi/config.toml
+      HANABI_DOUYIN_HELPER: /usr/local/lib/hanabi/douyin_user_feed.py
+      HOME: /tmp/hanabi-home
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ${HANABI_STATE_DIR:-/var/lib/hanabi}:/opt/hanabi
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"

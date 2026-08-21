@@ -145,6 +145,15 @@ cargo run --release --bin restore_pending -- 306 310    # 只恢复指定 token
 
 恢复工具复用 `config.toml` 与 gallery-dl 登录态，并原子更新 pending 文件路径；当前不支持恢复抖音待审项。需要按已确认的审批记录定向发布并入库时，可在单次启动前设置 `HANABI_PUBLISH_PENDING_TOKENS=306,310`，处理完成后必须立即移除该环境变量，避免后续重启重复触发。
 
+频道已经发布、但 Vitrine 入库失败时，Hanabi 会把 `item_meta` 与独立图片副本登记到同一个 `hanabi.db` 的 `gallery_outbox`，默认副本目录为数据库旁的 `gallery-outbox/`（可用 `HANABI_GALLERY_OUTBOX_ROOT` 覆盖）。后台每分钟检查，首次等待 5 分钟后按指数退避重试（最长 6 小时）；成功前不会删除队列和副本，也不会重发 Telegram 或改写 `pushed`。
+
+单独修复一条抖音作品时，先 dry-run，再执行补图库；此工具同样不会发布 Telegram 或修改 `pushed`。可重试的上传失败会由后台继续，永久错误转入 dead-letter；两者都保留 outbox 副本：
+
+```bash
+cargo run --release --bin gallery_repair -- --dry-run douyin 7671195794388553011
+cargo run --release --bin gallery_repair -- douyin 7671195794388553011
+```
+
 ## 命令（私聊 bot 发送）
 
 | 命令 | 作用 |
@@ -225,23 +234,25 @@ From <Pixiv|X|抖音>(作品链接) By 作者名(作者链接)
 镜像内含 gallery-dl，无需另装：
 
 ```bash
-mkdir -p pending
+mkdir -p pending gallery-outbox
 docker run -d --name hanabi \
   -e HANABI_BOT_TOKEN="<bot token>" \
   -v $PWD/config.toml:/data/config.toml:ro \
   -v $PWD/gallery-dl.conf:/data/gallery-dl.conf:ro \
   -v $PWD/hanabi.db:/data/hanabi.db \
   -v $PWD/pending:/data/pending \
+  -v $PWD/gallery-outbox:/data/gallery-outbox \
   ghcr.io/furinelle/hanabi:latest
 ```
 
-> `config.toml` 里 `gallery_dl.config_path` 设为 `/data/gallery-dl.conf`。`hanabi.db` 与 `/data/pending` 必须同时持久化，保证容器重建后旧审批按钮仍有对应图片。镜像随 `v*` tag 自动构建推送到 GHCR。
+> `config.toml` 里 `gallery_dl.config_path` 设为 `/data/gallery-dl.conf`。`hanabi.db`、`/data/pending` 与 `/data/gallery-outbox` 必须同时持久化，保证容器重建后旧审批按钮和图库补偿任务仍有对应图片。镜像随 `v*` tag 自动构建推送到 GHCR。
 
 ## 架构
 
-单 Rust 二进制 + 两个并发任务：
+单 Rust 二进制 + 三个并发任务：
 
 - **抓取循环**（`main` loop）：`Source`（Pixiv/X 使用 gallery-dl；抖音作者使用 douyin-downloader JSON 桥）→ `FilterChain` → `TelegramSink`（发审批消息），sqlite 去重（`mark_pushed` 在发审批后执行 = 审过即去重）
 - **审批回调任务**（`run_review_loop`）：短轮询 `get_updates`（避代理长连接超时），处理按钮回调（批准→发频道+删私聊）和 `/` 命令；`pending.state` 通过条件更新原子抢占，保证同一审批只会启动一次上传；`/run` 经 mpsc 通道触发抓取循环立即跑一轮
+- **图库补偿任务**：只消费持久 `gallery_outbox` 并重试 Vitrine；不调用 Telegram，也不读写 `pushed`
 
 两阶段抓取：`probe`（`gallery-dl -j` 拉元数据过滤）→ `download`（只下通过的作品）。设计/计划见 `docs/superpowers/`。

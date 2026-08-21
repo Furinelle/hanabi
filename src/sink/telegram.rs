@@ -14,7 +14,8 @@ use teloxide::types::{
 };
 use tokio::sync::Mutex;
 
-use crate::gallery::GalleryClient;
+use crate::gallery::{GalleryClient, GalleryIngestError};
+use crate::gallery_outbox::{GalleryOutbox, QueuedGalleryWork};
 use crate::model::MediaItem;
 use crate::sink::{needs_downscale, render_caption, Sink};
 
@@ -75,6 +76,8 @@ pub struct ReviewState {
     pending_comments: Mutex<std::collections::HashMap<i32, CommentJob>>,
     /// 可选图库入库客户端(Vitrine)。None 时不显示「发送并入库」。
     gallery: Option<GalleryClient>,
+    /// 图库失败补偿队列。与 gallery 同时启用，副本独立于 pending/评论目录。
+    gallery_outbox: Option<GalleryOutbox>,
 }
 
 impl ReviewState {
@@ -227,6 +230,11 @@ impl TelegramSink {
             .http1_only()
             .build()
             .context("构造 reqwest client 失败")?;
+        let gallery_outbox = if gallery.is_some() {
+            Some(GalleryOutbox::for_database(db_path)?)
+        } else {
+            None
+        };
         Ok(Self {
             state: Arc::new(ReviewState {
                 bot: Bot::with_client(token, client),
@@ -237,6 +245,7 @@ impl TelegramSink {
                 counter: AtomicU64::new(max_token as u64 + 1),
                 pending_comments: Mutex::new(std::collections::HashMap::new()),
                 gallery,
+                gallery_outbox,
             }),
         })
     }
@@ -262,7 +271,18 @@ impl TelegramSink {
         let caption = render_caption(item);
         let files_owned: Vec<PathBuf> = files.to_vec();
         let prepared = tokio::task::spawn_blocking(move || prepare_all(&files_owned)).await??;
+        // 在任何频道副作用前准备独立图库副本，避免 auto-forward 评论任务先清理原目录。
+        let gallery_staged = self.stage_gallery(item, files);
         let mut sent: Vec<MessageId> = Vec::new();
+        let mut activate_on_first = || {
+            if gallery_staged.is_some() {
+                activate_gallery_staging(
+                    self.state.gallery_outbox.as_ref(),
+                    item.source.as_str(),
+                    &item.source_id,
+                );
+            }
+        };
         let send_result = send_group(
             &self.state.bot,
             &self.state.publish_channel,
@@ -270,26 +290,39 @@ impl TelegramSink {
             &caption,
             item.is_r18, // R18 → 频道帖打剧透遮罩
             &mut sent,
+            &mut activate_on_first,
         )
         .await;
+        let mut send_error = send_result.err();
+        if sent.is_empty() {
+            if gallery_staged.is_some() {
+                resolve_gallery_staging(
+                    self.state.gallery_outbox.as_ref(),
+                    item.source.as_str(),
+                    &item.source_id,
+                );
+            }
+            cleanup(files);
+            if let Some(error) = send_error.take() {
+                return Err(error);
+            }
+        }
         // 登记原图评论任务,等讨论组 auto-forward 到来再投递;登记则延后清理临时目录。
         // 部分批次已发出时同样登记(频道帖已存在,评论区原图仍有意义)。
-        match sent.first() {
-            Some(mid) => register_comment(&self.state, mid.0, files).await,
-            None => cleanup(files),
+        if let Some(mid) = sent.first() {
+            register_comment(&self.state, mid.0, files).await;
         }
-        if let Err(e) = send_result {
-            if sent.is_empty() {
-                return Err(e);
-            }
+        if let Some(e) = send_error {
             // 部分成功:整条重发会造成频道重复内容,按已发布收尾,转人工检查。
             tracing::warn!(error = %e, id = %item.source_id, "直发部分成功,后续批次失败");
             // 部分成功也尝试入库(已有文件仍有意义)
-            self.maybe_ingest(item, files).await;
+            self.maybe_ingest(item, files, gallery_staged.as_ref())
+                .await;
             return Ok(PublishOutcome::Partial);
         }
         // 手动链接直发成功:同步入库(帖子自带标签)
-        self.maybe_ingest(item, files).await;
+        self.maybe_ingest(item, files, gallery_staged.as_ref())
+            .await;
         Ok(PublishOutcome::Full)
     }
 
@@ -366,25 +399,57 @@ impl TelegramSink {
         summary
     }
 
-    async fn maybe_ingest(&self, item: &MediaItem, files: &[PathBuf]) {
+    fn stage_gallery(&self, item: &MediaItem, files: &[PathBuf]) -> Option<QueuedGalleryWork> {
+        self.state.gallery.as_ref()?;
+        stage_gallery_work(self.state.gallery_outbox.as_ref(), item, files)
+    }
+
+    async fn maybe_ingest(
+        &self,
+        item: &MediaItem,
+        files: &[PathBuf],
+        staged: Option<&QueuedGalleryWork>,
+    ) {
         let Some(gallery) = self.state.gallery.as_ref() else {
             return;
         };
-        // 优先用原图路径(files 在调用侧是下载原图)
-        if let Err(e) = gallery.ingest(item, files).await {
-            tracing::warn!(
-                id = %item.source_id,
-                error = %e,
-                "直发后图库入库失败(频道已发,可稍后重试入库)"
-            );
-            let _ = self
-                .state
-                .bot
-                .send_message(
-                    self.state.review_chat.clone(),
-                    format!("⚠️ 频道已发,但图库入库失败: {e}"),
-                )
-                .await;
+        // 预备份成功后立即改用持久副本，避免评论任务并发清理原图。
+        let ingest_files = staged.map_or(files, |queued| queued.files.as_slice());
+        match gallery.ingest(item, ingest_files).await {
+            Ok(()) => {
+                if staged.is_some() {
+                    resolve_gallery_staging(
+                        self.state.gallery_outbox.as_ref(),
+                        item.source.as_str(),
+                        &item.source_id,
+                    );
+                }
+            }
+            Err(e) => {
+                let queued =
+                    enqueue_gallery_failure(self.state.gallery_outbox.as_ref(), item, files, &e);
+                tracing::warn!(
+                    id = %item.source_id,
+                    error = %e,
+                    queued,
+                    "直发后图库入库失败"
+                );
+                let suffix = if queued && e.is_retryable() {
+                    "；已加入自动补偿队列"
+                } else if queued {
+                    "；已保留持久副本并停止自动重试，请人工检查"
+                } else {
+                    "；补偿队列登记失败，请人工处理"
+                };
+                let _ = self
+                    .state
+                    .bot
+                    .send_message(
+                        self.state.review_chat.clone(),
+                        format!("⚠️ 频道已发,但图库入库失败: {e}{suffix}"),
+                    )
+                    .await;
+            }
         }
     }
 
@@ -897,6 +962,7 @@ async fn send_group(
     caption: &str,
     spoiler: bool,
     sent: &mut Vec<MessageId>,
+    on_first_sent: &mut impl FnMut(),
 ) -> Result<()> {
     if prepared.is_empty() {
         anyhow::bail!("无图可发");
@@ -906,7 +972,19 @@ async fn send_group(
     } else {
         MediaMode::Photo { spoiler }
     };
-    send_batches(bot, chat, prepared, caption, &mode, sent).await
+    send_batches(bot, chat, prepared, caption, &mode, sent, on_first_sent).await
+}
+
+fn record_sent(
+    sent: &mut Vec<MessageId>,
+    ids: impl IntoIterator<Item = MessageId>,
+    on_first_sent: &mut impl FnMut(),
+) {
+    let was_empty = sent.is_empty();
+    sent.extend(ids);
+    if was_empty && !sent.is_empty() {
+        on_first_sent();
+    }
 }
 
 /// 分批发送核心:sendMediaGroup 限 2–10,按 10 分批,余数 1 张退化为单发。
@@ -920,6 +998,7 @@ async fn send_batches(
     caption: &str,
     mode: &MediaMode,
     sent: &mut Vec<MessageId>,
+    on_first_sent: &mut impl FnMut(),
 ) -> Result<()> {
     for (ci, chunk) in prepared.chunks(10).enumerate() {
         let cap = if ci == 0 { caption } else { "" };
@@ -950,7 +1029,7 @@ async fn send_batches(
                     .await?
                 }
             };
-            sent.push(m.id);
+            record_sent(sent, [m.id], on_first_sent);
         } else {
             let msgs = tg_retry(|| {
                 let media = match mode {
@@ -960,7 +1039,7 @@ async fn send_batches(
                 bot.send_media_group(chat.clone(), media)
             })
             .await?;
-            sent.extend(msgs.iter().map(|m| m.id));
+            record_sent(sent, msgs.iter().map(|m| m.id), on_first_sent);
         }
     }
     Ok(())
@@ -1238,7 +1317,16 @@ impl Sink for TelegramSink {
                 } else {
                     MediaMode::Photo { spoiler: false }
                 };
-                send_batches(bot, &chat, &prepared, &first_cap, &mode, &mut review_ids).await?;
+                send_batches(
+                    bot,
+                    &chat,
+                    &prepared,
+                    &first_cap,
+                    &mode,
+                    &mut review_ids,
+                    &mut || {},
+                )
+                .await?;
                 let ctrl = tg_retry(|| {
                     bot.send_message(chat.clone(), format!("👆 上面 {n} 张,请审批"))
                         .reply_markup(keyboard.clone())
@@ -1347,7 +1435,17 @@ async fn finish_claimed(
             return Err(e);
         }
     };
+    let archive_staged = if publish && archive {
+        stage_pending_archive(state, &work)
+    } else {
+        None
+    };
     let mut sent: Vec<MessageId> = Vec::new();
+    let mut activate_on_first = || {
+        if archive_staged.is_some() {
+            activate_pending_archive(state, &work);
+        }
+    };
     let send_result = if publish {
         send_group(
             &state.bot,
@@ -1356,6 +1454,7 @@ async fn finish_claimed(
             &work.caption,
             work.is_r18, // 结构化字段决定剧透遮罩,不再从 caption 文本反推
             &mut sent,
+            &mut activate_on_first,
         )
         .await
     } else {
@@ -1364,6 +1463,9 @@ async fn finish_claimed(
     let first_id = sent.first().copied();
     if let Err(e) = send_result {
         if first_id.is_none() {
+            if archive_staged.is_some() {
+                resolve_pending_archive(state, &work);
+            }
             // 一张都没发出:恢复 pending,原审批按钮/下次 /approve 可安全重试。
             let restore = {
                 let db = state.db.lock().await;
@@ -1382,12 +1484,11 @@ async fn finish_claimed(
                 state.review_chat.clone(),
                 "⚠️ 该条仅部分图片发布成功(后续批次失败),已按已发布处理;请检查频道帖,必要时手动补发缺图",
             )
-            .await;
+        .await;
     }
 
     // 频道帖发出后立即登记评论任务。Telegram 通常会在约 1 秒内把频道帖
-    // auto-forward 到讨论组；图库入库可能耗时较久，必须放在它后面，避免错过
-    // 这次一次性的转发事件。
+    // auto-forward 到讨论组；图库补偿副本已先独立落盘，所以评论任务可以安全清理原目录。
     let registered = match (publish, first_id) {
         (true, Some(mid)) if !work.originals.is_empty() => {
             register_comment(state, mid.0, &work.originals).await;
@@ -1399,16 +1500,31 @@ async fn finish_claimed(
     // 发布成功(或至少部分成功)且需要入库
     let mut archive_failed = false;
     if publish && first_id.is_some() && archive {
-        if let Err(e) = archive_pending_work(state, &work).await {
-            archive_failed = true;
-            tracing::warn!(error = %e, token, "审批发布后图库入库失败");
-            let _ = state
-                .bot
-                .send_message(
-                    state.review_chat.clone(),
-                    format!("⚠️ 频道已发,但图库入库失败: {e}"),
-                )
-                .await;
+        match archive_pending_work(state, &work, archive_staged.as_ref()).await {
+            Ok(()) => {
+                if archive_staged.is_some() {
+                    resolve_pending_archive(state, &work);
+                }
+            }
+            Err(e) => {
+                archive_failed = true;
+                let queued = queue_pending_archive(state, &work, &e);
+                tracing::warn!(error = %e, token, queued, "审批发布后图库入库失败");
+                let suffix = if queued && e.is_retryable() {
+                    "；已加入自动补偿队列"
+                } else if queued {
+                    "；已保留持久副本并停止自动重试，请人工检查"
+                } else {
+                    "；补偿队列登记失败，请人工处理"
+                };
+                let _ = state
+                    .bot
+                    .send_message(
+                        state.review_chat.clone(),
+                        format!("⚠️ 频道已发,但图库入库失败: {e}{suffix}"),
+                    )
+                    .await;
+            }
         }
     }
 
@@ -1458,19 +1574,165 @@ async fn finish_claimed(
     Ok(FinishOutcome { archive_failed })
 }
 
-async fn archive_pending_work(state: &Arc<ReviewState>, work: &PendingWork) -> Result<()> {
-    let Some(gallery) = state.gallery.as_ref() else {
-        anyhow::bail!("图库未配置");
-    };
-    let item: MediaItem = serde_json::from_str(&work.item_meta)
-        .context("pending item_meta 无法解析为 MediaItem(旧审批请丢弃重抓)")?;
-    // 优先原图;无则用发布用的缩放图
+async fn archive_pending_work(
+    state: &Arc<ReviewState>,
+    work: &PendingWork,
+    staged: Option<&QueuedGalleryWork>,
+) -> std::result::Result<(), GalleryIngestError> {
+    let gallery = state
+        .gallery
+        .as_ref()
+        .ok_or_else(|| GalleryIngestError::permanent("图库未配置"))?;
+    let item: MediaItem = serde_json::from_str(&work.item_meta).map_err(|error| {
+        GalleryIngestError::permanent(format!(
+            "pending item_meta 无法解析为 MediaItem(旧审批请丢弃重抓): {error}"
+        ))
+    })?;
+    // staging 是独立持久副本，不受 pending/评论临时目录清理影响。
+    let paths = staged.map_or_else(
+        || {
+            if !work.originals.is_empty() {
+                work.originals.as_slice()
+            } else {
+                work.files.as_slice()
+            }
+        },
+        |queued| queued.files.as_slice(),
+    );
+    gallery.ingest(&item, paths).await
+}
+
+fn pending_archive_item_paths(work: &PendingWork) -> Option<(MediaItem, &[PathBuf])> {
+    let item = serde_json::from_str::<MediaItem>(&work.item_meta).ok()?;
     let paths = if !work.originals.is_empty() {
         work.originals.as_slice()
     } else {
         work.files.as_slice()
     };
-    gallery.ingest(&item, paths).await
+    Some((item, paths))
+}
+
+fn stage_pending_archive(state: &ReviewState, work: &PendingWork) -> Option<QueuedGalleryWork> {
+    let (item, paths) = pending_archive_item_paths(work)?;
+    stage_gallery_work(state.gallery_outbox.as_ref(), &item, paths)
+}
+
+fn queue_pending_archive(
+    state: &ReviewState,
+    work: &PendingWork,
+    error: &GalleryIngestError,
+) -> bool {
+    let (Some(outbox), Ok(item)) = (
+        state.gallery_outbox.as_ref(),
+        serde_json::from_str::<MediaItem>(&work.item_meta),
+    ) else {
+        return false;
+    };
+    let paths = if !work.originals.is_empty() {
+        work.originals.as_slice()
+    } else {
+        work.files.as_slice()
+    };
+    enqueue_gallery_failure(Some(outbox), &item, paths, error)
+}
+
+fn activate_pending_archive(state: &ReviewState, work: &PendingWork) {
+    let Ok(item) = serde_json::from_str::<MediaItem>(&work.item_meta) else {
+        return;
+    };
+    activate_gallery_staging(
+        state.gallery_outbox.as_ref(),
+        item.source.as_str(),
+        &item.source_id,
+    );
+}
+
+fn resolve_pending_archive(state: &ReviewState, work: &PendingWork) {
+    let Ok(item) = serde_json::from_str::<MediaItem>(&work.item_meta) else {
+        return;
+    };
+    resolve_gallery_staging(
+        state.gallery_outbox.as_ref(),
+        item.source.as_str(),
+        &item.source_id,
+    );
+}
+
+fn enqueue_gallery_failure(
+    outbox: Option<&GalleryOutbox>,
+    item: &MediaItem,
+    paths: &[PathBuf],
+    error: &GalleryIngestError,
+) -> bool {
+    let Some(outbox) = outbox else {
+        return false;
+    };
+    match outbox.enqueue_classified(item, paths, &error.to_string(), error.is_retryable()) {
+        Ok(_) => true,
+        Err(queue_error) => {
+            tracing::error!(
+                source = item.source.as_str(),
+                id = %item.source_id,
+                error = %queue_error,
+                "图库补偿队列登记失败"
+            );
+            false
+        }
+    }
+}
+
+fn stage_gallery_work(
+    outbox: Option<&GalleryOutbox>,
+    item: &MediaItem,
+    paths: &[PathBuf],
+) -> Option<QueuedGalleryWork> {
+    let outbox = outbox?;
+    match outbox.stage(item, paths) {
+        Ok(queued) => Some(queued),
+        Err(error) => {
+            tracing::error!(
+                source = item.source.as_str(),
+                id = %item.source_id,
+                error = %error,
+                "图库补偿 staging 登记失败"
+            );
+            None
+        }
+    }
+}
+
+fn activate_gallery_staging(outbox: Option<&GalleryOutbox>, source_kind: &str, source_id: &str) {
+    let Some(outbox) = outbox else {
+        return;
+    };
+    match outbox.activate(source_kind, source_id) {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            source = source_kind,
+            id = source_id,
+            "频道已发布但图库补偿 staging 未激活"
+        ),
+        Err(error) => tracing::error!(
+            source = source_kind,
+            id = source_id,
+            error = %error,
+            "频道已发布但激活图库补偿 staging 失败"
+        ),
+    }
+}
+
+fn resolve_gallery_staging(outbox: Option<&GalleryOutbox>, source_kind: &str, source_id: &str) {
+    let Some(outbox) = outbox else {
+        return;
+    };
+    if let Err(error) = outbox.resolve_without_retry(source_kind, source_id) {
+        tracing::warn!(
+            source = source_kind,
+            id = source_id,
+            error = %error,
+            "初次图库入库成功但清理补偿 staging 失败"
+        );
+    }
 }
 
 /// 顺序处理 `/approve` 或 `/approve_archive` 原子抢占到的全部记录。顺序发送避免
@@ -1522,6 +1784,10 @@ pub async fn run_review_loop(
     trigger: tokio::sync::mpsc::Sender<()>,
     link: tokio::sync::mpsc::Sender<LinkJob>,
 ) {
+    // 补偿线程只消费 gallery_outbox，不触碰 Telegram 发布和 pushed 去重。
+    if let (Some(outbox), Some(gallery)) = (state.gallery_outbox.clone(), state.gallery.clone()) {
+        tokio::spawn(crate::gallery_outbox::run_retry_loop(outbox, gallery));
+    }
     // 启动先清一次超期/孤儿(顺手清掉旧版本遗留的临时图)。
     cleanup_stale(&state).await;
     if let Err(e) = state
@@ -2393,5 +2659,18 @@ mod tests {
         // 子串伪装域名被 host 判定挡掉。
         assert_eq!(classify_link("https://evil.com/pixiv.net/artworks/1"), None);
         assert_eq!(classify_link("https://example.com/a"), None);
+    }
+
+    #[test]
+    fn first_successful_telegram_batch_activates_exactly_once() {
+        let mut sent = Vec::new();
+        let mut activations = 0;
+        let mut activate = || activations += 1;
+
+        record_sent(&mut sent, [MessageId(10), MessageId(11)], &mut activate);
+        record_sent(&mut sent, [MessageId(12)], &mut activate);
+
+        assert_eq!(sent, vec![MessageId(10), MessageId(11), MessageId(12)]);
+        assert_eq!(activations, 1);
     }
 }

@@ -231,7 +231,7 @@ From <Pixiv|X|抖音>(作品链接) By 作者名(作者链接)
 
 ### Docker Compose（推荐用于 VPS）
 
-镜像内含 gallery-dl、`gallery_repair` 与 `restore_pending`。生产必须固定不可变版本，不能使用 `latest`。把 DB、pending、outbox 和配置作为一个状态目录挂到容器内固定的 `/opt/hanabi`，这样 SQLite 中已有的绝对图片路径在换 VPS 或重建容器后仍然有效：
+镜像内含固定版本的 gallery-dl、`gallery_repair` 与 `restore_pending`。生产必须固定不可变版本，不能使用 `latest`。把 DB、pending、outbox 和配置作为一个状态目录挂到容器内固定的 `/opt/hanabi`，这样 SQLite 中已有的绝对图片路径在换 VPS 或重建容器后仍然有效：
 
 ```bash
 install -d -m 0700 /var/lib/hanabi /opt/hanabi-container

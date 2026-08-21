@@ -11,15 +11,15 @@ RUN cargo build --release --locked --bins \
     && cp target/release/restore_pending /restore_pending
 
 # ---- runtime: alpine + gallery-dl + douyin-downloader 作者发现桥 ----
-# gallery-dl 走 alpine community 仓库(自带, 依赖 python3 一并拉入), 免 pip 外部环境坑。
+# gallery-dl 固定到与生产验证一致的版本，避免 Alpine 仓库旧版导致站点解析回退。
 FROM alpine:3.20
 ARG DOUYIN_DOWNLOADER_COMMIT=ad7338fdc474c14e2063370540a362cd8a953b43
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.source="https://github.com/Furinelle/hanabi" \
       org.opencontainers.image.revision="${VCS_REF}"
-RUN apk add --no-cache gallery-dl ca-certificates py3-pip py3-aiohttp py3-yaml \
+RUN apk add --no-cache ca-certificates py3-pip py3-aiohttp py3-yaml \
     && apk add --no-cache --virtual .douyin-build-deps git py3-setuptools py3-wheel \
-    && pip install --no-cache-dir --break-system-packages gmssl==3.2.2 \
+    && pip install --no-cache-dir --break-system-packages gallery-dl==1.32.9 gmssl==3.2.2 \
     && pip install --no-cache-dir --break-system-packages --no-build-isolation --no-deps \
        "git+https://github.com/jiji262/douyin-downloader.git@${DOUYIN_DOWNLOADER_COMMIT}" \
     && apk del .douyin-build-deps \

@@ -5,6 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use image::imageops::FilterType;
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::model::{MediaItem, SourceKind};
@@ -13,14 +14,14 @@ const HASH_SIDE: u32 = 8;
 const COLOR_SIDE: u32 = 4;
 const MAX_SIMILAR_NOTICES: usize = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MatchKind {
     StrictSame,
     Similar { distance: u32 },
     Different,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageFingerprint {
     pub content_sha256: String,
     pub strict_key: String,

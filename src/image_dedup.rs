@@ -232,11 +232,7 @@ pub fn classify_similarity(left: &ImageFingerprint, right: &ImageFingerprint) ->
     if let Some(distance) = partial_distance(left, right) {
         return MatchKind::Partial { distance };
     }
-    if same_whole_aspect
-        && average_distance <= 10
-        && difference_distance <= 10
-        && distance <= 16
-    {
+    if same_whole_aspect && average_distance <= 10 && difference_distance <= 10 && distance <= 16 {
         MatchKind::Similar { distance }
     } else {
         MatchKind::Different
@@ -628,7 +624,11 @@ pub fn render_review_notice(matches: &[SimilarImage]) -> String {
     for value in matches.iter().take(MAX_SIMILAR_NOTICES) {
         output.push_str(&format!(
             "\n• {}：当前 {} · {}；{} {} {} · {}（差异 {}）",
-            if value.partial { "疑似原图局部" } else { "整图相似" },
+            if value.partial {
+                "疑似原图局部"
+            } else {
+                "整图相似"
+            },
             value.current.dimensions_label(),
             format_bytes(value.current.bytes),
             source_label(value.existing_work.source),

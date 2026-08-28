@@ -8,6 +8,7 @@ No external plan file was supplied. The tests were derived from these user journ
 2. As the approver, I want near-duplicate artwork to remain reviewable, with both images' resolution and file size visible.
 3. As the operator, I want fingerprint state to survive restarts and follow pending, published, discarded, expired, restored, and direct-publish lifecycle changes.
 4. As the gallery operator, I want a dry, deterministic full-catalog report that separates automatic strict removals from review-only similar pairs.
+5. As the approver, I want split panels to be matched back to a complete image but never placed in the automatic removal plan.
 
 ## RED and GREEN evidence
 
@@ -16,7 +17,10 @@ No external plan file was supplied. The tests were derived from these user journ
 - Regression: `cargo test --all-targets` passed 94 tests across library, binary, and integration targets.
 - Historical scan RED: `cargo test --test gallery_catalog` failed with `unresolved import hanabi::gallery_catalog` before production code existed (`fcd9ba2`).
 - Historical scan GREEN: the same target passed all 3 strict/similar/unrelated catalog tests after `f8baf70`.
-- Final regression: `cargo test --all-targets` passed 97 tests across library, binaries, and integration targets.
+- Pre-split-panel regression: `cargo test --all-targets` passed 97 tests across library, binaries, and integration targets.
+- Split-panel RED: `cargo test --test image_dedup` failed because `MatchKind::Partial` did not exist (`38aee50`).
+- Split-panel GREEN: focused image/catalog targets passed 11 tests after region fingerprints were implemented (`a40c86e`).
+- Final regression: `cargo test --all-targets` passed 99 tests; format, Clippy with warnings denied, and the locked release build also passed.
 - Static checks: `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings` passed.
 
 ## Test specification
@@ -33,6 +37,8 @@ No external plan file was supplied. The tests were derived from these user journ
 | 8 | Historical strict groups retain the highest-resolution image and exclude those members from similar review | `strict_group_keeps_the_highest_resolution_and_never_becomes_similar` | integration | PASS |
 | 9 | Historical visual edits remain review-only and never enter the automatic removal plan | `edited_image_is_review_only_and_does_not_enter_auto_remove_plan` | integration | PASS |
 | 10 | Unrelated historical images produce no findings | `unrelated_images_produce_no_findings` | integration | PASS |
+| 11 | A common split panel is classified as partial similarity and never strict equality | `a_split_panel_is_partial_similarity_and_never_auto_deduplicated` | unit | PASS |
+| 12 | Historical split panels enter the review report with `kind=partial`, not the removal plan | `split_panel_enters_review_report_but_not_strict_removal` | integration | PASS |
 
 ## Coverage and known gaps
 
@@ -44,4 +50,5 @@ No live Telegram E2E was run because the test environment intentionally has no b
 
 - RED checkpoints: `d0695f8`, `48bb661`.
 - Historical catalog RED/GREEN checkpoints: `fcd9ba2`, `f8baf70`.
+- Split-panel RED/GREEN checkpoints: `38aee50`, `a40c86e`.
 - GREEN implementation is validated by the commands above; this report preserves the RED/GREEN mapping if commits are later squashed.

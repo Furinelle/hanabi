@@ -95,6 +95,24 @@ fn a_small_visual_edit_is_similar_but_never_strict_same() {
 }
 
 #[test]
+fn a_split_panel_is_partial_similarity_and_never_auto_deduplicated() {
+    let dir = tempfile::tempdir().unwrap();
+    let full_path = dir.path().join("full.png");
+    let panel_path = dir.path().join("panel.png");
+    let full = patterned(600, 400);
+    let panel = image::imageops::crop_imm(&full, 0, 0, 300, 400).to_image();
+    save_png(&full_path, &full);
+    save_png(&panel_path, &panel);
+
+    let full = inspect_image(&full_path).unwrap();
+    let panel = inspect_image(&panel_path).unwrap();
+    assert!(matches!(
+        classify_similarity(&full, &panel),
+        MatchKind::Partial { .. }
+    ));
+}
+
+#[test]
 fn unrelated_images_are_not_marked_similar() {
     let dir = tempfile::tempdir().unwrap();
     let first_path = dir.path().join("first.png");

@@ -112,3 +112,24 @@ fn unrelated_images_produce_no_findings() {
     assert!(report.strict_groups.is_empty());
     assert!(report.similar_pairs.is_empty());
 }
+
+#[test]
+fn split_panel_enters_review_report_but_not_strict_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let full_path = dir.path().join("full.png");
+    let panel_path = dir.path().join("panel.png");
+    let full = patterned(600, 400);
+    let panel = image::imageops::crop_imm(&full, 300, 0, 300, 400).to_image();
+    save(&full_path, &full);
+    save(&panel_path, &panel);
+
+    let report = scan_catalog(&[
+        entry(&full_path, SourceKind::Pixiv, "full", "pixiv/full.png"),
+        entry(&panel_path, SourceKind::Douyin, "panel", "douyin/panel.png"),
+    ])
+    .unwrap();
+
+    assert!(report.strict_groups.is_empty());
+    assert_eq!(report.similar_pairs.len(), 1);
+    assert_eq!(report.similar_pairs[0].kind, "partial");
+}

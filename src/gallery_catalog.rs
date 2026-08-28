@@ -37,6 +37,7 @@ pub struct SimilarPair {
     pub left: ScannedCatalogImage,
     pub right: ScannedCatalogImage,
     pub distance: u32,
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -64,7 +65,10 @@ pub fn scan_catalog(images: &[CatalogImage]) -> Result<CatalogScanReport> {
             match classify_similarity(&scanned[left].fingerprint, &scanned[right].fingerprint) {
                 MatchKind::StrictSame => sets.union(left, right),
                 MatchKind::Similar { distance } => {
-                    similar_indices.push((left, right, distance));
+                    similar_indices.push((left, right, distance, "visual"));
+                }
+                MatchKind::Partial { distance } => {
+                    similar_indices.push((left, right, distance, "partial"));
                 }
                 MatchKind::Different => {}
             }
@@ -89,11 +93,12 @@ pub fn scan_catalog(images: &[CatalogImage]) -> Result<CatalogScanReport> {
 
     let mut similar_pairs = similar_indices
         .into_iter()
-        .filter(|(left, right, _)| sets.find(*left) != sets.find(*right))
-        .map(|(left, right, distance)| SimilarPair {
+        .filter(|(left, right, _, _)| sets.find(*left) != sets.find(*right))
+        .map(|(left, right, distance, kind)| SimilarPair {
             left: scanned[left].clone(),
             right: scanned[right].clone(),
             distance,
+            kind: kind.into(),
         })
         .collect::<Vec<_>>();
     similar_pairs.sort_by(|left, right| {

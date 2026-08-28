@@ -18,7 +18,17 @@ const MAX_SIMILAR_NOTICES: usize = 3;
 pub enum MatchKind {
     StrictSame,
     Similar { distance: u32 },
+    Partial { distance: u32 },
     Different,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegionFingerprint {
+    pub width: u32,
+    pub height: u32,
+    pub average_hash: u64,
+    pub difference_hash: u64,
+    pub color_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +43,8 @@ pub struct ImageFingerprint {
     pub height: u32,
     pub bytes: u64,
     pub format: String,
+    #[serde(default)]
+    pub regions: Vec<RegionFingerprint>,
 }
 
 impl ImageFingerprint {
@@ -96,6 +108,7 @@ pub struct SimilarImage {
     pub existing: ImageFingerprint,
     pub existing_work: WorkSummary,
     pub distance: u32,
+    pub partial: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,8 +128,28 @@ pub fn inspect_image(path: &Path) -> Result<ImageFingerprint> {
         .with_context(|| format!("解码图片失败: {}", path.display()))?;
     let width = image.width();
     let height = image.height();
-    let gray = image.to_luma8();
+    let visual = visual_fingerprint(&image);
+    let strict_key =
+        hex_digest(format!("{:016x}:{:016x}:{}", visual.0, visual.1, visual.3).as_bytes());
+    let regions = split_regions(&image);
 
+    Ok(ImageFingerprint {
+        content_sha256: hex_digest(&encoded),
+        strict_key,
+        average_hash: visual.0,
+        difference_hash: visual.1,
+        color_key: visual.2,
+        detail_key: visual.3,
+        width,
+        height,
+        bytes: encoded.len() as u64,
+        format,
+        regions,
+    })
+}
+
+fn visual_fingerprint(image: &image::DynamicImage) -> (u64, u64, String, String) {
+    let gray = image.to_luma8();
     let average = image::imageops::resize(&gray, HASH_SIDE, HASH_SIDE, FilterType::Triangle);
     let mean = average.pixels().map(|p| u64::from(p[0])).sum::<u64>() / 64;
     let mut average_hash = 0_u64;
@@ -125,7 +158,6 @@ pub fn inspect_image(path: &Path) -> Result<ImageFingerprint> {
             average_hash |= 1_u64 << index;
         }
     }
-
     let difference = image::imageops::resize(&gray, HASH_SIDE + 1, HASH_SIDE, FilterType::Triangle);
     let mut difference_hash = 0_u64;
     for y in 0..HASH_SIDE {
@@ -135,49 +167,61 @@ pub fn inspect_image(path: &Path) -> Result<ImageFingerprint> {
             }
         }
     }
-
-    // 低频颜色网格、32×32 细节网格与两种灰度结构哈希必须同时一致，才允许
-    // 自动去重。颜色降到 4 bit 以容忍尺寸/容器差异，但一般“相似图”不会过此门槛。
     let rgb = image.to_rgb8();
     let colors = image::imageops::resize(&rgb, COLOR_SIDE, COLOR_SIDE, FilterType::Triangle);
     let color_bytes: Vec<u8> = colors
         .pixels()
         .flat_map(|p| p.0.map(|channel| channel >> 4))
         .collect();
-    let color_key = hex_digest(&color_bytes);
     let details = image::imageops::resize(&rgb, 32, 32, FilterType::Triangle);
     let detail_bytes: Vec<u8> = details
         .pixels()
         .flat_map(|p| p.0.map(|channel| channel >> 4))
         .collect();
-    let detail_key = hex_digest(&detail_bytes);
-    let strict_key =
-        hex_digest(format!("{average_hash:016x}:{difference_hash:016x}:{detail_key}").as_bytes());
-
-    Ok(ImageFingerprint {
-        content_sha256: hex_digest(&encoded),
-        strict_key,
+    (
         average_hash,
         difference_hash,
-        color_key,
-        detail_key,
-        width,
-        height,
-        bytes: encoded.len() as u64,
-        format,
-    })
+        hex_digest(&color_bytes),
+        hex_digest(&detail_bytes),
+    )
+}
+
+fn split_regions(image: &image::DynamicImage) -> Vec<RegionFingerprint> {
+    let mut output = Vec::new();
+    for (columns, rows) in [(2, 1), (3, 1), (1, 2), (1, 3), (2, 2), (3, 3)] {
+        for row in 0..rows {
+            for column in 0..columns {
+                let x0 = image.width() * column / columns;
+                let x1 = image.width() * (column + 1) / columns;
+                let y0 = image.height() * row / rows;
+                let y1 = image.height() * (row + 1) / rows;
+                if x1 <= x0 || y1 <= y0 {
+                    continue;
+                }
+                let region = image.crop_imm(x0, y0, x1 - x0, y1 - y0);
+                let visual = visual_fingerprint(&region);
+                output.push(RegionFingerprint {
+                    width: x1 - x0,
+                    height: y1 - y0,
+                    average_hash: visual.0,
+                    difference_hash: visual.1,
+                    color_key: visual.2,
+                });
+            }
+        }
+    }
+    output
 }
 
 pub fn classify_similarity(left: &ImageFingerprint, right: &ImageFingerprint) -> MatchKind {
     if left.content_sha256 == right.content_sha256 {
         return MatchKind::StrictSame;
     }
-    if !same_aspect_ratio(left, right, 0.03) {
-        return MatchKind::Different;
-    }
     let average_distance = (left.average_hash ^ right.average_hash).count_ones();
     let difference_distance = (left.difference_hash ^ right.difference_hash).count_ones();
-    if same_aspect_ratio(left, right, 0.005)
+    let same_whole_aspect = same_aspect_ratio(left, right, 0.03);
+    if same_whole_aspect
+        && same_aspect_ratio(left, right, 0.005)
         && left.color_key == right.color_key
         && left.detail_key == right.detail_key
         && average_distance + difference_distance <= 1
@@ -185,11 +229,53 @@ pub fn classify_similarity(left: &ImageFingerprint, right: &ImageFingerprint) ->
         return MatchKind::StrictSame;
     }
     let distance = average_distance + difference_distance;
-    if average_distance <= 10 && difference_distance <= 10 && distance <= 16 {
+    if let Some(distance) = partial_distance(left, right) {
+        return MatchKind::Partial { distance };
+    }
+    if same_whole_aspect
+        && average_distance <= 10
+        && difference_distance <= 10
+        && distance <= 16
+    {
         MatchKind::Similar { distance }
     } else {
         MatchKind::Different
     }
+}
+
+fn partial_distance(left: &ImageFingerprint, right: &ImageFingerprint) -> Option<u32> {
+    region_distance(&left.regions, right)
+        .into_iter()
+        .chain(region_distance(&right.regions, left))
+        .min()
+}
+
+fn region_distance(regions: &[RegionFingerprint], whole: &ImageFingerprint) -> Option<u32> {
+    regions
+        .iter()
+        .filter(|region| same_dimensions_aspect(region.width, region.height, whole, 0.03))
+        .filter(|region| region.color_key == whole.color_key)
+        .filter_map(|region| {
+            let average = (region.average_hash ^ whole.average_hash).count_ones();
+            let difference = (region.difference_hash ^ whole.difference_hash).count_ones();
+            let distance = average + difference;
+            (average <= 10 && difference <= 10 && distance <= 16).then_some(distance)
+        })
+        .min()
+}
+
+fn same_dimensions_aspect(
+    width: u32,
+    height: u32,
+    other: &ImageFingerprint,
+    tolerance: f64,
+) -> bool {
+    if height == 0 || other.height == 0 {
+        return false;
+    }
+    let left_ratio = f64::from(width) / f64::from(height);
+    let right_ratio = f64::from(other.width) / f64::from(other.height);
+    ((left_ratio - right_ratio).abs() / left_ratio.max(right_ratio)) <= tolerance
 }
 
 fn same_aspect_ratio(left: &ImageFingerprint, right: &ImageFingerprint, tolerance: f64) -> bool {
@@ -224,6 +310,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             height          INTEGER NOT NULL,
             bytes           INTEGER NOT NULL,
             format          TEXT NOT NULL,
+            regions_json    TEXT NOT NULL DEFAULT '[]',
             recorded_at     INTEGER NOT NULL,
             PRIMARY KEY(source_kind, source_id, image_index)
          );
@@ -232,6 +319,10 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_image_fingerprints_status
            ON image_fingerprints(status);",
     )?;
+    let _ = conn.execute(
+        "ALTER TABLE image_fingerprints ADD COLUMN regions_json TEXT NOT NULL DEFAULT '[]'",
+        [],
+    );
     Ok(())
 }
 
@@ -255,8 +346,8 @@ pub fn record_work(
             "INSERT INTO image_fingerprints(
                 source_kind,source_id,image_index,title,source_url,status,
                 content_sha256,strict_key,average_hash,difference_hash,color_key,detail_key,
-                width,height,bytes,format,recorded_at
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                width,height,bytes,format,regions_json,recorded_at
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
                 kind,
                 source_id,
@@ -274,6 +365,7 @@ pub fn record_work(
                 i64::from(fingerprint.height),
                 fingerprint.bytes as i64,
                 fingerprint.format,
+                serde_json::to_string(&fingerprint.regions)?,
                 now,
             ],
         )?;
@@ -399,7 +491,8 @@ pub fn evaluate_work(
                 continue;
             }
             for (existing_index, old) in work.images.iter().enumerate() {
-                if let MatchKind::Similar { distance } = classify_similarity(fingerprint, old) {
+                let matched = classify_similarity(fingerprint, old);
+                if let MatchKind::Similar { distance } | MatchKind::Partial { distance } = matched {
                     similar.push(SimilarImage {
                         current_index,
                         current: fingerprint.clone(),
@@ -407,6 +500,7 @@ pub fn evaluate_work(
                         existing: old.clone(),
                         existing_work: work.clone(),
                         distance,
+                        partial: matches!(matched, MatchKind::Partial { .. }),
                     });
                 }
             }
@@ -465,7 +559,7 @@ fn load_works(conn: &Connection) -> Result<Vec<WorkSummary>> {
     let mut stmt = conn.prepare(
         "SELECT source_kind,source_id,image_index,title,source_url,status,
                 content_sha256,strict_key,average_hash,difference_hash,color_key,detail_key,
-                width,height,bytes,format
+                width,height,bytes,format,COALESCE(regions_json, '[]')
          FROM image_fingerprints
          ORDER BY source_kind,source_id,image_index",
     )?;
@@ -488,6 +582,7 @@ fn load_works(conn: &Connection) -> Result<Vec<WorkSummary>> {
                 height: row.get::<_, i64>(13)?.max(0) as u32,
                 bytes: row.get::<_, i64>(14)?.max(0) as u64,
                 format: row.get(15)?,
+                regions: serde_json::from_str(&row.get::<_, String>(16)?).unwrap_or_default(),
             },
         ))
     })?;
@@ -532,7 +627,8 @@ pub fn render_review_notice(matches: &[SimilarImage]) -> String {
     let mut output = String::from("\n\n🔎 相似图片（需人工确认）");
     for value in matches.iter().take(MAX_SIMILAR_NOTICES) {
         output.push_str(&format!(
-            "\n• 当前 {} · {}；{} {} {} · {}（差异 {}）",
+            "\n• {}：当前 {} · {}；{} {} {} · {}（差异 {}）",
+            if value.partial { "疑似原图局部" } else { "整图相似" },
             value.current.dimensions_label(),
             format_bytes(value.current.bytes),
             source_label(value.existing_work.source),

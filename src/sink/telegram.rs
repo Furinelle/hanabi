@@ -16,6 +16,11 @@ use tokio::sync::Mutex;
 
 use crate::gallery::{GalleryClient, GalleryIngestError};
 use crate::gallery_outbox::{GalleryOutbox, QueuedGalleryWork};
+use crate::image_dedup::{
+    evaluate_work, init_schema as init_image_dedup_schema, inspect_image, mark_work_status,
+    record_work, remove_work, remove_work_key, render_review_notice, ExactAction, ImageFingerprint,
+    WorkStatus, WorkSummary,
+};
 use crate::model::MediaItem;
 use crate::sink::{needs_downscale, render_caption, Sink};
 
@@ -155,6 +160,7 @@ impl TelegramSink {
              );",
         )
         .context("初始化 pending 表失败")?;
+        init_image_dedup_schema(&conn).context("初始化图片去重表失败")?;
         // 兼容旧库:补列,已存在则忽略报错。
         let _ = conn.execute(
             "ALTER TABLE pending ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
@@ -203,6 +209,10 @@ impl TelegramSink {
             [],
         )
         .context("恢复中断的撤销操作失败")?;
+        let backfilled = backfill_pending_image_catalog(&conn)?;
+        if backfilled > 0 {
+            tracing::info!(backfilled, "已为现有待审作品补建图片指纹");
+        }
         // counter 从已有最大 token 续上,避免重启后 token 与旧记录冲突。
         let max_token: i64 = conn
             .query_row("SELECT COALESCE(MAX(token), 0) FROM pending", [], |r| {
@@ -268,6 +278,7 @@ impl TelegramSink {
         if files.is_empty() {
             anyhow::bail!("无图片可发: {}", item.source_id);
         }
+        let fingerprints = inspect_images(files).await?;
         let caption = render_caption(item);
         let files_owned: Vec<PathBuf> = files.to_vec();
         let prepared = tokio::task::spawn_blocking(move || prepare_all(&files_owned)).await??;
@@ -318,11 +329,19 @@ impl TelegramSink {
             // 部分成功也尝试入库(已有文件仍有意义)
             self.maybe_ingest(item, files, gallery_staged.as_ref())
                 .await;
+            let db = self.state.db.lock().await;
+            if let Err(error) = record_work(&db, item, &fingerprints, WorkStatus::Published) {
+                tracing::warn!(error = %error, id = %item.source_id, "登记直发图片指纹失败");
+            }
             return Ok(PublishOutcome::Partial);
         }
         // 手动链接直发成功:同步入库(帖子自带标签)
         self.maybe_ingest(item, files, gallery_staged.as_ref())
             .await;
+        let db = self.state.db.lock().await;
+        if let Err(error) = record_work(&db, item, &fingerprints, WorkStatus::Published) {
+            tracing::warn!(error = %error, id = %item.source_id, "登记直发图片指纹失败");
+        }
         Ok(PublishOutcome::Full)
     }
 
@@ -1131,19 +1150,20 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
     }
     // ① 超期 pending。
     let cutoff = now_secs() - PENDING_TTL_SECS;
-    let expired: Vec<(i64, String, String)> = {
+    let expired: Vec<(i64, String, String, String)> = {
         let db = state.db.lock().await;
         let mut out = Vec::new();
         if let Ok(mut stmt) = db.prepare(
             // 只清 pending:publishing 表示有发布任务在途,清了会与其互踩
             // (删其正在上传的文件、DELETE 其记录,失败后的 restore 变成空操作)。
-            "SELECT token, files, msg_ids FROM pending WHERE created_at > 0 AND created_at < ?1 AND state='pending'",
+            "SELECT token, files, msg_ids, COALESCE(item_meta, '{}') FROM pending WHERE created_at > 0 AND created_at < ?1 AND state='pending'",
         ) {
             if let Ok(rows) = stmt.query_map([cutoff], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
                 ))
             }) {
                 out.extend(rows.flatten());
@@ -1151,7 +1171,7 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
         }
         out
     };
-    for (token, files_json, msg_json) in &expired {
+    for (token, files_json, msg_json, item_meta) in &expired {
         if let Ok(ids) = serde_json::from_str::<Vec<i32>>(msg_json) {
             for mid in ids {
                 let _ = state
@@ -1164,11 +1184,11 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
             let paths: Vec<PathBuf> = files.into_iter().map(PathBuf::from).collect();
             cleanup(&paths);
         }
-        let _ = state
-            .db
-            .lock()
-            .await
-            .execute("DELETE FROM pending WHERE token=?1", [*token]);
+        let db = state.db.lock().await;
+        let _ = db.execute("DELETE FROM pending WHERE token=?1", [*token]);
+        if let Ok(item) = serde_json::from_str::<MediaItem>(item_meta) {
+            let _ = remove_work(&db, &item);
+        }
     }
     if !expired.is_empty() {
         tracing::info!(count = expired.len(), "清理超期 pending");
@@ -1245,6 +1265,126 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
     .await;
 }
 
+async fn inspect_images(files: &[PathBuf]) -> Result<Vec<ImageFingerprint>> {
+    let files = files.to_vec();
+    tokio::task::spawn_blocking(move || {
+        files
+            .iter()
+            .map(|path| inspect_image(path))
+            .collect::<Result<Vec<_>>>()
+    })
+    .await?
+}
+
+fn backfill_pending_image_catalog(conn: &rusqlite::Connection) -> Result<usize> {
+    let rows: Vec<(String, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(item_meta, '{}'),originals,files FROM pending WHERE state='pending'",
+        )?;
+        let mapped = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        mapped.collect::<rusqlite::Result<_>>()?
+    };
+    let mut backfilled = 0;
+    for (item_meta, originals_json, files_json) in rows {
+        let Ok(item) = serde_json::from_str::<MediaItem>(&item_meta) else {
+            continue;
+        };
+        let (kind, source_id) = item.dedup_key();
+        let exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM image_fingerprints WHERE source_kind=?1 AND source_id=?2",
+            rusqlite::params![kind, source_id],
+            |row| row.get(0),
+        )?;
+        if exists > 0 {
+            continue;
+        }
+        let raw = serde_json::from_str::<Vec<String>>(&originals_json)
+            .ok()
+            .filter(|paths| !paths.is_empty())
+            .or_else(|| serde_json::from_str::<Vec<String>>(&files_json).ok())
+            .unwrap_or_default();
+        let fingerprints = raw
+            .iter()
+            .map(|path| inspect_image(Path::new(path)))
+            .collect::<Result<Vec<_>>>();
+        match fingerprints {
+            Ok(fingerprints) if !fingerprints.is_empty() => {
+                record_work(conn, &item, &fingerprints, WorkStatus::Pending)?;
+                backfilled += 1;
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                error = %error,
+                source = item.source.as_str(),
+                id = %item.source_id,
+                "现有待审图片指纹补建失败"
+            ),
+        }
+    }
+    Ok(backfilled)
+}
+
+/// 高清严格同图到达时，只能替换仍处于 pending 的旧审批卡片。若旧卡正发布或已经
+/// 发布，不能后台删除外部消息；调用方会保留旧版本并跳过当前版本以避免重复。
+async fn supersede_pending_work(state: &Arc<ReviewState>, old: &WorkSummary) -> Result<bool> {
+    let claimed = {
+        let db = state.db.lock().await;
+        let rows: Vec<(i64, PendingRow)> = {
+            let mut stmt = db.prepare(
+                "SELECT token,files,caption,msg_ids,originals,is_r18,COALESCE(item_meta, '{}')
+                 FROM pending WHERE state='pending' ORDER BY created_at,token",
+            )?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    (
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ),
+                ))
+            })?;
+            mapped.collect::<rusqlite::Result<_>>()?
+        };
+        let found = rows.into_iter().find(|(_, row)| {
+            serde_json::from_str::<MediaItem>(&row.5)
+                .is_ok_and(|item| item.source == old.source && item.source_id == old.source_id)
+        });
+        if let Some((token, row)) = found {
+            let changed = db.execute(
+                "DELETE FROM pending WHERE token=?1 AND state='pending'",
+                [token],
+            )?;
+            if changed == 1 {
+                remove_work_key(&db, old.source.as_str(), &old.source_id)?;
+                Some(decode_pending(row)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    let Some(work) = claimed else {
+        return Ok(false);
+    };
+    for mid in &work.msg_ids {
+        let _ = state
+            .bot
+            .delete_message(state.review_chat.clone(), MessageId(*mid))
+            .await;
+    }
+    if !work.originals.is_empty() {
+        cleanup(&work.originals);
+    } else {
+        cleanup(&work.files);
+    }
+    Ok(true)
+}
+
 #[async_trait]
 impl Sink for TelegramSink {
     /// 发到审批私聊:**全套图**(单图=sendPhoto+按钮;多图=图组+一条带按钮的控制消息)。
@@ -1253,11 +1393,86 @@ impl Sink for TelegramSink {
         if files.is_empty() {
             anyhow::bail!("无图片可发: {}", item.source_id);
         }
-        let caption = render_caption(item);
-        let files_owned: Vec<PathBuf> = files.to_vec();
-        // 原始(缩放前)路径:审批通过后发原画质 document 进频道帖评论区(发 photo 用缩放版)。
-        let originals: Vec<PathBuf> = files.to_vec();
+        let fingerprints = inspect_images(files).await?;
+        let evaluation = {
+            let db = self.state.db.lock().await;
+            evaluate_work(&db, item, &fingerprints)?
+        };
+        match &evaluation.exact_action {
+            ExactAction::SkipCurrent(old) => {
+                tracing::info!(
+                    id = %item.source_id,
+                    kept_source = old.source.as_str(),
+                    kept_id = %old.source_id,
+                    status = ?old.status,
+                    "严格同图自动去重,保留已有版本"
+                );
+                cleanup(files);
+                return Ok(());
+            }
+            ExactAction::ReplacePending(old) => {
+                if !supersede_pending_work(&self.state, old).await? {
+                    tracing::warn!(
+                        id = %item.source_id,
+                        old_source = old.source.as_str(),
+                        old_id = %old.source_id,
+                        "高清严格同图到达时旧审批已不再可替换,保留旧版本"
+                    );
+                    cleanup(files);
+                    return Ok(());
+                }
+                tracing::info!(
+                    id = %item.source_id,
+                    replaced_source = old.source.as_str(),
+                    replaced_id = %old.source_id,
+                    "严格同图自动去重,用高清版本替换旧审批"
+                );
+            }
+            ExactAction::None => {}
+        }
 
+        let dropped: HashSet<usize> = evaluation.drop_current_indices.iter().copied().collect();
+        let originals: Vec<PathBuf> = files
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !dropped.contains(index))
+            .map(|(_, path)| path.clone())
+            .collect();
+        let kept_fingerprints: Vec<ImageFingerprint> = fingerprints
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| !dropped.contains(index))
+            .map(|(_, fingerprint)| fingerprint)
+            .collect();
+        if originals.is_empty() {
+            tracing::info!(id = %item.source_id, "作品内图片均为严格同图,自动跳过审批");
+            cleanup(files);
+            return Ok(());
+        }
+        for index in &evaluation.drop_current_indices {
+            if let Some(path) = files.get(*index) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+
+        let mut effective_item = item.clone();
+        if effective_item.images.len() == files.len() {
+            effective_item.images = effective_item
+                .images
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| !dropped.contains(index))
+                .map(|(_, image)| image)
+                .collect();
+            effective_item.page_count = effective_item.images.len() as u32;
+        }
+        let caption = format!(
+            "{}{}",
+            render_caption(&effective_item),
+            render_review_notice(&evaluation.similar)
+        );
+        let files_owned = originals.clone();
+        // 原始(缩放前)路径:审批通过后发原画质 document 进频道帖评论区(发 photo 用缩放版)。
         // 全套图缩放(CPU 阻塞,放 blocking 线程);审批需要看到全部,批准后直接复用。
         let prepared = tokio::task::spawn_blocking(move || prepare_all(&files_owned)).await??;
 
@@ -1353,12 +1568,20 @@ impl Sink for TelegramSink {
                 let files_json = serde_json::to_string(&files_str)?;
                 let msg_json = serde_json::to_string(&msg_ids)?;
                 let originals_json = serde_json::to_string(&originals_str)?;
-                let item_meta = serde_json::to_string(item).unwrap_or_else(|_| "{}".into());
+                let item_meta = serde_json::to_string(&effective_item)?;
                 let db = self.state.db.lock().await;
-                db.execute(
+                let tx = db.unchecked_transaction()?;
+                tx.execute(
                     "INSERT OR REPLACE INTO pending(token, files, caption, msg_ids, originals, created_at, state, is_r18, item_meta) VALUES(?1,?2,?3,?4,?5,?6,'pending',?7,?8)",
-                    rusqlite::params![token as i64, files_json, caption, msg_json, originals_json, now_secs(), item.is_r18, item_meta],
+                    rusqlite::params![token as i64, files_json, caption, msg_json, originals_json, now_secs(), effective_item.is_r18, item_meta],
                 )?;
+                record_work(
+                    &tx,
+                    &effective_item,
+                    &kept_fingerprints,
+                    WorkStatus::Pending,
+                )?;
+                tx.commit()?;
                 Ok(())
             }
             .await
@@ -1556,6 +1779,17 @@ async fn finish_claimed(
             return Err(e).context("登记最近审批动作失败");
         }
     };
+    if let Ok(item) = serde_json::from_str::<MediaItem>(&work.item_meta) {
+        let db = state.db.lock().await;
+        let catalog_result = if publish {
+            mark_work_status(&db, &item, WorkStatus::Published)
+        } else {
+            remove_work(&db, &item)
+        };
+        if let Err(error) = catalog_result {
+            tracing::warn!(error = %error, token, "更新图片去重状态失败");
+        }
+    }
 
     for mid in &work.msg_ids {
         let _ = state
@@ -2366,6 +2600,14 @@ mod tests {
         assert!(cols.contains(&"state".to_string()));
         assert!(cols.contains(&"is_r18".to_string()));
         assert!(cols.contains(&"item_meta".to_string()));
+        let image_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='image_fingerprints'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(image_table, 1);
         let state: String = conn
             .query_row("SELECT state FROM pending WHERE token=1", [], |r| r.get(0))
             .unwrap();
@@ -2379,6 +2621,70 @@ mod tests {
             .query_row("SELECT is_r18 FROM pending WHERE token=1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(plain, 0);
+    }
+
+    #[test]
+    fn existing_pending_media_is_backfilled_into_image_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let image_path = dir.path().join("pending.png");
+        image::RgbImage::from_pixel(64, 48, image::Rgb([12, 34, 56]))
+            .save(&image_path)
+            .unwrap();
+        let item = crate::model::MediaItem {
+            source: crate::model::SourceKind::X,
+            source_id: "backfill-1".into(),
+            author: crate::model::Author {
+                name: "画师".into(),
+                url: "https://x.com/a".into(),
+            },
+            title: Some("旧待审".into()),
+            url: "https://x.com/a/status/1".into(),
+            tags: vec![],
+            bookmark_count: None,
+            is_r18: false,
+            pixiv_type: None,
+            page_count: 1,
+            images: vec![crate::model::ImageRef {
+                url: "https://example.test/1.png".into(),
+                referer: None,
+                fallback_urls: vec![],
+            }],
+            origin: "test".into(),
+        };
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pending(
+                token INTEGER PRIMARY KEY,
+                files TEXT NOT NULL,
+                caption TEXT NOT NULL,
+                msg_ids TEXT NOT NULL,
+                originals TEXT NOT NULL DEFAULT '[]',
+                created_at INTEGER NOT NULL DEFAULT 0,
+                state TEXT NOT NULL DEFAULT 'pending',
+                is_r18 INTEGER NOT NULL DEFAULT 0,
+                item_meta TEXT NOT NULL DEFAULT '{}'
+            );",
+        )
+        .unwrap();
+        init_image_dedup_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO pending(token,files,caption,msg_ids,originals,created_at,state,is_r18,item_meta)
+             VALUES(1,?1,'cap','[]',?1,1,'pending',0,?2)",
+            rusqlite::params![
+                serde_json::to_string(&vec![image_path.to_string_lossy().into_owned()]).unwrap(),
+                serde_json::to_string(&item).unwrap()
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(backfill_pending_image_catalog(&conn).unwrap(), 1);
+        assert_eq!(backfill_pending_image_catalog(&conn).unwrap(), 0);
+        let stored: i64 = conn
+            .query_row("SELECT COUNT(*) FROM image_fingerprints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, 1);
     }
 
     #[test]

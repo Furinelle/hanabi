@@ -2,8 +2,8 @@ use std::cmp::Ordering;
 use std::path::Path;
 
 use hanabi::image_dedup::{
-    classify_similarity, evaluate_work, init_schema, inspect_image, mark_work_status,
-    record_work, remove_work, render_review_notice, ExactAction, MatchKind, WorkStatus,
+    classify_similarity, evaluate_work, init_schema, inspect_image, mark_work_status, record_work,
+    remove_work, render_review_notice, ExactAction, MatchKind, WorkStatus,
 };
 use hanabi::model::{Author, ImageRef, MediaItem, SourceKind};
 use image::{ImageBuffer, Rgb, RgbImage};
@@ -45,7 +45,9 @@ fn patterned(width: u32, height: u32) -> RgbImage {
 }
 
 fn save_png(path: &Path, image: &RgbImage) {
-    image.save_with_format(path, image::ImageFormat::Png).unwrap();
+    image
+        .save_with_format(path, image::ImageFormat::Png)
+        .unwrap();
 }
 
 #[test]
@@ -59,7 +61,11 @@ fn strict_same_survives_resolution_change_and_prefers_more_pixels() {
     let small = inspect_image(&small_path).unwrap();
     let large = inspect_image(&large_path).unwrap();
 
-    assert_eq!(classify_similarity(&small, &large), MatchKind::StrictSame);
+    assert_eq!(
+        classify_similarity(&small, &large),
+        MatchKind::StrictSame,
+        "small={small:?} large={large:?}"
+    );
     assert_eq!(large.quality_cmp(&small), Ordering::Greater);
     assert_eq!(small.dimensions_label(), "320×240");
 }
@@ -122,7 +128,13 @@ fn catalog_replaces_pending_lower_quality_but_not_published_history() {
 
     let pixiv = item(SourceKind::Pixiv, "p1", "低清版");
     let x = item(SourceKind::X, "x1", "高清版");
-    record_work(&conn, &pixiv, std::slice::from_ref(&small), WorkStatus::Pending).unwrap();
+    record_work(
+        &conn,
+        &pixiv,
+        std::slice::from_ref(&small),
+        WorkStatus::Pending,
+    )
+    .unwrap();
 
     let pending = evaluate_work(&conn, &x, std::slice::from_ref(&large)).unwrap();
     assert!(matches!(

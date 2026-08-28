@@ -182,3 +182,38 @@ fn similar_notice_contains_both_sources_resolution_and_file_size() {
     assert!(notice.contains("640×480"));
     assert!(notice.contains("KiB"));
 }
+
+#[test]
+fn mixed_work_drops_only_strict_duplicate_images_and_keeps_unique_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let duplicate_path = dir.path().join("duplicate.png");
+    let unique_path = dir.path().join("unique.png");
+    save_png(&duplicate_path, &patterned(640, 480));
+    let unique = ImageBuffer::from_fn(640, 480, |x, y| {
+        Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8])
+    });
+    save_png(&unique_path, &unique);
+    let duplicate = inspect_image(&duplicate_path).unwrap();
+    let unique = inspect_image(&unique_path).unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    let old = item(SourceKind::Pixiv, "p3", "已收录");
+    let mut mixed = item(SourceKind::X, "x3", "两张图");
+    mixed.page_count = 2;
+    mixed.images.push(ImageRef {
+        url: "https://example.test/x3-2.png".into(),
+        referer: None,
+        fallback_urls: vec![],
+    });
+    record_work(
+        &conn,
+        &old,
+        std::slice::from_ref(&duplicate),
+        WorkStatus::Published,
+    )
+    .unwrap();
+
+    let evaluation = evaluate_work(&conn, &mixed, &[duplicate, unique]).unwrap();
+    assert!(matches!(evaluation.exact_action, ExactAction::None));
+    assert_eq!(evaluation.drop_current_indices, vec![0]);
+}

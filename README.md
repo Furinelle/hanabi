@@ -132,6 +132,14 @@ bot 启动后：抓取循环按 `poll_interval_secs` 定时跑，审批回调任
 
 图片指纹保存在同一个 `hanabi.db` 的 `image_fingerprints` 表。升级启动时会为仍存在原文件的旧待审项自动补建指纹；后续进入审批或手动直发成功的作品都会持续登记。已经发布到频道的旧版本不会被后台静默删除，因此“高清替换低清”只自动作用于尚未审批的严格同图；已发布记录优先用于阻止再次重复发布。
 
+对已经存在于图库中的历史原图，可先导出图片元数据并把对象下载到本地，再用同一套指纹规则生成只读整理报告：
+
+```bash
+cargo run --release --bin gallery_catalog -- manifest.json report.json
+```
+
+`manifest.json` 是 `CatalogImage` 数组，包含来源、作品、R2 key 与本地原图路径。报告把结果严格分为 `strict_groups` 和 `similar_pairs`：前者按总像素数、文件大小择优并列出可移除副本；后者绝不自动删除，供人工审批。工具本身不写 D1、R2 或 Telegram，实际整理必须先备份并单独执行。
+
 待审原图和 Telegram 发送文件默认保存在当前工作目录的 `pending/`。生产环境必须让该目录与 `hanabi.db` 一样落在持久磁盘；也可以显式指定绝对路径：
 
 ```bash

@@ -73,7 +73,12 @@ fn edited_image_is_review_only_and_does_not_enter_auto_remove_plan() {
     save(&edited_path, &edited);
 
     let report = scan_catalog(&[
-        entry(&original_path, SourceKind::Douyin, "d1", "douyin/original.png"),
+        entry(
+            &original_path,
+            SourceKind::Douyin,
+            "d1",
+            "douyin/original.png",
+        ),
         entry(&edited_path, SourceKind::X, "x2", "x/edited.png"),
     ])
     .unwrap();

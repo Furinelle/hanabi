@@ -1,7 +1,7 @@
 pub mod config;
 pub mod filter;
-pub mod gallery_catalog;
 pub mod gallery;
+pub mod gallery_catalog;
 pub mod gallery_outbox;
 pub mod gallery_repair;
 pub mod gallerydl;

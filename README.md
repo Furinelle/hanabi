@@ -24,7 +24,7 @@
 - ↩️ **误丢弃可撤销**：`/undo` 恢复最近一次误点 `❌ 丢弃` 的作品并重新生成审批卡片；最近动作已是发布时不会误撤销更早记录
 - ⌨️ **命令控制**：`/run` 手动抓一轮、`/approve` 一键批准发布、`/approve_archive` 一键批准并入库（配置 Vitrine 时）、`/undo`、`/status`、`/ping`、`/help`
 - ⏰ **定时轮询**：`poll_interval_secs` 可配（如一天三次 = 28800），`tz_offset_hours` 可配时区（默认 +8）
-- 🐳 **多种部署**：systemd / launchd / Docker（GHCR 镜像，含 gallery-dl）；预编译 x86_64 + aarch64 musl 静态二进制
+- 🐳 **多种部署**：systemd / launchd / Docker（含 gallery-dl）；Docker 镜像在实际部署主机上原生构建，只生成该主机对应的平台
 
 ## 前置依赖
 
@@ -241,7 +241,15 @@ From <Pixiv|X|抖音>(作品链接) By 作者名(作者链接)
 
 ### Docker Compose（推荐用于 VPS）
 
-镜像内含固定版本的 gallery-dl、`gallery_repair` 与 `restore_pending`。生产必须固定不可变版本，不能使用 `latest`。把 DB、pending、outbox 和配置作为一个状态目录挂到容器内固定的 `/opt/hanabi`，这样 SQLite 中已有的绝对图片路径在换 VPS 或重建容器后仍然有效：
+镜像内含固定版本的 gallery-dl、`gallery_repair` 与 `restore_pending`。发布时用已创建 tag 的干净源码在实际部署主机原生构建，不经 QEMU 构建其他平台：
+
+```bash
+./tools/build_on_target.sh <SSH 主机> vX.Y.Z
+```
+
+脚本会将该 tag 归档传到目标机的临时目录，用目标 Docker daemon 的原生架构构建 `ghcr.io/furinelle/hanabi:vX.Y.Z`，核对镜像架构与源码 revision，然后清理临时源码。GitHub Actions 只运行格式、测试和 Clippy，不再构建或发布容器。
+
+生产必须固定不可变版本，不能使用 `latest`。把 DB、pending、outbox 和配置作为一个状态目录挂到容器内固定的 `/opt/hanabi`，这样 SQLite 中已有的绝对图片路径在换 VPS 或重建容器后仍然有效：
 
 ```bash
 install -d -m 0700 /var/lib/hanabi /opt/hanabi-container
@@ -259,7 +267,7 @@ HANABI_GALLERY_TOKEN=<gallery token>
 
 cd /opt/hanabi-container
 docker compose config --quiet
-docker compose up -d
+docker compose up -d --pull never
 ```
 
 `/var/lib/hanabi` 内至少包含 `config.toml`、`gallery-dl.conf`、`hanabi.db`、`pending/` 与 `gallery-outbox/`，目录及文件应只允许运行 UID 读取。迁移时先停旧实例并执行 SQLite WAL checkpoint，再整体复制该目录；目标验证完成前不能启动第二个 Telegram polling 实例。Compose 使用只读根文件系统、空 capabilities、`no-new-privileges` 和有界日志轮转。

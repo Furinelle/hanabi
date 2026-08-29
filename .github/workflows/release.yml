@@ -1,9 +1,7 @@
-name: build
+name: check
 
-# push/PR 跑 lint+test;打 v* 标签时额外编译 musl 静态二进制(x86_64 + aarch64)并发布 Release。
-# 静态链接,跨发行版通用,服务器无需装 rust/编译,直接下载替换。
-# x86_64 用系统 musl-gcc;aarch64 用 cargo-zigbuild(zig 作交叉 C 编译器/链接器),
-# 能正确为 musl target 编译 rusqlite 的 bundled sqlite3.c(GNU 交叉工具链会引 glibc 专有符号失败)。
+# 发布镜像在实际部署主机上原生构建，只生成该主机的平台。
+# GitHub Actions 只做可重复的代码质量检查，不再构建 Release 二进制或多平台容器。
 on:
   push:
     branches: [master]
@@ -14,122 +12,17 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  lint:
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup component add clippy rustfmt
       - name: Format check
         run: cargo fmt --check
+      - name: Test
+        run: cargo test --all-targets
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
-
-  # x86_64: 系统 musl-gcc 交叉编译(已验证可用,保持不动)。
-  build-musl-x86_64:
-    runs-on: ubuntu-latest
-    env:
-      CC_x86_64_unknown_linux_musl: musl-gcc
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install musl tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
-      - name: Add musl target
-        run: rustup target add x86_64-unknown-linux-musl
-
-      - name: Test
-        run: cargo test --release
-
-      - name: Build (musl static)
-        run: cargo build --release --target x86_64-unknown-linux-musl
-
-      - name: Package
-        run: |
-          cd target/x86_64-unknown-linux-musl/release
-          tar czf hanabi-x86_64-unknown-linux-musl.tar.gz hanabi
-          sha256sum hanabi-x86_64-unknown-linux-musl.tar.gz > hanabi-x86_64-unknown-linux-musl.tar.gz.sha256
-          ls -la hanabi-x86_64-unknown-linux-musl.tar.gz*
-
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: |
-            target/x86_64-unknown-linux-musl/release/hanabi-x86_64-unknown-linux-musl.tar.gz
-            target/x86_64-unknown-linux-musl/release/hanabi-x86_64-unknown-linux-musl.tar.gz.sha256
-
-  # aarch64: cargo-zigbuild,zig 作交叉 C 编译器/链接器,正确为 musl 编 sqlite3.c。
-  # 不跑 test(x86_64 runner 无法直接执行 aarch64 二进制),只编译打包。
-  build-musl-aarch64:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.13.0
-
-      - name: Install cargo-zigbuild
-        run: cargo install --locked cargo-zigbuild
-
-      - name: Add aarch64 musl target
-        run: rustup target add aarch64-unknown-linux-musl
-
-      - name: Build (musl static, zigbuild)
-        run: cargo zigbuild --release --target aarch64-unknown-linux-musl
-
-      - name: Package
-        run: |
-          cd target/aarch64-unknown-linux-musl/release
-          tar czf hanabi-aarch64-unknown-linux-musl.tar.gz hanabi
-          sha256sum hanabi-aarch64-unknown-linux-musl.tar.gz > hanabi-aarch64-unknown-linux-musl.tar.gz.sha256
-          ls -la hanabi-aarch64-unknown-linux-musl.tar.gz*
-
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: |
-            target/aarch64-unknown-linux-musl/release/hanabi-aarch64-unknown-linux-musl.tar.gz
-            target/aarch64-unknown-linux-musl/release/hanabi-aarch64-unknown-linux-musl.tar.gz.sha256
-
-  docker:
-    runs-on: ubuntu-latest
-    # 仅正式 tag 构建并推 :latest;预发布 tag(含 '-',如 v0.4.1-rc1)跳过,避免覆盖生产 :latest。
-    if: startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-')
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ghcr.io/furinelle/hanabi
-          tags: |
-            type=ref,event=tag
-            type=raw,value=latest
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max

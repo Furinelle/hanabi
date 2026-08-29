@@ -121,11 +121,15 @@ pub struct DedupEvaluation {
 pub fn inspect_image(path: &Path) -> Result<ImageFingerprint> {
     let encoded =
         std::fs::read(path).with_context(|| format!("读取图片失败: {}", path.display()))?;
+    inspect_image_bytes(&encoded).with_context(|| format!("检查图片失败: {}", path.display()))
+}
+
+pub fn inspect_image_bytes(encoded: &[u8]) -> Result<ImageFingerprint> {
     let format = image::guess_format(&encoded)
         .map(|value| format!("{value:?}").to_ascii_uppercase())
         .unwrap_or_else(|_| "UNKNOWN".into());
     let image = image::load_from_memory(&encoded)
-        .with_context(|| format!("解码图片失败: {}", path.display()))?;
+        .context("解码图片失败")?;
     let width = image.width();
     let height = image.height();
     let visual = visual_fingerprint(&image);

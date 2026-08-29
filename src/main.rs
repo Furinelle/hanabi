@@ -96,6 +96,32 @@ async fn main() -> Result<()> {
         tracing::info!("未配置 [gallery],跳过图库入库");
         None
     };
+    if cfg.gallery.enabled() && cfg.gallery.fingerprint_sync_interval_secs > 0 {
+        let endpoint = cfg.gallery.endpoint.clone();
+        let token = cfg.gallery.resolved_token();
+        let interval = cfg.gallery.fingerprint_sync_interval_secs.max(300);
+        tokio::spawn(async move {
+            loop {
+                match hanabi::gallery_sync::sync_gallery_fingerprints(
+                    std::path::Path::new("hanabi.db"),
+                    &endpoint,
+                    &token,
+                )
+                .await
+                {
+                    Ok(summary) => tracing::info!(
+                        listed = summary.listed,
+                        imported = summary.imported,
+                        unchanged = summary.unchanged,
+                        failed = summary.failed,
+                        "Vitrine 图片指纹同步完成"
+                    ),
+                    Err(error) => tracing::warn!(error = %error, "Vitrine 图片指纹同步失败"),
+                }
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+            }
+        });
+    }
     // Arc 包裹:手动链接处理移入独立 task 时需克隆共享。
     let sink = Arc::new(TelegramSink::new(
         token,

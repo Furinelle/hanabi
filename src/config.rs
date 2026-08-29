@@ -28,6 +28,13 @@ pub struct GalleryCfg {
     /// 入库 token(与 Worker secret INGEST_TOKEN 一致)。也可用环境变量 HANABI_GALLERY_TOKEN。
     #[serde(default)]
     pub token: String,
+    /// 定期从 Vitrine 补齐已发布图片指纹；0 表示关闭。
+    #[serde(default = "default_gallery_fingerprint_sync_interval")]
+    pub fingerprint_sync_interval_secs: u64,
+}
+
+fn default_gallery_fingerprint_sync_interval() -> u64 {
+    6 * 3600
 }
 
 impl GalleryCfg {

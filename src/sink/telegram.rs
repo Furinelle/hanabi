@@ -2490,6 +2490,15 @@ fn similar_review_keyboard(token: i64, count: usize) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(rows)
 }
 
+fn similar_review_cleanup_message_ids(
+    media_message_ids: &[i32],
+    control_message_id: Option<i32>,
+) -> Vec<i32> {
+    let mut message_ids = media_message_ids.to_vec();
+    message_ids.extend(control_message_id);
+    message_ids
+}
+
 fn similar_confirm_keyboard(token: i64, index: usize) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![InlineKeyboardButton::callback(
@@ -2586,7 +2595,7 @@ async fn handle_similar_callback(
         let messages = similar_review_messages(&db, token)?;
         group.zip(messages)
     };
-    let Some((group, (_, control_id))) = claimed else {
+    let Some((group, (media_ids, control_id))) = claimed else {
         let _ = state
             .bot
             .answer_callback_query(q.id)
@@ -2606,9 +2615,9 @@ async fn handle_similar_callback(
 
     let state = state.clone();
     tokio::spawn(async move {
-        let result: Result<String> = async {
+        let result: Result<()> = async {
             match decision {
-                SimilarDecision::KeepAll => Ok("✅ 已审批：全部保留".into()),
+                SimilarDecision::KeepAll => Ok(()),
                 SimilarDecision::ConfirmKeep(index) => {
                     let keep = &group.images[index - 1];
                     let remove: Vec<String> = group
@@ -2627,9 +2636,8 @@ async fn handle_similar_callback(
                         .await?;
                     let db = state.db.lock().await;
                     remove_pruned_fingerprints(&db, &group, index)?;
-                    Ok(format!(
-                        "✅ 已审批：仅保留 #{index}，已移除 {removed} 张（有回收备份）"
-                    ))
+                    tracing::info!(token, keep_index = index, removed, "相似图审批整理完成");
+                    Ok(())
                 }
                 _ => unreachable!(),
             }
@@ -2637,7 +2645,7 @@ async fn handle_similar_callback(
         .await;
 
         match result {
-            Ok(text) => {
+            Ok(()) => {
                 {
                     let db = state.db.lock().await;
                     if let Err(error) = finish_similar_review(&db, token, decision) {
@@ -2645,14 +2653,21 @@ async fn handle_similar_callback(
                         return;
                     }
                 }
-                if let Some(message_id) = control_id {
-                    let _ = state
-                        .bot
-                        .edit_message_text(state.review_chat.clone(), MessageId(message_id), text)
-                        .reply_markup(InlineKeyboardMarkup::new(
-                            Vec::<Vec<InlineKeyboardButton>>::new(),
-                        ))
-                        .await;
+                for message_id in similar_review_cleanup_message_ids(&media_ids, control_id) {
+                    if let Err(error) = tg_retry(|| {
+                        state
+                            .bot
+                            .delete_message(state.review_chat.clone(), MessageId(message_id))
+                    })
+                    .await
+                    {
+                        tracing::warn!(
+                            token,
+                            message_id,
+                            error = %error,
+                            "删除已完成的相似图审批消息失败"
+                        );
+                    }
                 }
             }
             Err(error) => {

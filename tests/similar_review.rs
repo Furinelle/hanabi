@@ -30,7 +30,8 @@ fn review_registration_is_persistent_and_idempotent() {
     let second = register_review(&conn, &group()).unwrap();
     assert_eq!(first, second);
     assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM similar_reviews", [], |row| row.get::<_, i64>(0))
+        conn.query_row("SELECT COUNT(*) FROM similar_reviews", [], |row| row
+            .get::<_, i64>(0))
             .unwrap(),
         1
     );
@@ -79,4 +80,20 @@ fn review_claim_is_single_owner_and_can_be_restored_after_failure() {
     assert!(claim_review(&conn, token, SimilarDecision::KeepAll)
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn initialization_recovers_interrupted_review() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    let token = register_review(&conn, &group()).unwrap();
+    assert!(claim_review(&conn, token, SimilarDecision::KeepAll)
+        .unwrap()
+        .is_some());
+
+    init_schema(&conn).unwrap();
+
+    assert!(claim_review(&conn, token, SimilarDecision::KeepAll)
+        .unwrap()
+        .is_some());
 }

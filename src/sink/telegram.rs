@@ -2684,6 +2684,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn similar_review_control_text_does_not_repeat_album_details() {
+        let group = SimilarReviewGroup {
+            group_key: "douyin-group".into(),
+            images: vec![
+                crate::similar_review::SimilarReviewImage {
+                    image_id: "douyin:1#0".into(),
+                    r2_key: "douyin/1/0.jpg".into(),
+                    label: "douyin:1 p0 · 2844×1600 · 1.3 MiB · verty".into(),
+                },
+                crate::similar_review::SimilarReviewImage {
+                    image_id: "douyin:1#1".into(),
+                    r2_key: "douyin/1/1.jpg".into(),
+                    label: "douyin:1 p1 · 2844×1600 · 1.6 MiB · verty".into(),
+                },
+            ],
+        };
+
+        let text = similar_review_text(74, &group);
+
+        assert_eq!(text, "🔎 相似图审批 #74\n👆 上面 2 张，请审批");
+        assert!(!text.contains("douyin:1"));
+        assert!(!text.contains("请选择处理方式"));
+    }
+
+    #[test]
     fn cleanup_due_after_interval() {
         assert!(!cleanup_due(1000, 1000 + 6 * 3600 - 1, 6 * 3600));
         assert!(cleanup_due(1000, 1000 + 6 * 3600, 6 * 3600));

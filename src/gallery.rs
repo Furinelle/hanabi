@@ -79,6 +79,7 @@ impl GalleryClient {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(180))
             .connect_timeout(std::time::Duration::from_secs(15))
+            .user_agent(concat!("hanabi/", env!("CARGO_PKG_VERSION")))
             .trust_dns(true)
             .build()
             .context("构造 gallery http client 失败")?;

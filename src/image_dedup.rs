@@ -125,10 +125,10 @@ pub fn inspect_image(path: &Path) -> Result<ImageFingerprint> {
 }
 
 pub fn inspect_image_bytes(encoded: &[u8]) -> Result<ImageFingerprint> {
-    let format = image::guess_format(&encoded)
+    let format = image::guess_format(encoded)
         .map(|value| format!("{value:?}").to_ascii_uppercase())
         .unwrap_or_else(|_| "UNKNOWN".into());
-    let image = image::load_from_memory(&encoded).context("解码图片失败")?;
+    let image = image::load_from_memory(encoded).context("解码图片失败")?;
     let width = image.width();
     let height = image.height();
     let visual = visual_fingerprint(&image);
@@ -137,7 +137,7 @@ pub fn inspect_image_bytes(encoded: &[u8]) -> Result<ImageFingerprint> {
     let regions = split_regions(&image);
 
     Ok(ImageFingerprint {
-        content_sha256: hex_digest(&encoded),
+        content_sha256: hex_digest(encoded),
         strict_key,
         average_hash: visual.0,
         difference_hash: visual.1,

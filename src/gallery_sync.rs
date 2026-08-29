@@ -140,6 +140,7 @@ pub async fn sync_gallery_fingerprints(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(180))
         .connect_timeout(Duration::from_secs(15))
+        .user_agent(concat!("hanabi-catalog-sync/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("构造图库指纹同步客户端失败")?;
     let conn = Connection::open(db_path).context("打开图片指纹数据库失败")?;

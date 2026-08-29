@@ -2704,6 +2704,18 @@ mod tests {
     }
 
     #[test]
+    fn similar_review_cleanup_includes_album_and_control_messages() {
+        assert_eq!(
+            similar_review_cleanup_message_ids(&[101, 102, 103], Some(104)),
+            vec![101, 102, 103, 104]
+        );
+        assert_eq!(
+            similar_review_cleanup_message_ids(&[201, 202], None),
+            vec![201, 202]
+        );
+    }
+
+    #[test]
     fn cleanup_due_after_interval() {
         assert!(!cleanup_due(1000, 1000 + 6 * 3600 - 1, 6 * 3600));
         assert!(cleanup_due(1000, 1000 + 6 * 3600, 6 * 3600));

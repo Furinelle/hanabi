@@ -10,6 +10,7 @@ pub mod image_dedup;
 pub mod model;
 pub mod pipeline;
 pub mod sink;
+pub mod similar_review;
 pub mod source;
 pub mod store;
 pub mod util;

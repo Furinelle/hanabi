@@ -2470,15 +2470,10 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
 }
 
 fn similar_review_text(token: i64, group: &SimilarReviewGroup) -> String {
-    let mut lines = vec![format!("🔎 相似图审批 #{token}"), "请选择处理方式：".into()];
-    lines.extend(
-        group
-            .images
-            .iter()
-            .enumerate()
-            .map(|(index, image)| format!("{}. {}", index + 1, image.label)),
-    );
-    lines.join("\n")
+    format!(
+        "🔎 相似图审批 #{token}\n👆 上面 {} 张，请审批",
+        group.images.len()
+    )
 }
 
 fn similar_review_keyboard(token: i64, count: usize) -> InlineKeyboardMarkup {

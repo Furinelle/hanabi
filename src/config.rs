@@ -200,4 +200,22 @@ filters = { r18 = false, min_bookmarks = 500, tags = ["原神"], illust_only = t
         assert!(bm.filters.illust_only);
         assert_eq!(bm.filters.max_pages, Some(5));
     }
+
+    #[test]
+    fn gallery_fingerprint_sync_defaults_to_six_hours() {
+        let cfg: Config = toml::from_str(
+            r#"
+poll_interval_secs = 21600
+[telegram]
+channel_id = "1"
+[gallery_dl]
+config_path = "gallery-dl.conf"
+[gallery]
+endpoint = "https://gallery.example"
+token = "secret"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.gallery.fingerprint_sync_interval_secs, 21600);
+    }
 }

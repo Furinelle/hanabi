@@ -77,9 +77,7 @@ fn changed_catalog_image_updates_one_page_without_deleting_siblings() {
     assert!(import_catalog_image(&conn, &changed, &fingerprint("sha-c")).unwrap());
 
     let rows: Vec<(i64, String)> = conn
-        .prepare(
-            "SELECT image_index,content_sha256 FROM image_fingerprints ORDER BY image_index",
-        )
+        .prepare("SELECT image_index,content_sha256 FROM image_fingerprints ORDER BY image_index")
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .unwrap()

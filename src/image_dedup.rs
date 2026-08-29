@@ -128,8 +128,7 @@ pub fn inspect_image_bytes(encoded: &[u8]) -> Result<ImageFingerprint> {
     let format = image::guess_format(&encoded)
         .map(|value| format!("{value:?}").to_ascii_uppercase())
         .unwrap_or_else(|_| "UNKNOWN".into());
-    let image = image::load_from_memory(&encoded)
-        .context("解码图片失败")?;
+    let image = image::load_from_memory(&encoded).context("解码图片失败")?;
     let width = image.width();
     let height = image.height();
     let visual = visual_fingerprint(&image);

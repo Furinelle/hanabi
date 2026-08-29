@@ -22,6 +22,12 @@ use crate::image_dedup::{
     WorkStatus, WorkSummary,
 };
 use crate::model::MediaItem;
+use crate::similar_review::{
+    claim_review as claim_similar_review, finish_review as finish_similar_review,
+    init_schema as init_similar_review_schema, load_review as load_similar_review,
+    parse_callback as parse_similar_callback, restore_review as restore_similar_review,
+    review_messages as similar_review_messages, SimilarDecision, SimilarReviewGroup,
+};
 use crate::sink::{needs_downscale, render_caption, Sink};
 
 /// Telegram photo 缩放目标边长上限(超限按比例缩到此框内)。
@@ -161,6 +167,7 @@ impl TelegramSink {
         )
         .context("初始化 pending 表失败")?;
         init_image_dedup_schema(&conn).context("初始化图片去重表失败")?;
+        init_similar_review_schema(&conn).context("初始化相似图审批表失败")?;
         // 兼容旧库:补列,已存在则忽略报错。
         let _ = conn.execute(
             "ALTER TABLE pending ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
@@ -2371,6 +2378,9 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
         return Ok(());
     }
     let data = q.data.clone().unwrap_or_default();
+    if let Some((token, decision)) = parse_similar_callback(&data) {
+        return handle_similar_callback(state, q, token, decision).await;
+    }
     let (action, token_str) = data.split_once(':').unwrap_or(("", ""));
     let token: i64 = token_str.parse().unwrap_or(-1);
 
@@ -2453,6 +2463,216 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
                 tracing::error!(error = %join_err, token, "审批任务异常退出,恢复待审状态");
                 let db = state.db.lock().await;
                 let _ = restore_pending(&db, token);
+            }
+        }
+    });
+    Ok(())
+}
+
+fn similar_review_text(token: i64, group: &SimilarReviewGroup) -> String {
+    let mut lines = vec![format!("🔎 相似图审批 #{token}"), "请选择处理方式：".into()];
+    lines.extend(
+        group
+            .images
+            .iter()
+            .enumerate()
+            .map(|(index, image)| format!("{}. {}", index + 1, image.label)),
+    );
+    lines.join("\n")
+}
+
+fn similar_review_keyboard(token: i64, count: usize) -> InlineKeyboardMarkup {
+    let mut rows = vec![vec![InlineKeyboardButton::callback(
+        "✅ 全部保留",
+        format!("similar:{token}:all"),
+    )]];
+    for index in 1..=count {
+        rows.push(vec![InlineKeyboardButton::callback(
+            format!("只保留 #{index}"),
+            format!("similar:{token}:keep:{index}"),
+        )]);
+    }
+    InlineKeyboardMarkup::new(rows)
+}
+
+fn similar_confirm_keyboard(token: i64, index: usize) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback(
+            format!("⚠️ 确认仅保留 #{index}"),
+            format!("similar:{token}:confirm:{index}"),
+        )],
+        vec![InlineKeyboardButton::callback(
+            "↩️ 返回",
+            format!("similar:{token}:cancel"),
+        )],
+    ])
+}
+
+fn remove_pruned_fingerprints(
+    conn: &rusqlite::Connection,
+    group: &SimilarReviewGroup,
+    keep_index: usize,
+) -> Result<()> {
+    for (index, image) in group.images.iter().enumerate() {
+        if index + 1 == keep_index {
+            continue;
+        }
+        let Some((work_id, image_index)) = image.image_id.rsplit_once('#') else {
+            continue;
+        };
+        let Some((source, source_id)) = work_id.split_once(':') else {
+            continue;
+        };
+        let Ok(image_index) = image_index.parse::<i64>() else {
+            continue;
+        };
+        conn.execute(
+            "DELETE FROM image_fingerprints WHERE source_kind=?1 AND source_id=?2 AND image_index=?3",
+            rusqlite::params![source, source_id, image_index],
+        )?;
+    }
+    Ok(())
+}
+
+async fn handle_similar_callback(
+    state: &Arc<ReviewState>,
+    q: CallbackQuery,
+    token: i64,
+    decision: SimilarDecision,
+) -> Result<()> {
+    match decision {
+        SimilarDecision::SelectKeep(_) | SimilarDecision::Cancel => {
+            let loaded = {
+                let db = state.db.lock().await;
+                let group = load_similar_review(&db, token)?;
+                let messages = similar_review_messages(&db, token)?;
+                group.zip(messages)
+            };
+            let Some((group, (_, Some(control_id)))) = loaded else {
+                let _ = state
+                    .bot
+                    .answer_callback_query(q.id)
+                    .text("该组已处理或失效")
+                    .await;
+                return Ok(());
+            };
+            if matches!(decision, SimilarDecision::SelectKeep(index) if index == 0 || index > group.images.len())
+            {
+                let _ = state
+                    .bot
+                    .answer_callback_query(q.id)
+                    .text("无效图片序号")
+                    .await;
+                return Ok(());
+            }
+            let keyboard = match decision {
+                SimilarDecision::SelectKeep(index) => similar_confirm_keyboard(token, index),
+                SimilarDecision::Cancel => similar_review_keyboard(token, group.images.len()),
+                _ => unreachable!(),
+            };
+            let _ = state.bot.answer_callback_query(q.id).await;
+            state
+                .bot
+                .edit_message_text(
+                    state.review_chat.clone(),
+                    MessageId(control_id),
+                    similar_review_text(token, &group),
+                )
+                .reply_markup(keyboard)
+                .await?;
+            return Ok(());
+        }
+        SimilarDecision::KeepAll | SimilarDecision::ConfirmKeep(_) => {}
+    }
+
+    let claimed = {
+        let db = state.db.lock().await;
+        let group = claim_similar_review(&db, token, decision)?;
+        let messages = similar_review_messages(&db, token)?;
+        group.zip(messages)
+    };
+    let Some((group, (_, control_id))) = claimed else {
+        let _ = state
+            .bot
+            .answer_callback_query(q.id)
+            .text("该组已处理或正在处理中")
+            .await;
+        return Ok(());
+    };
+    let _ = state
+        .bot
+        .answer_callback_query(q.id)
+        .text(match decision {
+            SimilarDecision::KeepAll => "✅ 已记录全部保留",
+            SimilarDecision::ConfirmKeep(_) => "⏳ 正在备份并整理图库…",
+            _ => unreachable!(),
+        })
+        .await;
+
+    let state = state.clone();
+    tokio::spawn(async move {
+        let result: Result<String> = async {
+            match decision {
+                SimilarDecision::KeepAll => Ok("✅ 已审批：全部保留".into()),
+                SimilarDecision::ConfirmKeep(index) => {
+                    let keep = &group.images[index - 1];
+                    let remove: Vec<String> = group
+                        .images
+                        .iter()
+                        .enumerate()
+                        .filter(|(position, _)| position + 1 != index)
+                        .map(|(_, image)| image.r2_key.clone())
+                        .collect();
+                    let gallery = state
+                        .gallery
+                        .as_ref()
+                        .context("Vitrine 未配置，不能执行相似图整理")?;
+                    let removed = gallery
+                        .prune_similar(&format!("hanabi-similar-{token}"), &keep.r2_key, &remove)
+                        .await?;
+                    let db = state.db.lock().await;
+                    remove_pruned_fingerprints(&db, &group, index)?;
+                    Ok(format!(
+                        "✅ 已审批：仅保留 #{index}，已移除 {removed} 张（有回收备份）"
+                    ))
+                }
+                _ => unreachable!(),
+            }
+        }
+        .await;
+
+        match result {
+            Ok(text) => {
+                {
+                    let db = state.db.lock().await;
+                    if let Err(error) = finish_similar_review(&db, token, decision) {
+                        tracing::error!(token, error = %error, "写入相似图审批结果失败");
+                        return;
+                    }
+                }
+                if let Some(message_id) = control_id {
+                    let _ = state
+                        .bot
+                        .edit_message_text(state.review_chat.clone(), MessageId(message_id), text)
+                        .reply_markup(InlineKeyboardMarkup::new(
+                            Vec::<Vec<InlineKeyboardButton>>::new(),
+                        ))
+                        .await;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(token, error = %error, "相似图审批失败，恢复按钮");
+                {
+                    let db = state.db.lock().await;
+                    let _ = restore_similar_review(&db, token);
+                }
+                let _ = state
+                    .bot
+                    .send_message(
+                        state.review_chat.clone(),
+                        format!("⚠️ 相似图审批 #{token} 失败，原图未删除，可重新操作"),
+                    )
+                    .await;
             }
         }
     });

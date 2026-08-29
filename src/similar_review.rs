@@ -50,6 +50,10 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_similar_reviews_state
            ON similar_reviews(state, created_at);",
     )?;
+    conn.execute(
+        "UPDATE similar_reviews SET state='pending',decision=NULL WHERE state='processing'",
+        [],
+    )?;
     Ok(())
 }
 
@@ -97,6 +101,17 @@ pub fn review_messages(conn: &Connection, token: i64) -> Result<Option<(Vec<i32>
     )
     .optional()?
     .map(|(ids, control)| Ok((serde_json::from_str(&ids)?, control)))
+    .transpose()
+}
+
+pub fn load_review(conn: &Connection, token: i64) -> Result<Option<SimilarReviewGroup>> {
+    conn.query_row(
+        "SELECT payload_json FROM similar_reviews WHERE token=?1 AND state='pending'",
+        params![token],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()?
+    .map(|payload| Ok(serde_json::from_str(&payload)?))
     .transpose()
 }
 

@@ -8,6 +8,19 @@ use sha2::{Digest, Sha256};
 
 use crate::model::MediaItem;
 
+#[derive(Debug, serde::Serialize)]
+struct CatalogPruneRequest<'a> {
+    decision_id: &'a str,
+    keep_r2_key: &'a str,
+    remove_r2_keys: &'a [String],
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CatalogPruneResponse {
+    ok: bool,
+    removed: usize,
+}
+
 #[derive(Debug)]
 pub struct GalleryIngestError {
     message: String,
@@ -146,6 +159,48 @@ impl GalleryClient {
             "图库入库成功: {body}"
         );
         Ok(())
+    }
+
+    pub async fn prune_similar(
+        &self,
+        decision_id: &str,
+        keep_r2_key: &str,
+        remove_r2_keys: &[String],
+    ) -> std::result::Result<usize, GalleryIngestError> {
+        let url = format!("{}/api/catalog/prune", self.endpoint);
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(&self.token)
+            .json(&CatalogPruneRequest {
+                decision_id,
+                keep_r2_key,
+                remove_r2_keys,
+            })
+            .send()
+            .await
+            .map_err(|error| {
+                GalleryIngestError::transient(format!("请求 Vitrine 相似图整理失败: {error}"))
+            })?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let message = format!("Vitrine 相似图整理 HTTP {status}: {body}");
+            return Err(if retryable_status(status) {
+                GalleryIngestError::transient(message)
+            } else {
+                GalleryIngestError::permanent(message)
+            });
+        }
+        let parsed: CatalogPruneResponse = serde_json::from_str(&body).map_err(|error| {
+            GalleryIngestError::transient(format!("解析 Vitrine 相似图整理响应失败: {error}"))
+        })?;
+        if !parsed.ok {
+            return Err(GalleryIngestError::transient(
+                "Vitrine 相似图整理返回 ok=false",
+            ));
+        }
+        Ok(parsed.removed)
     }
 }
 

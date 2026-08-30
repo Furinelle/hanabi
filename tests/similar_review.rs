@@ -22,6 +22,34 @@ fn group() -> SimilarReviewGroup {
     }
 }
 
+fn multi_page_group() -> SimilarReviewGroup {
+    SimilarReviewGroup {
+        group_key: "group-multi-page".into(),
+        images: vec![
+            SimilarReviewImage {
+                image_id: "douyin:10#0".into(),
+                r2_key: "douyin/10/a/00.jpg".into(),
+                label: "douyin:10 p0".into(),
+            },
+            SimilarReviewImage {
+                image_id: "douyin:10#1".into(),
+                r2_key: "douyin/10/a/01.jpg".into(),
+                label: "douyin:10 p1".into(),
+            },
+            SimilarReviewImage {
+                image_id: "pixiv:20#0".into(),
+                r2_key: "pixiv/20/b/00.png".into(),
+                label: "pixiv:20 p0".into(),
+            },
+            SimilarReviewImage {
+                image_id: "pixiv:20#1".into(),
+                r2_key: "pixiv/20/b/01.png".into(),
+                label: "pixiv:20 p1".into(),
+            },
+        ],
+    }
+}
+
 #[test]
 fn review_registration_is_persistent_and_idempotent() {
     let conn = Connection::open_in_memory().unwrap();
@@ -80,6 +108,22 @@ fn review_claim_is_single_owner_and_can_be_restored_after_failure() {
     assert!(claim_review(&conn, token, SimilarDecision::KeepAll)
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn multi_page_posts_are_each_one_review_choice() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    let token = register_review(&conn, &multi_page_group()).unwrap();
+
+    assert!(claim_review(&conn, token, SimilarDecision::ConfirmKeep(3))
+        .unwrap()
+        .is_none());
+    let claimed = claim_review(&conn, token, SimilarDecision::ConfirmKeep(2))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(claimed.images.len(), 4);
 }
 
 #[test]

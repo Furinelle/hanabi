@@ -9,10 +9,42 @@ pub struct SimilarReviewImage {
     pub label: String,
 }
 
+impl SimilarReviewImage {
+    pub fn work_id(&self) -> &str {
+        self.image_id
+            .rsplit_once('#')
+            .map_or(self.image_id.as_str(), |(work_id, _)| work_id)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SimilarReviewGroup {
     pub group_key: String,
     pub images: Vec<SimilarReviewImage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimilarReviewPost {
+    pub work_id: String,
+    pub image_indices: Vec<usize>,
+}
+
+impl SimilarReviewGroup {
+    pub fn posts(&self) -> Vec<SimilarReviewPost> {
+        let mut posts: Vec<SimilarReviewPost> = Vec::new();
+        for (index, image) in self.images.iter().enumerate() {
+            let work_id = image.work_id();
+            if let Some(post) = posts.iter_mut().find(|post| post.work_id == work_id) {
+                post.image_indices.push(index);
+            } else {
+                posts.push(SimilarReviewPost {
+                    work_id: work_id.into(),
+                    image_indices: vec![index],
+                });
+            }
+        }
+        posts
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,7 +169,7 @@ pub fn claim_review(
     };
     let group: SimilarReviewGroup = serde_json::from_str(&payload)?;
     if let Some(index) = keep_index {
-        if index == 0 || index > group.images.len() {
+        if index == 0 || index > group.posts().len() {
             return Ok(None);
         }
     }

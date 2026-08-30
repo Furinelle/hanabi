@@ -2476,15 +2476,19 @@ fn similar_review_text(token: i64, group: &SimilarReviewGroup) -> String {
     )
 }
 
-fn similar_review_keyboard(token: i64, count: usize) -> InlineKeyboardMarkup {
+fn similar_review_keyboard(token: i64, group: &SimilarReviewGroup) -> InlineKeyboardMarkup {
     let mut rows = vec![vec![InlineKeyboardButton::callback(
         "✅ 全部保留",
         format!("similar:{token}:all"),
     )]];
-    for index in 1..=count {
+    for (index, post) in group.posts().iter().enumerate() {
         rows.push(vec![InlineKeyboardButton::callback(
-            format!("只保留 #{index}"),
-            format!("similar:{token}:keep:{index}"),
+            format!(
+                "只保留 {} 全组（{} 张）",
+                post.work_id,
+                post.image_indices.len()
+            ),
+            format!("similar:{token}:keep:{}", index + 1),
         )]);
     }
     InlineKeyboardMarkup::new(rows)
@@ -2499,10 +2503,19 @@ fn similar_review_cleanup_message_ids(
     message_ids
 }
 
-fn similar_confirm_keyboard(token: i64, index: usize) -> InlineKeyboardMarkup {
+fn similar_confirm_keyboard(
+    token: i64,
+    group: &SimilarReviewGroup,
+    index: usize,
+) -> InlineKeyboardMarkup {
+    let post = &group.posts()[index - 1];
     InlineKeyboardMarkup::new(vec![
         vec![InlineKeyboardButton::callback(
-            format!("⚠️ 确认仅保留 #{index}"),
+            format!(
+                "⚠️ 确认仅保留 {} 全组（{} 张）",
+                post.work_id,
+                post.image_indices.len()
+            ),
             format!("similar:{token}:confirm:{index}"),
         )],
         vec![InlineKeyboardButton::callback(
@@ -2512,13 +2525,39 @@ fn similar_confirm_keyboard(token: i64, index: usize) -> InlineKeyboardMarkup {
     ])
 }
 
+struct SimilarPrunePlan {
+    keep_work_id: String,
+    keep_r2_key: String,
+    remove_r2_keys: Vec<String>,
+}
+
+fn similar_prune_plan(
+    group: &SimilarReviewGroup,
+    keep_post_index: usize,
+) -> Option<SimilarPrunePlan> {
+    let posts = group.posts();
+    let keep_post = posts.get(keep_post_index.checked_sub(1)?)?;
+    let keep_image = &group.images[*keep_post.image_indices.first()?];
+    Some(SimilarPrunePlan {
+        keep_work_id: keep_post.work_id.clone(),
+        keep_r2_key: keep_image.r2_key.clone(),
+        remove_r2_keys: group
+            .images
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !keep_post.image_indices.contains(index))
+            .map(|(_, image)| image.r2_key.clone())
+            .collect(),
+    })
+}
+
 fn remove_pruned_fingerprints(
     conn: &rusqlite::Connection,
     group: &SimilarReviewGroup,
-    keep_index: usize,
+    keep_work_id: &str,
 ) -> Result<()> {
-    for (index, image) in group.images.iter().enumerate() {
-        if index + 1 == keep_index {
+    for image in &group.images {
+        if image.work_id() == keep_work_id {
             continue;
         }
         let Some((work_id, image_index)) = image.image_id.rsplit_once('#') else {
@@ -2560,7 +2599,7 @@ async fn handle_similar_callback(
                     .await;
                 return Ok(());
             };
-            if matches!(decision, SimilarDecision::SelectKeep(index) if index == 0 || index > group.images.len())
+            if matches!(decision, SimilarDecision::SelectKeep(index) if index == 0 || index > group.posts().len())
             {
                 let _ = state
                     .bot
@@ -2570,8 +2609,10 @@ async fn handle_similar_callback(
                 return Ok(());
             }
             let keyboard = match decision {
-                SimilarDecision::SelectKeep(index) => similar_confirm_keyboard(token, index),
-                SimilarDecision::Cancel => similar_review_keyboard(token, group.images.len()),
+                SimilarDecision::SelectKeep(index) => {
+                    similar_confirm_keyboard(token, &group, index)
+                }
+                SimilarDecision::Cancel => similar_review_keyboard(token, &group),
                 _ => unreachable!(),
             };
             let _ = state.bot.answer_callback_query(q.id).await;
@@ -2619,24 +2660,28 @@ async fn handle_similar_callback(
             match decision {
                 SimilarDecision::KeepAll => Ok(()),
                 SimilarDecision::ConfirmKeep(index) => {
-                    let keep = &group.images[index - 1];
-                    let remove: Vec<String> = group
-                        .images
-                        .iter()
-                        .enumerate()
-                        .filter(|(position, _)| position + 1 != index)
-                        .map(|(_, image)| image.r2_key.clone())
-                        .collect();
+                    let plan = similar_prune_plan(&group, index)
+                        .context("相似图审批选择的帖子序号无效")?;
                     let gallery = state
                         .gallery
                         .as_ref()
                         .context("Vitrine 未配置，不能执行相似图整理")?;
                     let removed = gallery
-                        .prune_similar(&format!("hanabi-similar-{token}"), &keep.r2_key, &remove)
+                        .prune_similar(
+                            &format!("hanabi-similar-{token}"),
+                            &plan.keep_r2_key,
+                            &plan.remove_r2_keys,
+                        )
                         .await?;
                     let db = state.db.lock().await;
-                    remove_pruned_fingerprints(&db, &group, index)?;
-                    tracing::info!(token, keep_index = index, removed, "相似图审批整理完成");
+                    remove_pruned_fingerprints(&db, &group, &plan.keep_work_id)?;
+                    tracing::info!(
+                        token,
+                        keep_index = index,
+                        keep_work_id = plan.keep_work_id,
+                        removed,
+                        "相似图审批整理完成"
+                    );
                     Ok(())
                 }
                 _ => unreachable!(),
@@ -2693,6 +2738,34 @@ async fn handle_similar_callback(
 mod tests {
     use super::*;
 
+    fn multi_post_similar_group() -> SimilarReviewGroup {
+        SimilarReviewGroup {
+            group_key: "multi-page".into(),
+            images: vec![
+                crate::similar_review::SimilarReviewImage {
+                    image_id: "douyin:10#0".into(),
+                    r2_key: "douyin/10/a/00.jpg".into(),
+                    label: "douyin:10 p0".into(),
+                },
+                crate::similar_review::SimilarReviewImage {
+                    image_id: "douyin:10#1".into(),
+                    r2_key: "douyin/10/a/01.jpg".into(),
+                    label: "douyin:10 p1".into(),
+                },
+                crate::similar_review::SimilarReviewImage {
+                    image_id: "pixiv:20#0".into(),
+                    r2_key: "pixiv/20/b/00.png".into(),
+                    label: "pixiv:20 p0".into(),
+                },
+                crate::similar_review::SimilarReviewImage {
+                    image_id: "pixiv:20#1".into(),
+                    r2_key: "pixiv/20/b/01.png".into(),
+                    label: "pixiv:20 p1".into(),
+                },
+            ],
+        }
+    }
+
     #[test]
     fn similar_review_control_text_does_not_repeat_album_details() {
         let group = SimilarReviewGroup {
@@ -2727,6 +2800,74 @@ mod tests {
         assert_eq!(
             similar_review_cleanup_message_ids(&[201, 202], None),
             vec![201, 202]
+        );
+    }
+
+    #[test]
+    fn multi_page_review_buttons_offer_one_choice_per_post() {
+        let keyboard = similar_review_keyboard(91, &multi_post_similar_group());
+        let value = serde_json::to_value(keyboard).unwrap();
+        let rows = value["inline_keyboard"].as_array().unwrap();
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1][0]["text"], "只保留 douyin:10 全组（2 张）");
+        assert_eq!(rows[1][0]["callback_data"], "similar:91:keep:1");
+        assert_eq!(rows[2][0]["text"], "只保留 pixiv:20 全组（2 张）");
+        assert_eq!(rows[2][0]["callback_data"], "similar:91:keep:2");
+    }
+
+    #[test]
+    fn selecting_one_post_keeps_all_its_differential_pages() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE image_fingerprints(
+                source_kind TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                image_index INTEGER NOT NULL
+             );
+             INSERT INTO image_fingerprints VALUES
+                ('douyin','10',0),('douyin','10',1),
+                ('pixiv','20',0),('pixiv','20',1);",
+        )
+        .unwrap();
+        let group = multi_post_similar_group();
+
+        remove_pruned_fingerprints(&conn, &group, "pixiv:20").unwrap();
+
+        let remaining = conn
+            .prepare(
+                "SELECT source_kind,source_id,image_index
+                 FROM image_fingerprints ORDER BY source_kind,source_id,image_index",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            remaining,
+            vec![
+                ("pixiv".into(), "20".into(), 0),
+                ("pixiv".into(), "20".into(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn selected_post_prune_plan_removes_only_the_other_posts() {
+        let plan = similar_prune_plan(&multi_post_similar_group(), 2).unwrap();
+
+        assert_eq!(plan.keep_work_id, "pixiv:20");
+        assert_eq!(plan.keep_r2_key, "pixiv/20/b/00.png");
+        assert_eq!(
+            plan.remove_r2_keys,
+            vec!["douyin/10/a/00.jpg", "douyin/10/a/01.jpg"]
         );
     }
 

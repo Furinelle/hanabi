@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-30
+
+### 新增
+- 频道发布成功后把 Telegram `chat_id` 与每条实际 message ID 随 Vitrine 入库写入 D1；`full` 与 `partial` 发送都记录 Telegram 真正创建的消息。
+- 相似图审批改为整部作品删除：先在 Vitrine 备份并隐藏落选作品，再按 D1 mapping 删除频道消息，最后完成 D1 receipt。中途失败会把审批恢复为 pending，本地指纹保留，同一决策可安全重试。
+- 落选作品没有完整、明确的在线 Telegram mapping 时拒绝删除，不会按标题、作者、时间或图像相似做模糊删除。
+- 增加精确历史 mapping 回填工具 `tools/backfill_telegram_publications.py`；默认 dry-run，`--apply` 只提交唯一精确匹配。
+
 ## [0.10.6] - 2026-08-30
 
 ### 修复

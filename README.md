@@ -138,6 +138,16 @@ bot 启动后：抓取循环按 `poll_interval_secs` 定时跑，审批回调任
 cargo run --release --bin gallery_catalog -- manifest.json report.json
 ```
 
+历史频道帖的 Telegram mapping 只能按精确来源链接回填。先用已登录的 Telegram 客户端导出发布频道（`tdl chat export --all --with-content`），再对照 Vitrine catalog JSON：
+
+```bash
+python3 tools/backfill_telegram_publications.py \
+  --export channel-export.json \
+  --catalog catalog.json
+```
+
+默认 dry-run，只输出 matched / ambiguous / missing 的数量和 work ID，不写 D1。`--apply` 只提交唯一精确匹配，且要求 `HANABI_GALLERY_TOKEN`；任一当前作品 ambiguous 时拒绝 apply。不要用标题、作者或时间做模糊删除。
+
 `manifest.json` 是 `CatalogImage` 数组，包含来源、作品、R2 key 与本地原图路径。报告把结果严格分为 `strict_groups` 和 `similar_pairs`：前者按总像素数、文件大小择优并列出可移除副本；后者用 `kind=visual|partial` 区分整图相似与疑似拆分局部，绝不自动删除，供人工审批。工具本身不写 D1、R2 或 Telegram，实际整理必须先备份并单独执行。
 
 待审原图和 Telegram 发送文件默认保存在当前工作目录的 `pending/`。生产环境必须让该目录与 `hanabi.db` 一样落在持久磁盘；也可以显式指定绝对路径：

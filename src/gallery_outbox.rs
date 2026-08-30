@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
-use crate::gallery::{GalleryClient, GalleryIngestError};
+use crate::gallery::{GalleryClient, GalleryIngestError, GalleryPublication};
 use crate::model::MediaItem;
 
 const RETRY_BASE_SECS: i64 = 5 * 60;
@@ -76,6 +76,8 @@ struct Manifest {
     last_error: String,
     #[serde(default = "pending_state")]
     state: String,
+    #[serde(default)]
+    publication: Option<GalleryPublication>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +85,7 @@ pub struct QueuedGalleryWork {
     pub source_kind: String,
     pub source_id: String,
     pub files: Vec<PathBuf>,
+    pub publication: Option<GalleryPublication>,
     state: String,
     work_dir: PathBuf,
 }
@@ -134,6 +137,7 @@ pub trait GalleryUploader: Send + Sync {
         &self,
         item: &MediaItem,
         files: &[PathBuf],
+        publication: Option<&GalleryPublication>,
     ) -> std::result::Result<(), GalleryUploadFailure>;
 }
 
@@ -143,8 +147,9 @@ impl GalleryUploader for GalleryClient {
         &self,
         item: &MediaItem,
         files: &[PathBuf],
+        publication: Option<&GalleryPublication>,
     ) -> std::result::Result<(), GalleryUploadFailure> {
-        self.ingest(item, files)
+        self.ingest(item, files, publication)
             .await
             .map_err(|error: GalleryIngestError| {
                 if error.is_retryable() {
@@ -168,6 +173,7 @@ struct ClaimedWork {
     files: Vec<PathBuf>,
     work_dir: PathBuf,
     attempts: i64,
+    publication: Option<GalleryPublication>,
 }
 
 enum ClaimResult {
@@ -206,6 +212,10 @@ impl GalleryOutbox {
         // 兼容已创建但没有 lease 字段的旧 outbox 表。
         let _ = conn.execute(
             "ALTER TABLE gallery_outbox ADD COLUMN claimed_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE gallery_outbox ADD COLUMN publication_json TEXT NOT NULL DEFAULT 'null'",
             [],
         );
         let lease_cutoff = now_secs() - UPLOAD_LEASE_SECS;
@@ -319,7 +329,16 @@ impl GalleryOutbox {
         Ok(queued)
     }
 
-    fn query_queued(
+    pub fn query_queued(
+        &self,
+        source_kind: &str,
+        source_id: &str,
+    ) -> Result<Option<QueuedGalleryWork>> {
+        let conn = open_connection(&self.db_path)?;
+        self.query_queued_on(&conn, source_kind, source_id)
+    }
+
+    fn query_queued_on(
         &self,
         conn: &rusqlite::Connection,
         source_kind: &str,
@@ -363,7 +382,17 @@ impl GalleryOutbox {
         files: &[impl AsRef<Path>],
         initial_error: &str,
     ) -> Result<QueuedGalleryWork> {
-        self.store(item, files, "pending", initial_error)
+        self.enqueue_with_publication(item, files, initial_error, None)
+    }
+
+    pub fn enqueue_with_publication(
+        &self,
+        item: &MediaItem,
+        files: &[impl AsRef<Path>],
+        initial_error: &str,
+        publication: Option<GalleryPublication>,
+    ) -> Result<QueuedGalleryWork> {
+        self.store(item, files, "pending", initial_error, publication.as_ref())
     }
 
     pub fn enqueue_classified(
@@ -372,8 +401,9 @@ impl GalleryOutbox {
         files: &[impl AsRef<Path>],
         error: &str,
         retryable: bool,
+        publication: Option<GalleryPublication>,
     ) -> Result<QueuedGalleryWork> {
-        let queued = self.store(item, files, "pending", error)?;
+        let queued = self.store(item, files, "pending", error, publication.as_ref())?;
         if retryable {
             return Ok(queued);
         }
@@ -393,13 +423,35 @@ impl GalleryOutbox {
 
     /// 仅预复制图片；在 Telegram 确认至少发出一条消息前，worker 永远不能 claim。
     pub fn stage(&self, item: &MediaItem, files: &[impl AsRef<Path>]) -> Result<QueuedGalleryWork> {
-        self.store(item, files, "staging", "awaiting Telegram publish")
+        self.store(item, files, "staging", "awaiting Telegram publish", None)
+    }
+
+    /// Persist a captured Telegram mapping onto an existing queued work.
+    pub fn set_publication(
+        &self,
+        source_kind: &str,
+        source_id: &str,
+        publication: &GalleryPublication,
+    ) -> Result<bool> {
+        let conn = open_connection(&self.db_path)?;
+        let Some(existing) = self.query_queued_on(&conn, source_kind, source_id)? else {
+            return Ok(false);
+        };
+        self.update_manifest(&existing.work_dir, |manifest| {
+            manifest.publication = Some(publication.clone());
+        })?;
+        let changed = conn.execute(
+            "UPDATE gallery_outbox SET publication_json=?1
+             WHERE source_kind=?2 AND source_id=?3 AND state <> 'completed'",
+            rusqlite::params![serde_json::to_string(publication)?, source_kind, source_id],
+        )?;
+        Ok(changed == 1)
     }
 
     /// Telegram 已确认存在频道消息后，把预复制记录激活为可重试 pending。
     pub fn activate(&self, source_kind: &str, source_id: &str) -> Result<bool> {
         let conn = open_connection(&self.db_path)?;
-        let existing = self.query_queued(&conn, source_kind, source_id)?;
+        let existing = self.query_queued_on(&conn, source_kind, source_id)?;
         let Some(existing) = existing else {
             return Ok(false);
         };
@@ -423,6 +475,7 @@ impl GalleryOutbox {
         files: &[impl AsRef<Path>],
         desired_state: &str,
         initial_error: &str,
+        publication: Option<&GalleryPublication>,
     ) -> Result<QueuedGalleryWork> {
         if files.is_empty() {
             anyhow::bail!("无文件可加入 gallery outbox");
@@ -431,7 +484,7 @@ impl GalleryOutbox {
         let dir_name = format!("{}_{}", component(source_kind), component(&item.source_id));
         let final_dir = self.root.join(&dir_name);
         let conn = open_connection(&self.db_path)?;
-        if let Some(existing) = self.query_queued(&conn, source_kind, &item.source_id)? {
+        if let Some(mut existing) = self.query_queued_on(&conn, source_kind, &item.source_id)? {
             if desired_state == "staging" && existing.state != "staging" {
                 anyhow::bail!("该作品已有激活的 gallery outbox 任务");
             }
@@ -439,8 +492,27 @@ impl GalleryOutbox {
                 self.update_manifest(&existing.work_dir, |manifest| {
                     manifest.state = "pending".to_string();
                     manifest.last_error = error_summary(initial_error);
+                    if publication.is_some() {
+                        manifest.publication = publication.cloned();
+                    }
                 })?;
-                conn.execute(
+                if let Some(publication) = publication {
+                    let publication_json = serde_json::to_string(publication)?;
+                    conn.execute(
+                    "UPDATE gallery_outbox
+                     SET state='pending',last_error=?1,next_attempt_at=?2,publication_json=?3
+                     WHERE source_kind=?4 AND source_id=?5 AND state IN ('pending','staging','failed')",
+                    rusqlite::params![
+                        error_summary(initial_error),
+                        now_secs() + RETRY_BASE_SECS,
+                        publication_json,
+                        source_kind,
+                        item.source_id,
+                    ],
+                    )?;
+                    existing.publication = Some(publication.clone());
+                } else {
+                    conn.execute(
                     "UPDATE gallery_outbox
                      SET state='pending',last_error=?1,next_attempt_at=?2
                      WHERE source_kind=?3 AND source_id=?4 AND state IN ('pending','staging','failed')",
@@ -450,7 +522,8 @@ impl GalleryOutbox {
                         source_kind,
                         item.source_id,
                     ],
-                )?;
+                    )?;
+                }
             }
             return Ok(existing);
         }
@@ -498,6 +571,7 @@ impl GalleryOutbox {
                 created_at: now_secs(),
                 last_error: error_summary(initial_error),
                 state: desired_state.to_string(),
+                publication: publication.cloned(),
             };
             std::fs::write(staging.join(MANIFEST_NAME), serde_json::to_vec(&manifest)?)
                 .context("写 gallery outbox manifest 失败")?;
@@ -518,7 +592,7 @@ impl GalleryOutbox {
 
         self.register_manifest(&conn, &final_dir)?;
         let queued = self
-            .query_queued(&conn, source_kind, &item.source_id)?
+            .query_queued_on(&conn, source_kind, &item.source_id)?
             .context("gallery outbox manifest 已落盘但数据库登记未找到")?;
         if desired_state == "staging" && queued.state != "staging" {
             anyhow::bail!("该作品已有激活的 gallery outbox 任务");
@@ -574,7 +648,11 @@ impl GalleryOutbox {
                 .collect::<Result<Vec<_>>>()
         });
         let result = match files {
-            Ok(files) => uploader.ingest_paths(&work.item, &files).await,
+            Ok(files) => {
+                uploader
+                    .ingest_paths(&work.item, &files, work.publication.as_ref())
+                    .await
+            }
             Err(error) => Err(GalleryUploadFailure::permanent(error.to_string())),
         };
         match result {
@@ -644,12 +722,17 @@ impl GalleryOutbox {
             tx.commit()?;
             return Ok(ClaimResult::Missing);
         };
-        let (item_meta, files_json, attempts, work_dir): (String, String, i64, String) = tx
-            .query_row(
-                "SELECT item_meta,files,attempts,work_dir FROM gallery_outbox WHERE id=?1",
-                [id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )?;
+        let (item_meta, files_json, attempts, work_dir, publication_json): (
+            String,
+            String,
+            i64,
+            String,
+            String,
+        ) = tx.query_row(
+            "SELECT item_meta,files,attempts,work_dir,publication_json FROM gallery_outbox WHERE id=?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )?;
         let file_names = match serde_json::from_str::<Vec<String>>(&files_json) {
             Ok(files) => files,
             Err(error) => {
@@ -671,10 +754,21 @@ impl GalleryOutbox {
                 );
             }
         };
+        let publication = match parse_publication_json(&publication_json) {
+            Ok(publication) => publication,
+            Err(error) => {
+                return Self::reject_claim(
+                    tx,
+                    id,
+                    &format!("解析 gallery outbox publication_json 失败: {error}"),
+                );
+            }
+        };
         let queued = QueuedGalleryWork {
             source_kind: item.source.as_str().to_string(),
             source_id: item.source_id.clone(),
             files: files.clone(),
+            publication: publication.clone(),
             state: "pending".to_string(),
             work_dir: PathBuf::from(&work_dir),
         };
@@ -698,6 +792,7 @@ impl GalleryOutbox {
             files,
             work_dir: PathBuf::from(work_dir),
             attempts: attempts + 1,
+            publication,
         })))
     }
 
@@ -886,11 +981,15 @@ impl GalleryOutbox {
                 .collect::<Vec<_>>(),
         )?;
         let tx = conn.unchecked_transaction()?;
+        let publication_json = match &manifest.publication {
+            Some(publication) => serde_json::to_string(publication)?,
+            None => "null".to_string(),
+        };
         tx.execute(
             "INSERT OR IGNORE INTO gallery_outbox(
                 source_kind,source_id,item_meta,files,work_dir,created_at,
-                next_attempt_at,attempts,state,last_error
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,0,?8,?9)",
+                next_attempt_at,attempts,state,last_error,publication_json
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?10)",
             rusqlite::params![
                 manifest.item.source.as_str(),
                 manifest.item.source_id,
@@ -901,17 +1000,19 @@ impl GalleryOutbox {
                 manifest.created_at + RETRY_BASE_SECS,
                 manifest.state,
                 manifest.last_error,
+                publication_json,
             ],
         )?;
         // 同一 DB/outbox 迁到新根目录时，manifest 是当前副本位置的事实来源。
         // 即使 UNIQUE 行已存在，也必须覆盖旧绝对 files/work_dir。
         tx.execute(
-            "UPDATE gallery_outbox SET item_meta=?1,files=?2,work_dir=?3
-             WHERE source_kind=?4 AND source_id=?5",
+            "UPDATE gallery_outbox SET item_meta=?1,files=?2,work_dir=?3,publication_json=?4
+             WHERE source_kind=?5 AND source_id=?6",
             rusqlite::params![
                 item_meta,
                 files_json,
                 dir.to_string_lossy(),
+                publication_json,
                 manifest.item.source.as_str(),
                 manifest.item.source_id,
             ],
@@ -1005,14 +1106,22 @@ impl GalleryOutbox {
     }
 }
 
+fn parse_publication_json(raw: &str) -> Result<Option<GalleryPublication>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Ok(None);
+    }
+    Ok(serde_json::from_str(trimmed)?)
+}
+
 fn query_queued_raw(
     conn: &rusqlite::Connection,
     source_kind: &str,
     source_id: &str,
 ) -> Result<Option<QueuedGalleryWork>> {
-    let row: Option<(String, String, String, String, String)> = conn
+    let row: Option<(String, String, String, String, String, String)> = conn
         .query_row(
-            "SELECT source_kind,source_id,files,state,work_dir FROM gallery_outbox
+            "SELECT source_kind,source_id,files,state,work_dir,publication_json FROM gallery_outbox
              WHERE source_kind=?1 AND source_id=?2 AND state <> 'completed'",
             rusqlite::params![source_kind, source_id],
             |row| {
@@ -1022,22 +1131,26 @@ fn query_queued_raw(
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )
         .optional()?;
-    row.map(|(source_kind, source_id, files, state, work_dir)| {
-        Ok(QueuedGalleryWork {
-            source_kind,
-            source_id,
-            files: serde_json::from_str::<Vec<String>>(&files)?
-                .into_iter()
-                .map(PathBuf::from)
-                .collect(),
-            state,
-            work_dir: PathBuf::from(work_dir),
-        })
-    })
+    row.map(
+        |(source_kind, source_id, files, state, work_dir, publication_json)| {
+            Ok(QueuedGalleryWork {
+                source_kind,
+                source_id,
+                files: serde_json::from_str::<Vec<String>>(&files)?
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect(),
+                publication: parse_publication_json(&publication_json)?,
+                state,
+                work_dir: PathBuf::from(work_dir),
+            })
+        },
+    )
     .transpose()
 }
 

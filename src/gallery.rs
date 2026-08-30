@@ -8,6 +8,20 @@ use sha2::{Digest, Sha256};
 
 use crate::model::MediaItem;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GalleryPublishState {
+    Full,
+    Partial,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GalleryPublication {
+    pub chat_id: i64,
+    pub message_ids: Vec<i32>,
+    pub publish_state: GalleryPublishState,
+}
+
 #[derive(Debug, serde::Serialize)]
 struct CatalogPruneRequest<'a> {
     decision_id: &'a str,
@@ -95,11 +109,12 @@ impl GalleryClient {
         &self,
         item: &MediaItem,
         files: &[impl AsRef<Path>],
+        publication: Option<&GalleryPublication>,
     ) -> std::result::Result<(), GalleryIngestError> {
         if files.is_empty() {
             return Err(GalleryIngestError::permanent("无文件可入库"));
         }
-        let meta_str = gallery_meta(item).map_err(|error| {
+        let meta_str = gallery_meta(item, publication).map_err(|error| {
             GalleryIngestError::permanent(format!("序列化图库元数据失败: {error}"))
         })?;
 
@@ -205,8 +220,11 @@ impl GalleryClient {
     }
 }
 
-fn gallery_meta(item: &MediaItem) -> serde_json::Result<String> {
-    serde_json::to_string(&serde_json::json!({
+fn gallery_meta(
+    item: &MediaItem,
+    publication: Option<&GalleryPublication>,
+) -> serde_json::Result<String> {
+    let mut meta = serde_json::json!({
         "source": item.source.as_str(),
         "source_id": item.source_id,
         "source_url": item.url,
@@ -216,7 +234,11 @@ fn gallery_meta(item: &MediaItem) -> serde_json::Result<String> {
         "tags": item.tags,
         "is_r18": item.is_r18,
         "origin": item.origin,
-    }))
+    });
+    if let Some(publication) = publication {
+        meta["telegram_publication"] = serde_json::to_value(publication)?;
+    }
+    serde_json::to_string(&meta)
 }
 
 fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
@@ -242,7 +264,7 @@ fn idempotency_key_from_bytes(
 
 #[cfg(test)]
 fn idempotency_key(item: &MediaItem, files: &[impl AsRef<Path>]) -> Result<String> {
-    let meta = gallery_meta(item)?;
+    let meta = gallery_meta(item, None)?;
     let mut payloads = Vec::with_capacity(files.len());
     for (index, path) in files.iter().enumerate() {
         let path = path.as_ref();

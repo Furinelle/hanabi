@@ -14,7 +14,7 @@ use teloxide::types::{
 };
 use tokio::sync::Mutex;
 
-use crate::gallery::{GalleryClient, GalleryIngestError};
+use crate::gallery::{GalleryClient, GalleryIngestError, GalleryPublication, GalleryPublishState};
 use crate::gallery_outbox::{GalleryOutbox, QueuedGalleryWork};
 use crate::image_dedup::{
     evaluate_work, init_schema as init_image_dedup_schema, inspect_image, mark_work_status,
@@ -411,28 +411,42 @@ impl TelegramSink {
         if let Some(e) = send_error {
             // 部分成功:整条重发会造成频道重复内容,按已发布收尾,转人工检查。
             tracing::warn!(error = %e, id = %item.source_id, "直发部分成功,后续批次失败");
+            let publication = publication_builder.finish(false)?;
+            let gallery_publication = to_gallery_publication(&publication);
             // 部分成功也尝试入库(已有文件仍有意义)
-            self.maybe_ingest(item, files, gallery_staged.as_ref())
-                .await;
+            self.maybe_ingest(
+                item,
+                files,
+                gallery_staged.as_ref(),
+                Some(&gallery_publication),
+            )
+            .await;
             let db = self.state.db.lock().await;
             if let Err(error) = record_work(&db, item, &fingerprints, WorkStatus::Published) {
                 tracing::warn!(error = %error, id = %item.source_id, "登记直发图片指纹失败");
             }
             return Ok(PublishResult {
                 outcome: PublishOutcome::Partial,
-                publication: publication_builder.finish(false)?,
+                publication,
             });
         }
+        let publication = publication_builder.finish(true)?;
+        let gallery_publication = to_gallery_publication(&publication);
         // 手动链接直发成功:同步入库(帖子自带标签)
-        self.maybe_ingest(item, files, gallery_staged.as_ref())
-            .await;
+        self.maybe_ingest(
+            item,
+            files,
+            gallery_staged.as_ref(),
+            Some(&gallery_publication),
+        )
+        .await;
         let db = self.state.db.lock().await;
         if let Err(error) = record_work(&db, item, &fingerprints, WorkStatus::Published) {
             tracing::warn!(error = %error, id = %item.source_id, "登记直发图片指纹失败");
         }
         Ok(PublishResult {
             outcome: PublishOutcome::Full,
-            publication: publication_builder.finish(true)?,
+            publication,
         })
     }
 
@@ -519,13 +533,20 @@ impl TelegramSink {
         item: &MediaItem,
         files: &[PathBuf],
         staged: Option<&QueuedGalleryWork>,
+        publication: Option<&GalleryPublication>,
     ) {
         let Some(gallery) = self.state.gallery.as_ref() else {
             return;
         };
+        persist_gallery_publication(
+            self.state.gallery_outbox.as_ref(),
+            item.source.as_str(),
+            &item.source_id,
+            publication,
+        );
         // 预备份成功后立即改用持久副本，避免评论任务并发清理原图。
         let ingest_files = staged.map_or(files, |queued| queued.files.as_slice());
-        match gallery.ingest(item, ingest_files).await {
+        match gallery.ingest(item, ingest_files, publication).await {
             Ok(()) => {
                 if staged.is_some() {
                     resolve_gallery_staging(
@@ -536,8 +557,13 @@ impl TelegramSink {
                 }
             }
             Err(e) => {
-                let queued =
-                    enqueue_gallery_failure(self.state.gallery_outbox.as_ref(), item, files, &e);
+                let queued = enqueue_gallery_failure(
+                    self.state.gallery_outbox.as_ref(),
+                    item,
+                    files,
+                    &e,
+                    publication.cloned(),
+                );
                 tracing::warn!(
                     id = %item.source_id,
                     error = %e,
@@ -1851,8 +1877,16 @@ async fn finish_claimed(
 
     // 发布成功(或至少部分成功)且需要入库
     let mut archive_failed = false;
+    let gallery_publication = publication.as_ref().map(to_gallery_publication);
     if publish && first_id.is_some() && archive {
-        match archive_pending_work(state, &work, archive_staged.as_ref()).await {
+        match archive_pending_work(
+            state,
+            &work,
+            archive_staged.as_ref(),
+            gallery_publication.as_ref(),
+        )
+        .await
+        {
             Ok(()) => {
                 if archive_staged.is_some() {
                     resolve_pending_archive(state, &work);
@@ -1860,7 +1894,7 @@ async fn finish_claimed(
             }
             Err(e) => {
                 archive_failed = true;
-                let queued = queue_pending_archive(state, &work, &e);
+                let queued = queue_pending_archive(state, &work, &e, gallery_publication.clone());
                 tracing::warn!(error = %e, token, queued, "审批发布后图库入库失败");
                 let suffix = if queued && e.is_retryable() {
                     "；已加入自动补偿队列"
@@ -1941,6 +1975,7 @@ async fn archive_pending_work(
     state: &Arc<ReviewState>,
     work: &PendingWork,
     staged: Option<&QueuedGalleryWork>,
+    publication: Option<&GalleryPublication>,
 ) -> std::result::Result<(), GalleryIngestError> {
     let gallery = state
         .gallery
@@ -1951,6 +1986,12 @@ async fn archive_pending_work(
             "pending item_meta 无法解析为 MediaItem(旧审批请丢弃重抓): {error}"
         ))
     })?;
+    persist_gallery_publication(
+        state.gallery_outbox.as_ref(),
+        item.source.as_str(),
+        &item.source_id,
+        publication,
+    );
     // staging 是独立持久副本，不受 pending/评论临时目录清理影响。
     let paths = staged.map_or_else(
         || {
@@ -1962,7 +2003,7 @@ async fn archive_pending_work(
         },
         |queued| queued.files.as_slice(),
     );
-    gallery.ingest(&item, paths).await
+    gallery.ingest(&item, paths, publication).await
 }
 
 fn pending_archive_item_paths(work: &PendingWork) -> Option<(MediaItem, &[PathBuf])> {
@@ -1984,6 +2025,7 @@ fn queue_pending_archive(
     state: &ReviewState,
     work: &PendingWork,
     error: &GalleryIngestError,
+    publication: Option<GalleryPublication>,
 ) -> bool {
     let (Some(outbox), Ok(item)) = (
         state.gallery_outbox.as_ref(),
@@ -1996,7 +2038,7 @@ fn queue_pending_archive(
     } else {
         work.files.as_slice()
     };
-    enqueue_gallery_failure(Some(outbox), &item, paths, error)
+    enqueue_gallery_failure(Some(outbox), &item, paths, error, publication)
 }
 
 fn activate_pending_archive(state: &ReviewState, work: &PendingWork) {
@@ -2021,16 +2063,53 @@ fn resolve_pending_archive(state: &ReviewState, work: &PendingWork) {
     );
 }
 
+fn persist_gallery_publication(
+    outbox: Option<&GalleryOutbox>,
+    source_kind: &str,
+    source_id: &str,
+    publication: Option<&GalleryPublication>,
+) {
+    let (Some(outbox), Some(publication)) = (outbox, publication) else {
+        return;
+    };
+    if let Err(error) = outbox.set_publication(source_kind, source_id, publication) {
+        tracing::warn!(
+            source = source_kind,
+            id = source_id,
+            error = %error,
+            "保存图库 publication 映射失败"
+        );
+    }
+}
+
+fn to_gallery_publication(publication: &TelegramPublication) -> GalleryPublication {
+    GalleryPublication {
+        chat_id: publication.chat_id,
+        message_ids: publication.message_ids.clone(),
+        publish_state: match publication.publish_state {
+            PublicationState::Full => GalleryPublishState::Full,
+            PublicationState::Partial => GalleryPublishState::Partial,
+        },
+    }
+}
+
 fn enqueue_gallery_failure(
     outbox: Option<&GalleryOutbox>,
     item: &MediaItem,
     paths: &[PathBuf],
     error: &GalleryIngestError,
+    publication: Option<GalleryPublication>,
 ) -> bool {
     let Some(outbox) = outbox else {
         return false;
     };
-    match outbox.enqueue_classified(item, paths, &error.to_string(), error.is_retryable()) {
+    match outbox.enqueue_classified(
+        item,
+        paths,
+        &error.to_string(),
+        error.is_retryable(),
+        publication,
+    ) {
         Ok(_) => true,
         Err(queue_error) => {
             tracing::error!(

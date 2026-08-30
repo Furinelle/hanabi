@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use hanabi::gallery::{GalleryPublication, GalleryPublishState};
 use hanabi::gallery_outbox::{GalleryOutbox, GalleryUploadFailure, GalleryUploader, RetryOutcome};
 use hanabi::model::{Author, ImageRef, MediaItem, SourceKind};
 
@@ -41,6 +42,7 @@ impl GalleryUploader for FakeUploader {
         &self,
         _item: &MediaItem,
         files: &[PathBuf],
+        _publication: Option<&hanabi::gallery::GalleryPublication>,
     ) -> std::result::Result<(), GalleryUploadFailure> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         assert_eq!(files.len(), 1);
@@ -519,6 +521,7 @@ impl GalleryUploader for PermanentFailureUploader {
         &self,
         _item: &MediaItem,
         _files: &[PathBuf],
+        _publication: Option<&hanabi::gallery::GalleryPublication>,
     ) -> std::result::Result<(), GalleryUploadFailure> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         Err(GalleryUploadFailure::permanent("HTTP 413"))
@@ -574,6 +577,7 @@ impl GalleryUploader for BlockingSuccessUploader {
         &self,
         _item: &MediaItem,
         _files: &[PathBuf],
+        _publication: Option<&hanabi::gallery::GalleryPublication>,
     ) -> std::result::Result<(), GalleryUploadFailure> {
         self.started.notify_one();
         self.release.notified().await;
@@ -766,4 +770,108 @@ async fn malformed_files_json_is_dead_lettered_without_starving_later_work() {
 #[tokio::test]
 async fn malformed_item_meta_is_dead_lettered_without_starving_later_work() {
     assert_malformed_row_does_not_starve_following_work("item_meta", "{bad-json").await;
+}
+
+fn pixiv_item() -> MediaItem {
+    MediaItem {
+        source: SourceKind::Pixiv,
+        source_id: "1".into(),
+        author: Author {
+            name: "author".into(),
+            url: "https://example.test/author".into(),
+        },
+        title: Some("title".into()),
+        url: "https://www.pixiv.net/artworks/1".into(),
+        tags: vec!["tag".into()],
+        bookmark_count: None,
+        is_r18: false,
+        pixiv_type: None,
+        page_count: 1,
+        images: vec![ImageRef {
+            url: "https://example.test/image.jpg".into(),
+            referer: None,
+            fallback_urls: vec![],
+        }],
+        origin: "test".into(),
+    }
+}
+
+#[test]
+fn queued_work_preserves_publication_after_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("hanabi.db");
+    let root = temp.path().join("gallery-outbox");
+    let source = temp.path().join("original.jpg");
+    std::fs::write(&source, b"original bytes").unwrap();
+    let publication = GalleryPublication {
+        chat_id: -100123,
+        message_ids: vec![41, 42],
+        publish_state: GalleryPublishState::Full,
+    };
+    let outbox = GalleryOutbox::open(&db_path, &root).unwrap();
+    outbox
+        .enqueue_with_publication(
+            &pixiv_item(),
+            &[&source],
+            "HTTP 500",
+            Some(publication.clone()),
+        )
+        .unwrap();
+    drop(outbox);
+    let reopened = GalleryOutbox::open(&db_path, &root).unwrap();
+    assert_eq!(
+        reopened
+            .query_queued("pixiv", "1")
+            .unwrap()
+            .unwrap()
+            .publication,
+        Some(publication)
+    );
+}
+
+#[test]
+fn opening_pre_publication_outbox_defaults_to_none_without_row_loss() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("hanabi.db");
+    let root = temp.path().join("gallery-outbox");
+    std::fs::create_dir_all(&root).unwrap();
+    let root = std::fs::canonicalize(&root).unwrap();
+    let work_dir = root.join("pixiv_1");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let file = work_dir.join("000.jpg");
+    std::fs::write(&file, b"bytes").unwrap();
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute_batch(
+        "CREATE TABLE gallery_outbox(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_kind TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            item_meta TEXT NOT NULL,
+            files TEXT NOT NULL,
+            work_dir TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            next_attempt_at INTEGER NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            state TEXT NOT NULL DEFAULT 'pending',
+            last_error TEXT NOT NULL DEFAULT '',
+            UNIQUE(source_kind,source_id)
+         );",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO gallery_outbox(
+            source_kind,source_id,item_meta,files,work_dir,created_at,next_attempt_at,attempts,state,last_error
+         ) VALUES('pixiv','1','{}',?1,?2,1,1,0,'pending','')",
+        rusqlite::params![
+            serde_json::to_string(&vec![file.to_string_lossy()]).unwrap(),
+            work_dir.to_string_lossy()
+        ],
+    )
+    .unwrap();
+    drop(db);
+
+    let outbox = GalleryOutbox::open(&db_path, &root).unwrap();
+    let queued = outbox.query_queued("pixiv", "1").unwrap().unwrap();
+    assert_eq!(queued.publication, None);
+    assert_eq!(outbox.pending_count().unwrap(), 1);
 }

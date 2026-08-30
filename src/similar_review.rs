@@ -29,6 +29,36 @@ pub struct SimilarReviewPost {
     pub image_indices: Vec<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkPruneRequest {
+    pub keep_work_id: String,
+    pub remove_work_ids: Vec<String>,
+}
+
+pub fn work_prune_plan(
+    group: &SimilarReviewGroup,
+    keep_post_index: usize,
+) -> Option<WorkPruneRequest> {
+    let posts = group.posts();
+    let keep_post = posts.get(keep_post_index.checked_sub(1)?)?;
+    let mut remove_work_ids = Vec::new();
+    for post in &posts {
+        if post.work_id == keep_post.work_id {
+            continue;
+        }
+        if !remove_work_ids.contains(&post.work_id) {
+            remove_work_ids.push(post.work_id.clone());
+        }
+    }
+    if remove_work_ids.is_empty() || remove_work_ids.len() > 20 {
+        return None;
+    }
+    Some(WorkPruneRequest {
+        keep_work_id: keep_post.work_id.clone(),
+        remove_work_ids,
+    })
+}
+
 impl SimilarReviewGroup {
     pub fn posts(&self) -> Vec<SimilarReviewPost> {
         let mut posts: Vec<SimilarReviewPost> = Vec::new();

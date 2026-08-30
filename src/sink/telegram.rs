@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use rusqlite::OptionalExtension;
 use teloxide::prelude::*;
 use teloxide::types::{
-    AllowedUpdate, BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+    AllowedUpdate, BotCommand, CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup,
     InputFile, InputMedia, InputMediaDocument, InputMediaPhoto, MessageId, MessageOrigin,
     ParseMode, Recipient, ReplyParameters, UpdateKind,
 };
@@ -26,7 +26,8 @@ use crate::similar_review::{
     claim_review as claim_similar_review, finish_review as finish_similar_review,
     init_schema as init_similar_review_schema, load_review as load_similar_review,
     parse_callback as parse_similar_callback, restore_review as restore_similar_review,
-    review_messages as similar_review_messages, SimilarDecision, SimilarReviewGroup,
+    review_messages as similar_review_messages, work_prune_plan, SimilarDecision,
+    SimilarReviewGroup,
 };
 use crate::sink::{needs_downscale, render_caption, Sink};
 
@@ -2726,12 +2727,60 @@ fn similar_confirm_keyboard(
     ])
 }
 
+#[cfg(test)]
 struct SimilarPrunePlan {
     keep_work_id: String,
     keep_r2_key: String,
     remove_r2_keys: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PruneProgress {
+    GalleryPruned,
+    TelegramDeleted,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PruneAction {
+    DeleteTelegram,
+    FinalizeGallery,
+    FinishReview,
+}
+
+fn next_prune_action(progress: PruneProgress) -> PruneAction {
+    match progress {
+        PruneProgress::GalleryPruned => PruneAction::DeleteTelegram,
+        PruneProgress::TelegramDeleted => PruneAction::FinalizeGallery,
+        PruneProgress::Complete => PruneAction::FinishReview,
+    }
+}
+
+fn is_idempotent_delete_error(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("message to delete not found")
+}
+
+async fn delete_mapped_telegram_messages(
+    bot: &Bot,
+    targets: &[crate::gallery::GalleryTelegramTarget],
+) -> Result<()> {
+    for target in targets {
+        let chat = ChatId(target.chat_id);
+        for message_id in &target.message_ids {
+            let message_id = i32::try_from(*message_id).context("telegram message id 超出范围")?;
+            match tg_retry(|| bot.delete_message(chat, MessageId(message_id))).await {
+                Ok(_) => {}
+                Err(error) if is_idempotent_delete_error(&error.to_string()) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn similar_prune_plan(
     group: &SimilarReviewGroup,
     keep_post_index: usize,
@@ -2861,26 +2910,46 @@ async fn handle_similar_callback(
             match decision {
                 SimilarDecision::KeepAll => Ok(()),
                 SimilarDecision::ConfirmKeep(index) => {
-                    let plan = similar_prune_plan(&group, index)
-                        .context("相似图审批选择的帖子序号无效")?;
+                    let plan =
+                        work_prune_plan(&group, index).context("相似图审批选择的帖子序号无效")?;
                     let gallery = state
                         .gallery
                         .as_ref()
                         .context("Vitrine 未配置，不能执行相似图整理")?;
-                    let removed = gallery
-                        .prune_similar(
-                            &format!("hanabi-similar-{token}"),
-                            &plan.keep_r2_key,
-                            &plan.remove_r2_keys,
+                    let decision_id = format!("hanabi-similar-{token}");
+                    let pruned = gallery
+                        .prune_similar_works(
+                            &decision_id,
+                            &plan.keep_work_id,
+                            &plan.remove_work_ids,
                         )
                         .await?;
+                    let mut progress = PruneProgress::GalleryPruned;
+                    loop {
+                        match next_prune_action(progress) {
+                            PruneAction::DeleteTelegram => {
+                                delete_mapped_telegram_messages(
+                                    &state.bot,
+                                    &pruned.telegram_targets,
+                                )
+                                .await?;
+                                progress = PruneProgress::TelegramDeleted;
+                            }
+                            PruneAction::FinalizeGallery => {
+                                gallery.finish_telegram_prune(&decision_id).await?;
+                                progress = PruneProgress::Complete;
+                            }
+                            PruneAction::FinishReview => break,
+                        }
+                    }
                     let db = state.db.lock().await;
                     remove_pruned_fingerprints(&db, &group, &plan.keep_work_id)?;
                     tracing::info!(
                         token,
                         keep_index = index,
                         keep_work_id = plan.keep_work_id,
-                        removed,
+                        removed_works = pruned.removed_work_ids.len(),
+                        replayed = pruned.replayed,
                         "相似图审批整理完成"
                     );
                     Ok(())
@@ -2918,6 +2987,16 @@ async fn handle_similar_callback(
             }
             Err(error) => {
                 tracing::warn!(token, error = %error, "相似图审批失败，恢复按钮");
+                if matches!(decision, SimilarDecision::ConfirmKeep(_)) {
+                    if let Some(gallery) = state.gallery.as_ref() {
+                        let _ = gallery
+                            .report_telegram_prune_failure(
+                                &format!("hanabi-similar-{token}"),
+                                &error.to_string(),
+                            )
+                            .await;
+                    }
+                }
                 {
                     let db = state.db.lock().await;
                     let _ = restore_similar_review(&db, token);
@@ -2965,6 +3044,32 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn review_finishes_only_after_telegram_completion() {
+        assert_eq!(
+            next_prune_action(PruneProgress::GalleryPruned),
+            PruneAction::DeleteTelegram
+        );
+        assert_eq!(
+            next_prune_action(PruneProgress::TelegramDeleted),
+            PruneAction::FinalizeGallery
+        );
+        assert_eq!(
+            next_prune_action(PruneProgress::Complete),
+            PruneAction::FinishReview
+        );
+    }
+
+    #[test]
+    fn only_message_not_found_is_idempotent_success() {
+        assert!(is_idempotent_delete_error(
+            "Bad Request: message to delete not found"
+        ));
+        assert!(!is_idempotent_delete_error(
+            "Forbidden: bot is not an administrator"
+        ));
     }
 
     #[test]

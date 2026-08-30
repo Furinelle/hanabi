@@ -218,6 +218,168 @@ impl GalleryClient {
         }
         Ok(parsed.removed)
     }
+
+    pub async fn prune_similar_works(
+        &self,
+        decision_id: &str,
+        keep_work_id: &str,
+        remove_work_ids: &[String],
+    ) -> std::result::Result<GalleryWorkPruneResult, GalleryIngestError> {
+        if remove_work_ids.is_empty() || remove_work_ids.len() > 20 {
+            return Err(GalleryIngestError::permanent(
+                "remove works must contain 1 to 20 entries",
+            ));
+        }
+        let url = format!("{}/api/catalog/prune-works", self.endpoint);
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(&self.token)
+            .json(&CatalogWorkPruneRequest {
+                decision_id,
+                keep_work_id,
+                remove_work_ids,
+            })
+            .send()
+            .await
+            .map_err(|error| {
+                GalleryIngestError::transient(format!("请求 Vitrine 整作品整理失败: {error}"))
+            })?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let message = format!("Vitrine 整作品整理 HTTP {status}: {body}");
+            return Err(if retryable_status(status) {
+                GalleryIngestError::transient(message)
+            } else {
+                GalleryIngestError::permanent(message)
+            });
+        }
+        let parsed: CatalogWorkPruneResponse = serde_json::from_str(&body).map_err(|error| {
+            GalleryIngestError::transient(format!("解析 Vitrine 整作品整理响应失败: {error}"))
+        })?;
+        if !parsed.ok {
+            return Err(GalleryIngestError::transient(
+                "Vitrine 整作品整理返回 ok=false",
+            ));
+        }
+        if parsed.telegram_targets.is_empty() {
+            return Err(GalleryIngestError::permanent(
+                "Vitrine 整作品整理未返回 Telegram 目标",
+            ));
+        }
+        Ok(GalleryWorkPruneResult {
+            removed_work_ids: parsed.removed_works,
+            removed_r2_keys: parsed.removed_r2_keys,
+            telegram_targets: parsed.telegram_targets,
+            replayed: parsed.replayed,
+        })
+    }
+
+    pub async fn finish_telegram_prune(
+        &self,
+        decision_id: &str,
+    ) -> std::result::Result<(), GalleryIngestError> {
+        self.post_telegram_result(decision_id, true, None).await
+    }
+
+    pub async fn report_telegram_prune_failure(
+        &self,
+        decision_id: &str,
+        error: &str,
+    ) -> std::result::Result<(), GalleryIngestError> {
+        self.post_telegram_result(decision_id, false, Some(error))
+            .await
+    }
+
+    async fn post_telegram_result(
+        &self,
+        decision_id: &str,
+        complete: bool,
+        error: Option<&str>,
+    ) -> std::result::Result<(), GalleryIngestError> {
+        let url = format!("{}/api/catalog/prune-works/telegram-result", self.endpoint);
+        let error = error.map(sanitize_reported_error);
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(&self.token)
+            .json(&CatalogTelegramResultRequest {
+                decision_id,
+                complete,
+                error: error.as_deref(),
+            })
+            .send()
+            .await
+            .map_err(|error| {
+                GalleryIngestError::transient(format!("请求 Vitrine Telegram 结果失败: {error}"))
+            })?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let message = format!("Vitrine Telegram 结果 HTTP {status}: {body}");
+            return Err(if retryable_status(status) {
+                GalleryIngestError::transient(message)
+            } else {
+                GalleryIngestError::permanent(message)
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CatalogWorkPruneRequest<'a> {
+    decision_id: &'a str,
+    keep_work_id: &'a str,
+    remove_work_ids: &'a [String],
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CatalogWorkPruneResponse {
+    ok: bool,
+    removed_works: Vec<String>,
+    removed_r2_keys: Vec<String>,
+    telegram_targets: Vec<GalleryTelegramTarget>,
+    replayed: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GalleryTelegramTarget {
+    pub publication_id: String,
+    pub work_id: String,
+    pub chat_id: i64,
+    pub message_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GalleryWorkPruneResult {
+    pub removed_work_ids: Vec<String>,
+    pub removed_r2_keys: Vec<String>,
+    pub telegram_targets: Vec<GalleryTelegramTarget>,
+    pub replayed: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CatalogTelegramResultRequest<'a> {
+    decision_id: &'a str,
+    complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
+}
+
+fn sanitize_reported_error(raw: &str) -> String {
+    let filtered: String = raw.chars().filter(|ch| !ch.is_control()).collect();
+    let truncated: String = filtered.chars().take(500).collect();
+    let lower = truncated.to_ascii_lowercase();
+    if lower.contains("bearer ")
+        || lower.contains("authorization:")
+        || lower.contains("cookie:")
+        || lower.contains("set-cookie:")
+    {
+        return "[redacted]".into();
+    }
+    truncated
 }
 
 fn gallery_meta(

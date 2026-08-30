@@ -1,6 +1,6 @@
 use hanabi::similar_review::{
     claim_review, finish_review, init_schema, parse_callback, register_review, restore_review,
-    SimilarDecision, SimilarReviewGroup, SimilarReviewImage,
+    work_prune_plan, SimilarDecision, SimilarReviewGroup, SimilarReviewImage,
 };
 use rusqlite::Connection;
 
@@ -140,4 +140,40 @@ fn initialization_recovers_interrupted_review() {
     assert!(claim_review(&conn, token, SimilarDecision::KeepAll)
         .unwrap()
         .is_some());
+}
+
+fn four_image_similarity_group() -> SimilarReviewGroup {
+    SimilarReviewGroup {
+        group_key: "group-example".into(),
+        images: vec![
+            SimilarReviewImage {
+                image_id: "douyin:7669678713420921673#0".into(),
+                r2_key: "douyin/7669678713420921673/a/00.jpg".into(),
+                label: "douyin p0".into(),
+            },
+            SimilarReviewImage {
+                image_id: "douyin:7669678713420921673#1".into(),
+                r2_key: "douyin/7669678713420921673/a/01.jpg".into(),
+                label: "douyin p1".into(),
+            },
+            SimilarReviewImage {
+                image_id: "pixiv:147342918#0".into(),
+                r2_key: "pixiv/147342918/b/00.png".into(),
+                label: "pixiv p0".into(),
+            },
+            SimilarReviewImage {
+                image_id: "pixiv:147342918#1".into(),
+                r2_key: "pixiv/147342918/b/01.png".into(),
+                label: "pixiv p1".into(),
+            },
+        ],
+    }
+}
+
+#[test]
+fn selecting_pixiv_builds_whole_work_request() {
+    let group = four_image_similarity_group();
+    let request = work_prune_plan(&group, 2).unwrap();
+    assert_eq!(request.keep_work_id, "pixiv:147342918");
+    assert_eq!(request.remove_work_ids, vec!["douyin:7669678713420921673"]);
 }

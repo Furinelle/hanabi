@@ -60,6 +60,82 @@ pub enum PublishOutcome {
     Partial,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationState {
+    Full,
+    Partial,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramPublication {
+    pub chat_id: i64,
+    pub message_ids: Vec<i32>,
+    pub publish_state: PublicationState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishResult {
+    pub outcome: PublishOutcome,
+    pub publication: TelegramPublication,
+}
+
+impl PartialEq<PublishOutcome> for PublishResult {
+    fn eq(&self, other: &PublishOutcome) -> bool {
+        self.outcome == *other
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TelegramPublicationBuilder {
+    chat_id: Option<i64>,
+    message_ids: Vec<i32>,
+}
+
+impl TelegramPublicationBuilder {
+    pub fn record(&mut self, chat_id: i64, ids: impl IntoIterator<Item = i32>) -> Result<()> {
+        if chat_id == 0 {
+            anyhow::bail!("invalid telegram chat id");
+        }
+        if let Some(existing) = self.chat_id {
+            if existing != chat_id {
+                anyhow::bail!("mixed telegram chats");
+            }
+        }
+        let mut incoming = Vec::new();
+        for id in ids {
+            if id <= 0 {
+                anyhow::bail!("invalid telegram message id");
+            }
+            if self.message_ids.contains(&id) || incoming.contains(&id) {
+                anyhow::bail!("duplicate telegram message id");
+            }
+            incoming.push(id);
+        }
+        if incoming.is_empty() {
+            anyhow::bail!("empty telegram message ids");
+        }
+        self.chat_id = Some(chat_id);
+        self.message_ids.extend(incoming);
+        Ok(())
+    }
+
+    pub fn finish(self, full: bool) -> Result<TelegramPublication> {
+        let chat_id = self.chat_id.context("no telegram chat captured")?;
+        if self.message_ids.is_empty() {
+            anyhow::bail!("no telegram messages captured");
+        }
+        Ok(TelegramPublication {
+            chat_id,
+            message_ids: self.message_ids,
+            publish_state: if full {
+                PublicationState::Full
+            } else {
+                PublicationState::Partial
+            },
+        })
+    }
+}
+
 /// 待投递评论区的原图任务:发布到频道后登记,等讨论组 auto-forward 到来时
 /// 把原画质 document reply 进该帖评论区。temp_dir 在投递完成或超时后清理。
 struct CommentJob {
@@ -274,14 +350,14 @@ impl TelegramSink {
 
     /// 直接发布到频道(跳过审批):用于手动发来的链接,作品即时发布。
     ///
-    /// 返回 [`PublishOutcome`]:`Partial` 表示部分批次已进频道后失败——频道帖已存在,
+    /// 返回 [`PublishResult`]:`Partial` 表示部分批次已进频道后失败——频道帖已存在,
     /// 整条重发会重复,调用方应与完整成功一样 mark_pushed 并提示人工补图
     /// (与 finish_claimed 对部分成功"按已发布收尾"的策略一致)。
     pub async fn publish_direct(
         &self,
         item: &MediaItem,
         files: &[PathBuf],
-    ) -> Result<PublishOutcome> {
+    ) -> Result<PublishResult> {
         if files.is_empty() {
             anyhow::bail!("无图片可发: {}", item.source_id);
         }
@@ -292,6 +368,7 @@ impl TelegramSink {
         // 在任何频道副作用前准备独立图库副本，避免 auto-forward 评论任务先清理原目录。
         let gallery_staged = self.stage_gallery(item, files);
         let mut sent: Vec<MessageId> = Vec::new();
+        let mut publication_builder = TelegramPublicationBuilder::default();
         let mut activate_on_first = || {
             if gallery_staged.is_some() {
                 activate_gallery_staging(
@@ -308,6 +385,7 @@ impl TelegramSink {
             &caption,
             item.is_r18, // R18 → 频道帖打剧透遮罩
             &mut sent,
+            &mut publication_builder,
             &mut activate_on_first,
         )
         .await;
@@ -340,7 +418,10 @@ impl TelegramSink {
             if let Err(error) = record_work(&db, item, &fingerprints, WorkStatus::Published) {
                 tracing::warn!(error = %error, id = %item.source_id, "登记直发图片指纹失败");
             }
-            return Ok(PublishOutcome::Partial);
+            return Ok(PublishResult {
+                outcome: PublishOutcome::Partial,
+                publication: publication_builder.finish(false)?,
+            });
         }
         // 手动链接直发成功:同步入库(帖子自带标签)
         self.maybe_ingest(item, files, gallery_staged.as_ref())
@@ -349,7 +430,10 @@ impl TelegramSink {
         if let Err(error) = record_work(&db, item, &fingerprints, WorkStatus::Published) {
             tracing::warn!(error = %error, id = %item.source_id, "登记直发图片指纹失败");
         }
-        Ok(PublishOutcome::Full)
+        Ok(PublishResult {
+            outcome: PublishOutcome::Full,
+            publication: publication_builder.finish(true)?,
+        })
     }
 
     /// 维护入口：只处理显式指定的待审 token，复用正常审批的原子抢占、频道发布、
@@ -981,6 +1065,7 @@ enum MediaMode {
 /// 发一组图到指定 chat(用于发布到频道)。组内任一文件超 Telegram photo 硬上限时,
 /// 整组退化为 document 发送(album 不允许 photo/document 混投,故不能只降级单张;
 /// R18 剧透遮罩仅 photo 支持,随退化自然丢失)。
+#[allow(clippy::too_many_arguments)]
 async fn send_group(
     bot: &Bot,
     chat: &Recipient,
@@ -988,6 +1073,7 @@ async fn send_group(
     caption: &str,
     spoiler: bool,
     sent: &mut Vec<MessageId>,
+    publication: &mut TelegramPublicationBuilder,
     on_first_sent: &mut impl FnMut(),
 ) -> Result<()> {
     if prepared.is_empty() {
@@ -998,7 +1084,17 @@ async fn send_group(
     } else {
         MediaMode::Photo { spoiler }
     };
-    send_batches(bot, chat, prepared, caption, &mode, sent, on_first_sent).await
+    send_batches(
+        bot,
+        chat,
+        prepared,
+        caption,
+        &mode,
+        sent,
+        publication,
+        on_first_sent,
+    )
+    .await
 }
 
 fn record_sent(
@@ -1017,6 +1113,7 @@ fn record_sent(
 /// caption 仅挂第一批第一张。每个请求带限流重试。已发出的消息 id 实时推入 `sent`
 /// (首元素即频道帖锚点),中途失败时调用方据 `sent` 是否非空判断"部分批次已进
 /// 频道"——此时盲目恢复重试会造成频道重复内容。
+#[allow(clippy::too_many_arguments)]
 async fn send_batches(
     bot: &Bot,
     chat: &Recipient,
@@ -1024,6 +1121,7 @@ async fn send_batches(
     caption: &str,
     mode: &MediaMode,
     sent: &mut Vec<MessageId>,
+    publication: &mut TelegramPublicationBuilder,
     on_first_sent: &mut impl FnMut(),
 ) -> Result<()> {
     for (ci, chunk) in prepared.chunks(10).enumerate() {
@@ -1056,6 +1154,7 @@ async fn send_batches(
                 }
             };
             record_sent(sent, [m.id], on_first_sent);
+            publication.record(m.chat.id.0, [m.id.0])?;
         } else {
             let msgs = tg_retry(|| {
                 let media = match mode {
@@ -1066,6 +1165,9 @@ async fn send_batches(
             })
             .await?;
             record_sent(sent, msgs.iter().map(|m| m.id), on_first_sent);
+            for message in &msgs {
+                publication.record(message.chat.id.0, [message.id.0])?;
+            }
         }
     }
     Ok(())
@@ -1539,6 +1641,7 @@ impl Sink for TelegramSink {
                 } else {
                     MediaMode::Photo { spoiler: false }
                 };
+                let mut review_publication = TelegramPublicationBuilder::default();
                 send_batches(
                     bot,
                     &chat,
@@ -1546,6 +1649,7 @@ impl Sink for TelegramSink {
                     &first_cap,
                     &mode,
                     &mut review_ids,
+                    &mut review_publication,
                     &mut || {},
                 )
                 .await?;
@@ -1671,6 +1775,7 @@ async fn finish_claimed(
         None
     };
     let mut sent: Vec<MessageId> = Vec::new();
+    let mut publication_builder = TelegramPublicationBuilder::default();
     let mut activate_on_first = || {
         if archive_staged.is_some() {
             activate_pending_archive(state, &work);
@@ -1684,13 +1789,30 @@ async fn finish_claimed(
             &work.caption,
             work.is_r18, // 结构化字段决定剧透遮罩,不再从 caption 文本反推
             &mut sent,
+            &mut publication_builder,
             &mut activate_on_first,
         )
         .await
     } else {
         Ok(())
     };
-    let first_id = sent.first().copied();
+    let publication = if sent.is_empty() {
+        None
+    } else {
+        Some(publication_builder.finish(send_result.is_ok())?)
+    };
+    let first_id = publication
+        .as_ref()
+        .and_then(|captured| captured.message_ids.first().copied())
+        .map(MessageId);
+    if let Some(captured) = &publication {
+        tracing::debug!(
+            chat_id = captured.chat_id,
+            messages = captured.message_ids.len(),
+            publish_state = ?captured.publish_state,
+            "captured channel publication"
+        );
+    }
     if let Err(e) = send_result {
         if first_id.is_none() {
             if archive_staged.is_some() {
@@ -2764,6 +2886,18 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn publication_capture_records_batches_and_rejects_mixed_chats() {
+        let mut builder = TelegramPublicationBuilder::default();
+        builder.record(-100123, [41, 42]).unwrap();
+        builder.record(-100123, [43]).unwrap();
+        assert_eq!(
+            builder.clone().finish(true).unwrap().message_ids,
+            vec![41, 42, 43]
+        );
+        assert!(builder.record(-100999, [44]).is_err());
     }
 
     #[test]

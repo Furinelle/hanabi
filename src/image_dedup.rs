@@ -452,25 +452,6 @@ pub fn evaluate_work(
         }
     }
 
-    // 同一作品内部也只保留严格同图中画质最高的一张。
-    for left in 0..current.len() {
-        if drop_current_indices.contains(&left) {
-            continue;
-        }
-        for right in (left + 1)..current.len() {
-            if classify_similarity(&current[left], &current[right]) != MatchKind::StrictSame {
-                continue;
-            }
-            let loser = if current[left].quality_cmp(&current[right]) == Ordering::Less {
-                left
-            } else {
-                right
-            };
-            if !drop_current_indices.contains(&loser) {
-                drop_current_indices.push(loser);
-            }
-        }
-    }
     drop_current_indices.sort_unstable();
 
     let exact_work_keys: HashSet<(String, String)> = exact_works

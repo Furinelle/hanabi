@@ -247,3 +247,87 @@ fn mixed_work_drops_only_strict_duplicate_images_and_keeps_unique_ones() {
     assert!(matches!(evaluation.exact_action, ExactAction::None));
     assert_eq!(evaluation.drop_current_indices, vec![0]);
 }
+
+#[test]
+fn same_post_images_are_never_compared_with_each_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let image_path = dir.path().join("same.png");
+    save_png(&image_path, &patterned(640, 480));
+    let fingerprint = inspect_image(&image_path).unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    let mut current = item(SourceKind::Pixiv, "p4", "同帖差分图");
+    current.page_count = 2;
+    current.images.push(ImageRef {
+        url: "https://example.test/p4-2.png".into(),
+        referer: None,
+        fallback_urls: vec![],
+    });
+
+    let evaluation = evaluate_work(&conn, &current, &[fingerprint.clone(), fingerprint]).unwrap();
+
+    assert!(matches!(evaluation.exact_action, ExactAction::None));
+    assert!(evaluation.drop_current_indices.is_empty());
+    assert!(evaluation.similar.is_empty());
+}
+
+#[test]
+fn same_platform_different_posts_are_still_deduplicated() {
+    let dir = tempfile::tempdir().unwrap();
+    let image_path = dir.path().join("same.png");
+    save_png(&image_path, &patterned(640, 480));
+    let fingerprint = inspect_image(&image_path).unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    let old = item(SourceKind::Pixiv, "p5", "已收录");
+    let current = item(SourceKind::Pixiv, "p6", "另一帖");
+    record_work(
+        &conn,
+        &old,
+        std::slice::from_ref(&fingerprint),
+        WorkStatus::Published,
+    )
+    .unwrap();
+
+    let evaluation = evaluate_work(&conn, &current, &[fingerprint]).unwrap();
+
+    assert!(matches!(
+        evaluation.exact_action,
+        ExactAction::SkipCurrent(ref work) if work.source_id == "p5"
+    ));
+}
+
+#[test]
+fn same_platform_different_posts_still_request_similar_review() {
+    let dir = tempfile::tempdir().unwrap();
+    let original_path = dir.path().join("original.png");
+    let edited_path = dir.path().join("edited.png");
+    let original = patterned(640, 480);
+    let mut edited = original.clone();
+    for y in 200..260 {
+        for x in 280..360 {
+            edited.put_pixel(x, y, Rgb([255, 255, 255]));
+        }
+    }
+    save_png(&original_path, &original);
+    save_png(&edited_path, &edited);
+    let original = inspect_image(&original_path).unwrap();
+    let edited = inspect_image(&edited_path).unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    let old = item(SourceKind::X, "x7", "已收录");
+    let current = item(SourceKind::X, "x8", "同平台另一帖");
+    record_work(
+        &conn,
+        &old,
+        std::slice::from_ref(&original),
+        WorkStatus::Published,
+    )
+    .unwrap();
+
+    let evaluation = evaluate_work(&conn, &current, &[edited]).unwrap();
+
+    assert!(matches!(evaluation.exact_action, ExactAction::None));
+    assert_eq!(evaluation.similar.len(), 1);
+    assert_eq!(evaluation.similar[0].existing_work.source_id, "x7");
+}

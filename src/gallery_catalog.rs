@@ -62,6 +62,9 @@ pub fn scan_catalog(images: &[CatalogImage]) -> Result<CatalogScanReport> {
 
     for left in 0..scanned.len() {
         for right in (left + 1)..scanned.len() {
+            if same_post(&scanned[left], &scanned[right]) {
+                continue;
+            }
             match classify_similarity(&scanned[left].fingerprint, &scanned[right].fingerprint) {
                 MatchKind::StrictSame => sets.union(left, right),
                 MatchKind::Similar { distance } => {
@@ -113,6 +116,10 @@ pub fn scan_catalog(images: &[CatalogImage]) -> Result<CatalogScanReport> {
         strict_groups,
         similar_pairs,
     })
+}
+
+fn same_post(left: &ScannedCatalogImage, right: &ScannedCatalogImage) -> bool {
+    left.image.source == right.image.source && left.image.source_id == right.image.source_id
 }
 
 fn quality_cmp(left: &ScannedCatalogImage, right: &ScannedCatalogImage) -> Ordering {

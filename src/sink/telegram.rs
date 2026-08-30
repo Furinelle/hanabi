@@ -1452,7 +1452,7 @@ impl Sink for TelegramSink {
             .map(|(_, fingerprint)| fingerprint)
             .collect();
         if originals.is_empty() {
-            tracing::info!(id = %item.source_id, "作品内图片均为严格同图,自动跳过审批");
+            tracing::info!(id = %item.source_id, "当前作品图片均与其他帖子严格同图,自动跳过审批");
             cleanup(files);
             return Ok(());
         }

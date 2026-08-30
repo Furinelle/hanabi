@@ -133,3 +133,72 @@ fn split_panel_enters_review_report_but_not_strict_removal() {
     assert_eq!(report.similar_pairs.len(), 1);
     assert_eq!(report.similar_pairs[0].kind, "partial");
 }
+
+#[test]
+fn same_platform_same_post_strict_images_produce_no_finding() {
+    let dir = tempfile::tempdir().unwrap();
+    let first_path = dir.path().join("first.png");
+    let second_path = dir.path().join("second.png");
+    save(&first_path, &patterned(320, 240));
+    save(&second_path, &patterned(1280, 960));
+
+    let report = scan_catalog(&[
+        entry(&first_path, SourceKind::Pixiv, "p7", "pixiv/p7-1.png"),
+        entry(&second_path, SourceKind::Pixiv, "p7", "pixiv/p7-2.png"),
+    ])
+    .unwrap();
+
+    assert!(report.strict_groups.is_empty());
+    assert!(report.similar_pairs.is_empty());
+}
+
+#[test]
+fn same_platform_same_post_similar_images_produce_no_finding() {
+    let dir = tempfile::tempdir().unwrap();
+    let original_path = dir.path().join("original.png");
+    let edited_path = dir.path().join("edited.png");
+    let original = patterned(640, 480);
+    let mut edited = original.clone();
+    for y in 200..260 {
+        for x in 280..360 {
+            edited.put_pixel(x, y, Rgb([255, 255, 255]));
+        }
+    }
+    save(&original_path, &original);
+    save(&edited_path, &edited);
+
+    let report = scan_catalog(&[
+        entry(&original_path, SourceKind::Douyin, "d8", "douyin/d8-1.png"),
+        entry(&edited_path, SourceKind::Douyin, "d8", "douyin/d8-2.png"),
+    ])
+    .unwrap();
+
+    assert!(report.strict_groups.is_empty());
+    assert!(report.similar_pairs.is_empty());
+}
+
+#[test]
+fn same_platform_different_posts_similar_images_enter_review_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let original_path = dir.path().join("original.png");
+    let edited_path = dir.path().join("edited.png");
+    let original = patterned(640, 480);
+    let mut edited = original.clone();
+    for y in 200..260 {
+        for x in 280..360 {
+            edited.put_pixel(x, y, Rgb([255, 255, 255]));
+        }
+    }
+    save(&original_path, &original);
+    save(&edited_path, &edited);
+
+    let report = scan_catalog(&[
+        entry(&original_path, SourceKind::X, "x9", "x/x9.png"),
+        entry(&edited_path, SourceKind::X, "x10", "x/x10.png"),
+    ])
+    .unwrap();
+
+    assert!(report.strict_groups.is_empty());
+    assert_eq!(report.similar_pairs.len(), 1);
+    assert_eq!(report.similar_pairs[0].kind, "visual");
+}

@@ -130,6 +130,8 @@ cargo run --release
 
 bot 启动后：抓取循环按 `poll_interval_secs` 定时跑，审批回调任务并发监听按钮/命令。
 
+CPU 密集的图片指纹计算（含区域内指纹）和 Telegram 展示副本准备会自动使用容器/进程可见的 CPU 核数；可选环境变量 `RAYON_NUM_THREADS` 可覆盖该线程数。Telegram 发布顺序与数据库状态转换仍按原有顺序串行执行，不会随 CPU 并行而重排。
+
 图片指纹保存在同一个 `hanabi.db` 的 `image_fingerprints` 表。升级启动时会为仍存在原文件的旧待审项自动补建指纹；后续进入审批或手动直发成功的作品都会持续登记。已经发布到频道的旧版本不会被后台静默删除，因此“高清替换低清”只自动作用于尚未审批的严格同图；已发布记录优先用于阻止再次重复发布。
 
 对已经存在于图库中的历史原图，可先导出图片元数据并把对象下载到本地，再用同一套指纹规则生成只读整理报告：
@@ -274,6 +276,8 @@ HANABI_STATE_DIR=/var/lib/hanabi
 # /opt/hanabi-container/hanabi.env（chmod 600，不入库）
 HANABI_BOT_TOKEN=<bot token>
 HANABI_GALLERY_TOKEN=<gallery token>
+# 可选：覆盖图片 CPU 并行线程数；默认使用容器可见核数
+# RAYON_NUM_THREADS=4
 
 cd /opt/hanabi-container
 docker compose config --quiet

@@ -70,7 +70,8 @@ fn parallel_fingerprint_matches_sequential_reference() {
         let production = inspect_image_bytes(&encoded).unwrap();
         let sequential = inspect_image_bytes_sequential(&encoded).unwrap();
         assert_eq!(
-            production, sequential,
+            production,
+            sequential,
             "fingerprint mismatch for {}",
             path.display()
         );

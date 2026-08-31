@@ -3005,7 +3005,9 @@ async fn handle_similar_callback(
                     .bot
                     .send_message(
                         state.review_chat.clone(),
-                        format!("⚠️ 相似图审批 #{token} 失败，原图未删除，可重新操作"),
+                        format!(
+                            "⚠️ 相似图审批 #{token} 未完成；图库内容已安全备份，频道清理可重新操作"
+                        ),
                     )
                     .await;
             }

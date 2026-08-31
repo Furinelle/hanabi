@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::path::PathBuf;
 
 use anyhow::Result;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::image_dedup::{classify_similarity, inspect_image, ImageFingerprint, MatchKind};
@@ -48,33 +49,100 @@ pub struct CatalogScanReport {
 }
 
 pub fn scan_catalog(images: &[CatalogImage]) -> Result<CatalogScanReport> {
-    let scanned = images
-        .iter()
-        .map(|image| {
-            Ok(ScannedCatalogImage {
-                fingerprint: inspect_image(&image.path)?,
-                image: image.clone(),
-            })
+    let scanned = inspect_catalog_images(images, true)?;
+    build_report(scanned, true)
+}
+
+/// Sequential pair traversal used as an independent catalog-scan reference.
+pub fn sequential_scan_catalog(images: &[CatalogImage]) -> Result<CatalogScanReport> {
+    let scanned = inspect_catalog_images(images, false)?;
+    build_report(scanned, false)
+}
+
+fn inspect_catalog_images(
+    images: &[CatalogImage],
+    parallel: bool,
+) -> Result<Vec<ScannedCatalogImage>> {
+    let inspect = |image: &CatalogImage| {
+        Ok(ScannedCatalogImage {
+            fingerprint: inspect_image(&image.path)?,
+            image: image.clone(),
         })
-        .collect::<Result<Vec<_>>>()?;
+    };
+    if parallel {
+        images.par_iter().map(inspect).collect()
+    } else {
+        images.iter().map(inspect).collect()
+    }
+}
+
+enum PairOutcome {
+    Strict {
+        left: usize,
+        right: usize,
+    },
+    Similar {
+        left: usize,
+        right: usize,
+        distance: u32,
+        kind: &'static str,
+    },
+}
+
+fn classify_right_pairs(scanned: &[ScannedCatalogImage], left: usize) -> Vec<PairOutcome> {
+    let mut row = Vec::new();
+    for right in (left + 1)..scanned.len() {
+        if same_post(&scanned[left], &scanned[right]) {
+            continue;
+        }
+        match classify_similarity(&scanned[left].fingerprint, &scanned[right].fingerprint) {
+            MatchKind::StrictSame => row.push(PairOutcome::Strict { left, right }),
+            MatchKind::Similar { distance } => row.push(PairOutcome::Similar {
+                left,
+                right,
+                distance,
+                kind: "visual",
+            }),
+            MatchKind::Partial { distance } => row.push(PairOutcome::Similar {
+                left,
+                right,
+                distance,
+                kind: "partial",
+            }),
+            MatchKind::Different => {}
+        }
+    }
+    row
+}
+
+fn pair_outcomes(scanned: &[ScannedCatalogImage], parallel: bool) -> Vec<PairOutcome> {
+    if parallel {
+        (0..scanned.len())
+            .into_par_iter()
+            .map(|left| classify_right_pairs(scanned, left))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect()
+    } else {
+        (0..scanned.len())
+            .flat_map(|left| classify_right_pairs(scanned, left))
+            .collect()
+    }
+}
+
+fn build_report(scanned: Vec<ScannedCatalogImage>, parallel: bool) -> Result<CatalogScanReport> {
     let mut sets = DisjointSet::new(scanned.len());
     let mut similar_indices = Vec::new();
-
-    for left in 0..scanned.len() {
-        for right in (left + 1)..scanned.len() {
-            if same_post(&scanned[left], &scanned[right]) {
-                continue;
-            }
-            match classify_similarity(&scanned[left].fingerprint, &scanned[right].fingerprint) {
-                MatchKind::StrictSame => sets.union(left, right),
-                MatchKind::Similar { distance } => {
-                    similar_indices.push((left, right, distance, "visual"));
-                }
-                MatchKind::Partial { distance } => {
-                    similar_indices.push((left, right, distance, "partial"));
-                }
-                MatchKind::Different => {}
-            }
+    for outcome in pair_outcomes(&scanned, parallel) {
+        match outcome {
+            PairOutcome::Strict { left, right } => sets.union(left, right),
+            PairOutcome::Similar {
+                left,
+                right,
+                distance,
+                kind,
+            } => similar_indices.push((left, right, distance, kind)),
         }
     }
 

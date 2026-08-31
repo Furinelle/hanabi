@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use rayon::prelude::*;
 use rusqlite::OptionalExtension;
 use teloxide::prelude::*;
 use teloxide::types::{
@@ -1154,7 +1155,7 @@ fn prepare(path: &Path) -> Result<PathBuf> {
 
 /// 供维护工具在恢复待审原图后重建与正常审批一致的发送文件。
 pub fn prepare_all(files: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    files.iter().map(|p| prepare(p)).collect()
+    files.par_iter().map(|p| prepare(p)).collect()
 }
 
 /// 构造图组:第一张挂 caption,其余无。spoiler=true 时整组打剧透遮罩(R18)。
@@ -1499,7 +1500,7 @@ async fn inspect_images(files: &[PathBuf]) -> Result<Vec<ImageFingerprint>> {
     let files = files.to_vec();
     tokio::task::spawn_blocking(move || {
         files
-            .iter()
+            .par_iter()
             .map(|path| inspect_image(path))
             .collect::<Result<Vec<_>>>()
     })
@@ -3330,6 +3331,46 @@ mod tests {
             panic!("expected document")
         };
         assert_eq!(first.caption, None);
+    }
+
+    #[test]
+    fn parallel_prepare_all_preserves_input_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let pass = dir.path().join("a_pass.png");
+        let wide = dir.path().join("c_wide.png");
+        let tall = dir.path().join("b_tall.png");
+        image::RgbImage::from_pixel(64, 64, image::Rgb([10, 20, 30]))
+            .save(&pass)
+            .unwrap();
+        image::RgbImage::from_pixel(9001, 500, image::Rgb([40, 50, 60]))
+            .save(&wide)
+            .unwrap();
+        image::RgbImage::from_pixel(500, 9001, image::Rgb([70, 80, 90]))
+            .save(&tall)
+            .unwrap();
+
+        let inputs = vec![pass.clone(), wide.clone(), tall.clone()];
+        let outputs = prepare_all(&inputs).unwrap();
+
+        assert_eq!(outputs.len(), inputs.len());
+        assert_eq!(outputs[0], pass, "small image should pass through in place");
+        assert_eq!(outputs[1], wide.with_extension("telegram.jpg"));
+        assert_eq!(outputs[2], tall.with_extension("telegram.jpg"));
+
+        for output in &outputs {
+            let bytes = std::fs::metadata(output).unwrap().len();
+            let (width, height) = image::image_dimensions(output).unwrap();
+            assert!(
+                bytes <= crate::sink::PHOTO_HARD_LIMIT_BYTES,
+                "{} exceeds photo hard limit",
+                output.display()
+            );
+            assert!(
+                !needs_downscale(bytes, width, height),
+                "{} still exceeds Telegram display limits",
+                output.display()
+            );
+        }
     }
 
     #[test]

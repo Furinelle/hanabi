@@ -130,6 +130,7 @@ pub fn inspect_image_bytes(encoded: &[u8]) -> Result<ImageFingerprint> {
 }
 
 /// Sequential grid traversal used as an independent fingerprint reference.
+#[doc(hidden)]
 pub fn inspect_image_bytes_sequential(encoded: &[u8]) -> Result<ImageFingerprint> {
     fingerprint_from_bytes(encoded, split_regions_sequential)
 }
@@ -164,7 +165,7 @@ fn fingerprint_from_bytes(
     })
 }
 
-fn compact_visual_fingerprint(image: &image::DynamicImage) -> (u64, u64, String) {
+fn luma_hashes(image: &image::DynamicImage) -> (u64, u64) {
     let gray = image.to_luma8();
     let average = image::imageops::resize(&gray, HASH_SIDE, HASH_SIDE, FilterType::Triangle);
     let mean = average.pixels().map(|p| u64::from(p[0])).sum::<u64>() / 64;
@@ -183,28 +184,36 @@ fn compact_visual_fingerprint(image: &image::DynamicImage) -> (u64, u64, String)
             }
         }
     }
-    let rgb = image.to_rgb8();
-    let colors = image::imageops::resize(&rgb, COLOR_SIDE, COLOR_SIDE, FilterType::Triangle);
-    let color_bytes: Vec<u8> = colors
-        .pixels()
-        .flat_map(|p| p.0.map(|channel| channel >> 4))
-        .collect();
-    (average_hash, difference_hash, hex_digest(&color_bytes))
+    (average_hash, difference_hash)
 }
 
-fn visual_fingerprint(image: &image::DynamicImage) -> (u64, u64, String, String) {
-    let (average_hash, difference_hash, color_key) = compact_visual_fingerprint(image);
-    let rgb = image.to_rgb8();
-    let details = image::imageops::resize(&rgb, 32, 32, FilterType::Triangle);
-    let detail_bytes: Vec<u8> = details
+fn quantized_digest(rgb: &image::RgbImage, side: u32) -> String {
+    let resized = image::imageops::resize(rgb, side, side, FilterType::Triangle);
+    let bytes: Vec<u8> = resized
         .pixels()
         .flat_map(|p| p.0.map(|channel| channel >> 4))
         .collect();
+    hex_digest(&bytes)
+}
+
+fn compact_visual_fingerprint(image: &image::DynamicImage) -> (u64, u64, String) {
+    let (average_hash, difference_hash) = luma_hashes(image);
+    let rgb = image.to_rgb8();
     (
         average_hash,
         difference_hash,
-        color_key,
-        hex_digest(&detail_bytes),
+        quantized_digest(&rgb, COLOR_SIDE),
+    )
+}
+
+fn visual_fingerprint(image: &image::DynamicImage) -> (u64, u64, String, String) {
+    let (average_hash, difference_hash) = luma_hashes(image);
+    let rgb = image.to_rgb8();
+    (
+        average_hash,
+        difference_hash,
+        quantized_digest(&rgb, COLOR_SIDE),
+        quantized_digest(&rgb, 32),
     )
 }
 

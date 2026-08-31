@@ -54,6 +54,7 @@ pub fn scan_catalog(images: &[CatalogImage]) -> Result<CatalogScanReport> {
 }
 
 /// Sequential pair traversal used as an independent catalog-scan reference.
+#[doc(hidden)]
 pub fn sequential_scan_catalog(images: &[CatalogImage]) -> Result<CatalogScanReport> {
     let scanned = inspect_catalog_images(images, false)?;
     build_report(scanned, false)

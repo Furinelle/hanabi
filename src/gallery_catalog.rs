@@ -49,32 +49,29 @@ pub struct CatalogScanReport {
 }
 
 pub fn scan_catalog(images: &[CatalogImage]) -> Result<CatalogScanReport> {
-    let scanned = inspect_catalog_images(images, true)?;
-    build_report(scanned, true)
+    let scanned = images
+        .par_iter()
+        .map(inspect_catalog_image)
+        .collect::<Result<Vec<_>>>()?;
+    let outcomes = pair_outcomes(&scanned);
+    build_report(scanned, outcomes)
 }
 
-/// Sequential pair traversal used as an independent catalog-scan reference.
-#[doc(hidden)]
-pub fn sequential_scan_catalog(images: &[CatalogImage]) -> Result<CatalogScanReport> {
-    let scanned = inspect_catalog_images(images, false)?;
-    build_report(scanned, false)
+#[cfg(test)]
+fn sequential_scan_catalog(images: &[CatalogImage]) -> Result<CatalogScanReport> {
+    let scanned = images
+        .iter()
+        .map(inspect_catalog_image)
+        .collect::<Result<Vec<_>>>()?;
+    let outcomes = sequential_pair_outcomes(&scanned);
+    build_report(scanned, outcomes)
 }
 
-fn inspect_catalog_images(
-    images: &[CatalogImage],
-    parallel: bool,
-) -> Result<Vec<ScannedCatalogImage>> {
-    let inspect = |image: &CatalogImage| {
-        Ok(ScannedCatalogImage {
-            fingerprint: inspect_image(&image.path)?,
-            image: image.clone(),
-        })
-    };
-    if parallel {
-        images.par_iter().map(inspect).collect()
-    } else {
-        images.iter().map(inspect).collect()
-    }
+fn inspect_catalog_image(image: &CatalogImage) -> Result<ScannedCatalogImage> {
+    Ok(ScannedCatalogImage {
+        fingerprint: inspect_image(&image.path)?,
+        image: image.clone(),
+    })
 }
 
 enum PairOutcome {
@@ -116,26 +113,30 @@ fn classify_right_pairs(scanned: &[ScannedCatalogImage], left: usize) -> Vec<Pai
     row
 }
 
-fn pair_outcomes(scanned: &[ScannedCatalogImage], parallel: bool) -> Vec<PairOutcome> {
-    if parallel {
-        (0..scanned.len())
-            .into_par_iter()
-            .map(|left| classify_right_pairs(scanned, left))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flatten()
-            .collect()
-    } else {
-        (0..scanned.len())
-            .flat_map(|left| classify_right_pairs(scanned, left))
-            .collect()
-    }
+fn pair_outcomes(scanned: &[ScannedCatalogImage]) -> Vec<PairOutcome> {
+    (0..scanned.len())
+        .into_par_iter()
+        .map(|left| classify_right_pairs(scanned, left))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
-fn build_report(scanned: Vec<ScannedCatalogImage>, parallel: bool) -> Result<CatalogScanReport> {
+#[cfg(test)]
+fn sequential_pair_outcomes(scanned: &[ScannedCatalogImage]) -> Vec<PairOutcome> {
+    (0..scanned.len())
+        .flat_map(|left| classify_right_pairs(scanned, left))
+        .collect()
+}
+
+fn build_report(
+    scanned: Vec<ScannedCatalogImage>,
+    outcomes: Vec<PairOutcome>,
+) -> Result<CatalogScanReport> {
     let mut sets = DisjointSet::new(scanned.len());
     let mut similar_indices = Vec::new();
-    for outcome in pair_outcomes(&scanned, parallel) {
+    for outcome in outcomes {
         match outcome {
             PairOutcome::Strict { left, right } => sets.union(left, right),
             PairOutcome::Similar {
@@ -221,5 +222,94 @@ impl DisjointSet {
         if left != right {
             self.parent[right] = left;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::SourceKind;
+    use image::{ImageBuffer, Rgb, RgbImage};
+    use std::path::Path;
+
+    fn patterned(width: u32, height: u32) -> RgbImage {
+        ImageBuffer::from_fn(width, height, |x, y| {
+            let bx = x * 4 / width;
+            let by = y * 4 / height;
+            Rgb([
+                (bx * 53 + by * 17) as u8,
+                (bx * 19 + by * 61) as u8,
+                (bx * 31 + by * 29) as u8,
+            ])
+        })
+    }
+
+    fn save(path: &Path, image: &RgbImage) {
+        image
+            .save_with_format(path, image::ImageFormat::Png)
+            .unwrap();
+    }
+
+    fn entry(path: &Path, source: SourceKind, source_id: &str, key: &str) -> CatalogImage {
+        CatalogImage {
+            work_id: format!("{}:{source_id}", source.as_str()),
+            source,
+            source_id: source_id.into(),
+            title: source_id.into(),
+            author_name: "画师".into(),
+            source_url: format!("https://example.test/{source_id}"),
+            page_index: 0,
+            r2_key: key.into(),
+            path: path.into(),
+        }
+    }
+
+    #[test]
+    fn parallel_catalog_scan_matches_reference_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let low = dir.path().join("low.png");
+        let high = dir.path().join("high.png");
+        let original_path = dir.path().join("original.png");
+        let edited_path = dir.path().join("edited.png");
+        save(&low, &patterned(320, 240));
+        save(&high, &patterned(1280, 960));
+        let original = ImageBuffer::from_fn(640, 480, |x, y| {
+            Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8])
+        });
+        let mut edited = original.clone();
+        for y in 200..260 {
+            for x in 280..360 {
+                edited.put_pixel(x, y, Rgb([255, 255, 255]));
+            }
+        }
+        save(&original_path, &original);
+        save(&edited_path, &edited);
+
+        let images = [
+            entry(&low, SourceKind::X, "x1", "x/low.png"),
+            entry(&high, SourceKind::Pixiv, "p1", "pixiv/high.png"),
+            entry(
+                &original_path,
+                SourceKind::Douyin,
+                "d1",
+                "douyin/original.png",
+            ),
+            entry(&edited_path, SourceKind::X, "x2", "x/edited.png"),
+        ];
+        let expected = sequential_scan_catalog(&images).unwrap();
+        let report = scan_catalog(&images).unwrap();
+        assert_eq!(
+            serde_json::to_value(&report).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(report.strict_groups.len(), 1);
+        assert_eq!(report.strict_groups[0].keep.image.r2_key, "pixiv/high.png");
+        assert_eq!(report.strict_groups[0].remove[0].image.r2_key, "x/low.png");
+        assert_eq!(report.similar_pairs.len(), 1);
+        assert_eq!(
+            report.similar_pairs[0].left.image.r2_key,
+            "douyin/original.png"
+        );
+        assert_eq!(report.similar_pairs[0].right.image.r2_key, "x/edited.png");
     }
 }

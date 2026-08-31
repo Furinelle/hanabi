@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use hanabi::gallery_catalog::{scan_catalog, sequential_scan_catalog, CatalogImage};
+use hanabi::gallery_catalog::{scan_catalog, CatalogImage};
 use hanabi::model::SourceKind;
 use image::{ImageBuffer, Rgb, RgbImage};
 
@@ -34,55 +34,6 @@ fn entry(path: &Path, source: SourceKind, source_id: &str, key: &str) -> Catalog
         r2_key: key.into(),
         path: path.into(),
     }
-}
-
-#[test]
-fn parallel_catalog_scan_matches_reference_order() {
-    let dir = tempfile::tempdir().unwrap();
-    let low = dir.path().join("low.png");
-    let high = dir.path().join("high.png");
-    let original_path = dir.path().join("original.png");
-    let edited_path = dir.path().join("edited.png");
-    save(&low, &patterned(320, 240));
-    save(&high, &patterned(1280, 960));
-    let original = ImageBuffer::from_fn(640, 480, |x, y| {
-        Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8])
-    });
-    let mut edited = original.clone();
-    for y in 200..260 {
-        for x in 280..360 {
-            edited.put_pixel(x, y, Rgb([255, 255, 255]));
-        }
-    }
-    save(&original_path, &original);
-    save(&edited_path, &edited);
-
-    let images = [
-        entry(&low, SourceKind::X, "x1", "x/low.png"),
-        entry(&high, SourceKind::Pixiv, "p1", "pixiv/high.png"),
-        entry(
-            &original_path,
-            SourceKind::Douyin,
-            "d1",
-            "douyin/original.png",
-        ),
-        entry(&edited_path, SourceKind::X, "x2", "x/edited.png"),
-    ];
-    let expected = sequential_scan_catalog(&images).unwrap();
-    let report = scan_catalog(&images).unwrap();
-    assert_eq!(
-        serde_json::to_value(&report).unwrap(),
-        serde_json::to_value(&expected).unwrap()
-    );
-    assert_eq!(report.strict_groups.len(), 1);
-    assert_eq!(report.strict_groups[0].keep.image.r2_key, "pixiv/high.png");
-    assert_eq!(report.strict_groups[0].remove[0].image.r2_key, "x/low.png");
-    assert_eq!(report.similar_pairs.len(), 1);
-    assert_eq!(
-        report.similar_pairs[0].left.image.r2_key,
-        "douyin/original.png"
-    );
-    assert_eq!(report.similar_pairs[0].right.image.r2_key, "x/edited.png");
 }
 
 #[test]

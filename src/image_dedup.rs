@@ -129,15 +129,14 @@ pub fn inspect_image_bytes(encoded: &[u8]) -> Result<ImageFingerprint> {
     fingerprint_from_bytes(encoded, split_regions)
 }
 
-/// Sequential grid traversal used as an independent fingerprint reference.
-#[doc(hidden)]
-pub fn inspect_image_bytes_sequential(encoded: &[u8]) -> Result<ImageFingerprint> {
+#[cfg(test)]
+fn inspect_image_bytes_sequential(encoded: &[u8]) -> Result<ImageFingerprint> {
     fingerprint_from_bytes(encoded, split_regions_sequential)
 }
 
 fn fingerprint_from_bytes(
     encoded: &[u8],
-    split_regions: fn(&image::DynamicImage) -> Vec<RegionFingerprint>,
+    split_regions: impl FnOnce(&image::DynamicImage) -> Vec<RegionFingerprint>,
 ) -> Result<ImageFingerprint> {
     let format = image::guess_format(encoded)
         .map(|value| format!("{value:?}").to_ascii_uppercase())
@@ -261,6 +260,7 @@ fn split_regions(image: &image::DynamicImage) -> Vec<RegionFingerprint> {
         .collect()
 }
 
+#[cfg(test)]
 fn split_regions_sequential(image: &image::DynamicImage) -> Vec<RegionFingerprint> {
     region_windows(image)
         .into_iter()
@@ -692,5 +692,94 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KiB", bytes as f64 / 1024.0)
     } else {
         format!("{bytes} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{ImageBuffer, Rgb, RgbImage};
+    use std::path::Path;
+
+    fn patterned(width: u32, height: u32) -> RgbImage {
+        ImageBuffer::from_fn(width, height, |x, y| {
+            let bx = x * 4 / width;
+            let by = y * 4 / height;
+            Rgb([
+                (bx * 53 + by * 17) as u8,
+                (bx * 19 + by * 61) as u8,
+                (bx * 31 + by * 29) as u8,
+            ])
+        })
+    }
+
+    fn save_with_format(path: &Path, image: &RgbImage, format: image::ImageFormat) {
+        image.save_with_format(path, format).unwrap();
+    }
+
+    #[test]
+    fn parallel_fingerprint_matches_sequential_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let png_path = dir.path().join("wide.png");
+        let jpeg_path = dir.path().join("tall.jpg");
+        let bmp_path = dir.path().join("square.bmp");
+        save_with_format(&png_path, &patterned(320, 240), image::ImageFormat::Png);
+        save_with_format(&jpeg_path, &patterned(200, 400), image::ImageFormat::Jpeg);
+        save_with_format(&bmp_path, &patterned(480, 480), image::ImageFormat::Bmp);
+
+        let expected_320x240_region_sizes: [(u32, u32); 23] = [
+            (160, 240),
+            (160, 240),
+            (106, 240),
+            (107, 240),
+            (107, 240),
+            (320, 120),
+            (320, 120),
+            (320, 80),
+            (320, 80),
+            (320, 80),
+            (160, 120),
+            (160, 120),
+            (160, 120),
+            (160, 120),
+            (106, 80),
+            (107, 80),
+            (107, 80),
+            (106, 80),
+            (107, 80),
+            (107, 80),
+            (106, 80),
+            (107, 80),
+            (107, 80),
+        ];
+
+        for path in [&png_path, &jpeg_path, &bmp_path] {
+            let encoded = std::fs::read(path).unwrap();
+            let production = inspect_image_bytes(&encoded).unwrap();
+            let sequential = inspect_image_bytes_sequential(&encoded).unwrap();
+            assert_eq!(
+                production,
+                sequential,
+                "fingerprint mismatch for {}",
+                path.display()
+            );
+            assert_eq!(
+                production.regions.len(),
+                23,
+                "region order/count mismatch for {}",
+                path.display()
+            );
+        }
+
+        let png = inspect_image(&png_path).unwrap();
+        let sizes: Vec<(u32, u32)> = png
+            .regions
+            .iter()
+            .map(|region| (region.width, region.height))
+            .collect();
+        assert_eq!(
+            sizes, expected_320x240_region_sizes,
+            "320×240 region window order drifted"
+        );
     }
 }

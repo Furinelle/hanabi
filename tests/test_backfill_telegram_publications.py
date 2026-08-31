@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tools.backfill_telegram_publications import build_manifest
+from tools.backfill_telegram_publications import build_manifest, normalize_export_messages
 
 
 class BackfillTelegramPublicationsTest(unittest.TestCase):
@@ -54,6 +54,49 @@ class BackfillTelegramPublicationsTest(unittest.TestCase):
         result = build_manifest(messages, {"pixiv:2"})
         self.assertEqual(result["matched"][0]["message_ids"], [41, 42])
         self.assertNotIn(43, result["matched"][0]["message_ids"])
+
+    def test_normalizes_tdl_raw_channel_album(self):
+        messages = normalize_export_messages(
+            [
+                {
+                    "id": 41,
+                    "type": "message",
+                    "raw": {
+                        "ID": 41,
+                        "GroupedID": 9001,
+                        "Message": "source",
+                        "PeerID": {"ChannelID": 3664074984},
+                        "Entities": [
+                            {
+                                "Offset": 0,
+                                "Length": 6,
+                                "URL": "https://www.pixiv.net/artworks/147342918",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "id": 42,
+                    "type": "message",
+                    "raw": {
+                        "ID": 42,
+                        "GroupedID": 9001,
+                        "Message": "",
+                        "PeerID": {"ChannelID": 3664074984},
+                        "Entities": None,
+                    },
+                },
+            ]
+        )
+        self.assertEqual(messages[0]["chat_id"], -1003664074984)
+        result = build_manifest(messages, {"pixiv:147342918"})
+        self.assertEqual(result["matched"][0]["message_ids"], [41, 42])
+
+    def test_rejects_minimal_tdl_export_without_raw_fields(self):
+        with self.assertRaisesRegex(SystemExit, "rerun with --raw"):
+            normalize_export_messages(
+                [{"id": 41, "type": "message", "text": "https://example.com"}]
+            )
 
 
 if __name__ == "__main__":

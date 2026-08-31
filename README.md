@@ -138,7 +138,7 @@ bot 启动后：抓取循环按 `poll_interval_secs` 定时跑，审批回调任
 cargo run --release --bin gallery_catalog -- manifest.json report.json
 ```
 
-历史频道帖的 Telegram mapping 只能按精确来源链接回填。先用已登录的 Telegram 客户端导出发布频道（`tdl chat export --all --with-content`），再对照 Vitrine catalog JSON：
+历史频道帖的 Telegram mapping 只能按精确来源链接回填。先用已登录的 Telegram 客户端导出发布频道（`tdl chat export --all --with-content --raw`）；必须包含 raw 字段，默认最小导出缺少媒体组和 chat ID，会被工具拒绝。再对照 Vitrine catalog JSON：
 
 ```bash
 python3 tools/backfill_telegram_publications.py \

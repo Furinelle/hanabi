@@ -142,16 +142,68 @@ def build_manifest(
     return {"matched": matched, "ambiguous": ambiguous, "missing": missing}
 
 
+def telegram_peer_chat_id(peer: Any) -> int | None:
+    if not isinstance(peer, dict):
+        return None
+    channel_id = peer.get("ChannelID")
+    if isinstance(channel_id, int) and channel_id > 0:
+        return -int(f"100{channel_id}")
+    chat_id = peer.get("ChatID")
+    if isinstance(chat_id, int) and chat_id > 0:
+        return -chat_id
+    user_id = peer.get("UserID")
+    if isinstance(user_id, int) and user_id > 0:
+        return user_id
+    return None
+
+
+def normalize_export_messages(messages: list[Any]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in messages:
+        if not isinstance(item, dict):
+            raise SystemExit("export contains a non-object message")
+        if isinstance(item.get("id"), int) and isinstance(item.get("chat_id"), int):
+            normalized.append(item)
+            continue
+        raw = item.get("raw")
+        if not isinstance(raw, dict):
+            raise SystemExit("tdl export lacks raw Telegram fields; rerun with --raw")
+        message_id = raw.get("ID")
+        chat_id = telegram_peer_chat_id(raw.get("PeerID"))
+        if not isinstance(message_id, int) or message_id <= 0 or chat_id is None:
+            raise SystemExit("tdl raw export contains an invalid message identity")
+        grouped_id = raw.get("GroupedID")
+        visible_text = raw.get("Message") if isinstance(raw.get("Message"), str) else ""
+        entity_urls = [
+            entity["URL"]
+            for entity in (raw.get("Entities") or [])
+            if isinstance(entity, dict)
+            and isinstance(entity.get("URL"), str)
+            and entity["URL"].strip()
+        ]
+        normalized.append(
+            {
+                "id": message_id,
+                "chat_id": chat_id,
+                "media_group_id": str(grouped_id)
+                if isinstance(grouped_id, int) and grouped_id > 0
+                else "",
+                "text": "\n".join([visible_text, *entity_urls]),
+            }
+        )
+    return normalized
+
+
 def load_messages(path: str) -> list[dict[str, Any]]:
     with open(path, encoding="utf-8") as handle:
         payload = json.load(handle)
     if isinstance(payload, list):
-        return payload
+        return normalize_export_messages(payload)
     if isinstance(payload, dict):
         for key in ("messages", "data", "items"):
             value = payload.get(key)
             if isinstance(value, list):
-                return value
+                return normalize_export_messages(value)
     raise SystemExit("export JSON must be a message list or an object with messages")
 
 

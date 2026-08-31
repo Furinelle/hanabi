@@ -29,10 +29,10 @@ use crate::similar_review::{
     review_messages as similar_review_messages, work_prune_plan, SimilarDecision,
     SimilarReviewGroup,
 };
-use crate::sink::{needs_downscale, render_caption, Sink};
+use crate::sink::{
+    needs_downscale, render_caption, Sink, PHOTO_TARGET_BYTES, PHOTO_TARGET_DIMENSION_SUM,
+};
 
-/// Telegram photo 缩放目标边长上限(超限按比例缩到此框内)。
-const MAX_DIMENSION: u32 = 4096;
 /// pending 保留时长上限(秒);超期未审批自动清理(删消息+文件+记录)。
 const PENDING_TTL_SECS: i64 = 7 * 24 * 3600;
 /// 最近一次丢弃可撤销的保留时间。与 pending 一致，避免误丢弃文件永久占盘。
@@ -1037,25 +1037,119 @@ where
     }
 }
 
-/// 超限则缩放到限制内,返回最终发送路径(可能是缩放后的临时文件)。
-fn prepare(path: &Path) -> Result<PathBuf> {
+fn encode_highest_fitting_quality<F>(
+    max_bytes: usize,
+    mut encode: F,
+) -> Result<Option<(u8, Vec<u8>)>>
+where
+    F: FnMut(u8) -> Result<Vec<u8>>,
+{
+    let mut lower = 1_u8;
+    let mut upper = 100_u8;
+    let mut best = None;
+    while lower <= upper {
+        let quality = lower + (upper - lower) / 2;
+        let encoded = encode(quality)?;
+        if encoded.len() <= max_bytes {
+            best = Some((quality, encoded));
+            if quality == 100 {
+                break;
+            }
+            lower = quality + 1;
+        } else {
+            if quality == 1 {
+                break;
+            }
+            upper = quality - 1;
+        }
+    }
+    Ok(best)
+}
+
+fn fit_dimension_sum(image: image::DynamicImage, max_dimension_sum: u32) -> image::DynamicImage {
+    let sum = image.width().saturating_add(image.height());
+    if sum <= max_dimension_sum || sum == 0 {
+        return image;
+    }
+    let scale = f64::from(max_dimension_sum) / f64::from(sum);
+    let width = (f64::from(image.width()) * scale).floor().max(1.0) as u32;
+    let height = (f64::from(image.height()) * scale).floor().max(1.0) as u32;
+    image.resize_exact(width, height, image::imageops::FilterType::Lanczos3)
+}
+
+fn shrink_once(image: &image::DynamicImage) -> image::DynamicImage {
+    let width = (image.width() * 85 / 100).max(1);
+    let height = (image.height() * 85 / 100).max(1);
+    image.resize_exact(width, height, image::imageops::FilterType::Lanczos3)
+}
+
+fn encode_png(image: &image::DynamicImage) -> Result<Vec<u8>> {
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut cursor, image::ImageFormat::Png)
+        .context("编码 Telegram PNG 失败")?;
+    Ok(cursor.into_inner())
+}
+
+fn prepare_with_limits(path: &Path, max_bytes: usize, max_dimension_sum: u32) -> Result<PathBuf> {
     let bytes = std::fs::metadata(path)?.len();
     let (w, h) = image::image_dimensions(path).unwrap_or((0, 0));
-    if !needs_downscale(bytes, w, h) {
+    if bytes <= max_bytes as u64 && w.saturating_add(h) <= max_dimension_sum {
         return Ok(path.to_path_buf());
     }
-    let dyn_img = image::open(path).context("打开图片失败")?;
-    let scaled = dyn_img.resize(
-        MAX_DIMENSION,
-        MAX_DIMENSION,
-        image::imageops::FilterType::Lanczos3,
+    let mut image = fit_dimension_sum(
+        image::open(path).context("打开图片失败")?,
+        max_dimension_sum,
     );
-    // 保留原格式: PNG 缩放后仍是 PNG(保 alpha), JPG 仍是 JPG。
-    // DynamicImage::save 按扩展名推断编码,RGBA 透明通道得以保留。
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("jpg");
-    let out = path.with_extension(format!("scaled.{ext}"));
-    scaled.save(&out).context("保存缩放图失败")?;
-    Ok(out)
+    if image.color().has_alpha() {
+        loop {
+            let encoded = encode_png(&image)?;
+            if encoded.len() <= max_bytes {
+                let out = path.with_extension("telegram.png");
+                std::fs::write(&out, encoded).context("保存 Telegram PNG 失败")?;
+                return Ok(out);
+            }
+            if image.width() == 1 && image.height() == 1 {
+                anyhow::bail!("透明 PNG 无法压缩到 Telegram photo 限制内");
+            }
+            image = shrink_once(&image);
+        }
+    }
+
+    loop {
+        let rgb = image.to_rgb8();
+        if let Some((_quality, encoded)) = encode_highest_fitting_quality(max_bytes, |quality| {
+            let mut encoded = Vec::new();
+            rgb.write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
+                &mut encoded,
+                quality,
+            ))
+            .context("编码 Telegram JPEG 失败")?;
+            Ok(encoded)
+        })? {
+            let out = path.with_extension("telegram.jpg");
+            std::fs::write(&out, encoded).context("保存 Telegram JPEG 失败")?;
+            return Ok(out);
+        }
+        if image.width() == 1 && image.height() == 1 {
+            anyhow::bail!("图片无法压缩到 Telegram photo 限制内");
+        }
+        image = shrink_once(&image);
+    }
+}
+
+/// 生成审批与频道共同复用的 Telegram 展示副本；原图保留给评论区 document。
+fn prepare(path: &Path) -> Result<PathBuf> {
+    let bytes = std::fs::metadata(path)?.len();
+    let (width, height) = image::image_dimensions(path).unwrap_or((0, 0));
+    if !needs_downscale(bytes, width, height) {
+        return Ok(path.to_path_buf());
+    }
+    prepare_with_limits(
+        path,
+        PHOTO_TARGET_BYTES as usize,
+        PHOTO_TARGET_DIMENSION_SUM,
+    )
 }
 
 /// 供维护工具在恢复待审原图后重建与正常审批一致的发送文件。
@@ -3254,6 +3348,37 @@ mod tests {
         assert_eq!(out.extension().unwrap(), "png", "应保留 png 而非转 jpg");
         let reloaded = image::open(&out).unwrap();
         assert!(reloaded.color().has_alpha(), "应保留 alpha 通道");
+    }
+
+    #[test]
+    fn quality_search_chooses_the_highest_fitting_jpeg_quality() {
+        let (quality, encoded) =
+            encode_highest_fitting_quality(250, |quality| Ok(vec![0_u8; usize::from(quality) * 3]))
+                .unwrap()
+                .expect("quality 1 should fit");
+
+        assert_eq!(quality, 83);
+        assert_eq!(encoded.len(), 249);
+    }
+
+    #[test]
+    fn opaque_preview_uses_maximum_quality_before_reducing_dimensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("detailed.png");
+        let image = image::RgbImage::from_fn(1200, 1200, |x, y| {
+            let value = ((x.wrapping_mul(37) ^ y.wrapping_mul(91) ^ (x * y)) & 0xff) as u8;
+            image::Rgb([value, value.wrapping_mul(3), value.wrapping_add(71)])
+        });
+        image.save(&src).unwrap();
+        let original = std::fs::read(&src).unwrap();
+
+        let out = prepare_with_limits(&src, 250_000, 9_500).unwrap();
+
+        assert_ne!(out, src);
+        assert_eq!(out.extension().unwrap(), "jpg");
+        assert!(std::fs::metadata(&out).unwrap().len() <= 250_000);
+        assert_eq!(image::image_dimensions(&out).unwrap(), (1200, 1200));
+        assert_eq!(std::fs::read(&src).unwrap(), original, "原图不得改写");
     }
 
     #[test]

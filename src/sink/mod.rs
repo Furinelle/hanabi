@@ -72,9 +72,13 @@ pub fn render_caption(item: &MediaItem) -> String {
     s
 }
 
-/// Telegram photo 上限:约 10MB,且宽+高 ≤ 10000。超限需缩放。
+/// Telegram photo 展示副本的安全目标：给 10 MiB / 宽高和 10000 的硬限制留余量。
+pub const PHOTO_TARGET_BYTES: u64 = 9_500_000;
+pub const PHOTO_TARGET_DIMENSION_SUM: u32 = 9_500;
+
+/// 超过展示副本安全目标时需要重新编码或缩放。
 pub fn needs_downscale(bytes: u64, width: u32, height: u32) -> bool {
-    bytes > 10_000_000 || (width + height) > 10_000
+    bytes > PHOTO_TARGET_BYTES || (width + height) > PHOTO_TARGET_DIMENSION_SUM
 }
 
 /// Telegram sendPhoto 硬上限(实测报错阈值:file too big for a photo, max 10485760)。

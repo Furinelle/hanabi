@@ -2,8 +2,9 @@ use std::cmp::Ordering;
 use std::path::Path;
 
 use hanabi::image_dedup::{
-    classify_similarity, evaluate_work, init_schema, inspect_image, mark_work_status, record_work,
-    remove_work, render_review_notice, ExactAction, MatchKind, WorkStatus,
+    classify_similarity, evaluate_work, init_schema, inspect_image, inspect_image_bytes,
+    inspect_image_bytes_sequential, mark_work_status, record_work, remove_work,
+    render_review_notice, ExactAction, MatchKind, WorkStatus,
 };
 use hanabi::model::{Author, ImageRef, MediaItem, SourceKind};
 use image::{ImageBuffer, Rgb, RgbImage};
@@ -48,6 +49,38 @@ fn save_png(path: &Path, image: &RgbImage) {
     image
         .save_with_format(path, image::ImageFormat::Png)
         .unwrap();
+}
+
+fn save_with_format(path: &Path, image: &RgbImage, format: image::ImageFormat) {
+    image.save_with_format(path, format).unwrap();
+}
+
+#[test]
+fn parallel_fingerprint_matches_sequential_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let png_path = dir.path().join("wide.png");
+    let jpeg_path = dir.path().join("tall.jpg");
+    let bmp_path = dir.path().join("square.bmp");
+    save_png(&png_path, &patterned(320, 240));
+    save_with_format(&jpeg_path, &patterned(200, 400), image::ImageFormat::Jpeg);
+    save_with_format(&bmp_path, &patterned(480, 480), image::ImageFormat::Bmp);
+
+    for path in [&png_path, &jpeg_path, &bmp_path] {
+        let encoded = std::fs::read(path).unwrap();
+        let production = inspect_image_bytes(&encoded).unwrap();
+        let sequential = inspect_image_bytes_sequential(&encoded).unwrap();
+        assert_eq!(
+            production, sequential,
+            "fingerprint mismatch for {}",
+            path.display()
+        );
+        assert_eq!(
+            production.regions.len(),
+            23,
+            "region order/count mismatch for {}",
+            path.display()
+        );
+    }
 }
 
 #[test]

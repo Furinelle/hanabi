@@ -4,6 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use image::imageops::FilterType;
+use rayon::prelude::*;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -125,6 +126,18 @@ pub fn inspect_image(path: &Path) -> Result<ImageFingerprint> {
 }
 
 pub fn inspect_image_bytes(encoded: &[u8]) -> Result<ImageFingerprint> {
+    fingerprint_from_bytes(encoded, split_regions)
+}
+
+/// Sequential grid traversal used as an independent fingerprint reference.
+pub fn inspect_image_bytes_sequential(encoded: &[u8]) -> Result<ImageFingerprint> {
+    fingerprint_from_bytes(encoded, split_regions_sequential)
+}
+
+fn fingerprint_from_bytes(
+    encoded: &[u8],
+    split_regions: fn(&image::DynamicImage) -> Vec<RegionFingerprint>,
+) -> Result<ImageFingerprint> {
     let format = image::guess_format(encoded)
         .map(|value| format!("{value:?}").to_ascii_uppercase())
         .unwrap_or_else(|_| "UNKNOWN".into());
@@ -151,7 +164,7 @@ pub fn inspect_image_bytes(encoded: &[u8]) -> Result<ImageFingerprint> {
     })
 }
 
-fn visual_fingerprint(image: &image::DynamicImage) -> (u64, u64, String, String) {
+fn compact_visual_fingerprint(image: &image::DynamicImage) -> (u64, u64, String) {
     let gray = image.to_luma8();
     let average = image::imageops::resize(&gray, HASH_SIDE, HASH_SIDE, FilterType::Triangle);
     let mean = average.pixels().map(|p| u64::from(p[0])).sum::<u64>() / 64;
@@ -176,6 +189,12 @@ fn visual_fingerprint(image: &image::DynamicImage) -> (u64, u64, String, String)
         .pixels()
         .flat_map(|p| p.0.map(|channel| channel >> 4))
         .collect();
+    (average_hash, difference_hash, hex_digest(&color_bytes))
+}
+
+fn visual_fingerprint(image: &image::DynamicImage) -> (u64, u64, String, String) {
+    let (average_hash, difference_hash, color_key) = compact_visual_fingerprint(image);
+    let rgb = image.to_rgb8();
     let details = image::imageops::resize(&rgb, 32, 32, FilterType::Triangle);
     let detail_bytes: Vec<u8> = details
         .pixels()
@@ -184,12 +203,12 @@ fn visual_fingerprint(image: &image::DynamicImage) -> (u64, u64, String, String)
     (
         average_hash,
         difference_hash,
-        hex_digest(&color_bytes),
+        color_key,
         hex_digest(&detail_bytes),
     )
 }
 
-fn split_regions(image: &image::DynamicImage) -> Vec<RegionFingerprint> {
+fn region_windows(image: &image::DynamicImage) -> Vec<(u32, u32, u32, u32)> {
     let mut output = Vec::new();
     for (columns, rows) in [(2, 1), (3, 1), (1, 2), (1, 3), (2, 2), (3, 3)] {
         for row in 0..rows {
@@ -201,19 +220,43 @@ fn split_regions(image: &image::DynamicImage) -> Vec<RegionFingerprint> {
                 if x1 <= x0 || y1 <= y0 {
                     continue;
                 }
-                let region = image.crop_imm(x0, y0, x1 - x0, y1 - y0);
-                let visual = visual_fingerprint(&region);
-                output.push(RegionFingerprint {
-                    width: x1 - x0,
-                    height: y1 - y0,
-                    average_hash: visual.0,
-                    difference_hash: visual.1,
-                    color_key: visual.2,
-                });
+                output.push((x0, y0, x1 - x0, y1 - y0));
             }
         }
     }
     output
+}
+
+fn region_fingerprint(
+    image: &image::DynamicImage,
+    x0: u32,
+    y0: u32,
+    width: u32,
+    height: u32,
+) -> RegionFingerprint {
+    let region = image.crop_imm(x0, y0, width, height);
+    let visual = compact_visual_fingerprint(&region);
+    RegionFingerprint {
+        width,
+        height,
+        average_hash: visual.0,
+        difference_hash: visual.1,
+        color_key: visual.2,
+    }
+}
+
+fn split_regions(image: &image::DynamicImage) -> Vec<RegionFingerprint> {
+    region_windows(image)
+        .into_par_iter()
+        .map(|(x0, y0, width, height)| region_fingerprint(image, x0, y0, width, height))
+        .collect()
+}
+
+fn split_regions_sequential(image: &image::DynamicImage) -> Vec<RegionFingerprint> {
+    region_windows(image)
+        .into_iter()
+        .map(|(x0, y0, width, height)| region_fingerprint(image, x0, y0, width, height))
+        .collect()
 }
 
 pub fn classify_similarity(left: &ImageFingerprint, right: &ImageFingerprint) -> MatchKind {

@@ -2875,6 +2875,51 @@ async fn delete_mapped_telegram_messages(
     Ok(())
 }
 
+fn similar_review_failure_text(
+    token: i64,
+    publish_channel: &Recipient,
+    targets: &[crate::gallery::GalleryTelegramTarget],
+) -> String {
+    let generic =
+        || format!("⚠️ 相似图审批 #{token} 未完成；图库内容已安全备份，频道清理可重新操作");
+    if targets.is_empty() {
+        return generic();
+    }
+
+    let mut details = Vec::new();
+    for target in targets {
+        let links: Vec<String> = target
+            .message_ids
+            .iter()
+            .filter_map(|message_id| match publish_channel {
+                Recipient::ChannelUsername(username) => {
+                    let username = username.trim().trim_start_matches('@');
+                    (!username.is_empty()).then(|| format!("https://t.me/{username}/{message_id}"))
+                }
+                Recipient::Id(_) => target
+                    .chat_id
+                    .to_string()
+                    .strip_prefix("-100")
+                    .filter(|channel_id| !channel_id.is_empty())
+                    .map(|channel_id| format!("https://t.me/c/{channel_id}/{message_id}")),
+            })
+            .collect();
+        if !links.is_empty() {
+            details.push(format!("• {}", target.work_id));
+            details.extend(links);
+        }
+    }
+    if details.is_empty() {
+        return generic();
+    }
+
+    format!(
+        "⚠️ 相似图审批 #{token} 未完成；图库内容已安全备份。\n\
+         请手动删除以下频道消息后再处理：\n{}",
+        details.join("\n")
+    )
+}
+
 #[cfg(test)]
 fn similar_prune_plan(
     group: &SimilarReviewGroup,
@@ -3001,6 +3046,7 @@ async fn handle_similar_callback(
 
     let state = state.clone();
     tokio::spawn(async move {
+        let mut manual_cleanup_targets = Vec::new();
         let result: Result<()> = async {
             match decision {
                 SimilarDecision::KeepAll => Ok(()),
@@ -3023,11 +3069,15 @@ async fn handle_similar_callback(
                     loop {
                         match next_prune_action(progress) {
                             PruneAction::DeleteTelegram => {
-                                delete_mapped_telegram_messages(
+                                if let Err(error) = delete_mapped_telegram_messages(
                                     &state.bot,
                                     &pruned.telegram_targets,
                                 )
-                                .await?;
+                                .await
+                                {
+                                    manual_cleanup_targets = pruned.telegram_targets.clone();
+                                    return Err(error);
+                                }
                                 progress = PruneProgress::TelegramDeleted;
                             }
                             PruneAction::FinalizeGallery => {
@@ -3100,8 +3150,10 @@ async fn handle_similar_callback(
                     .bot
                     .send_message(
                         state.review_chat.clone(),
-                        format!(
-                            "⚠️ 相似图审批 #{token} 未完成；图库内容已安全备份，频道清理可重新操作"
+                        similar_review_failure_text(
+                            token,
+                            &state.publish_channel,
+                            &manual_cleanup_targets,
                         ),
                     )
                     .await;
@@ -3167,6 +3219,61 @@ mod tests {
         assert!(!is_idempotent_delete_error(
             "Forbidden: bot is not an administrator"
         ));
+    }
+
+    #[test]
+    fn similar_failure_notice_lists_public_channel_links_for_manual_cleanup() {
+        let targets = vec![crate::gallery::GalleryTelegramTarget {
+            publication_id: "x:82:-1003664074984:4634".into(),
+            work_id: "x:2084119062460961271".into(),
+            chat_id: -1003664074984,
+            message_ids: vec![4634, 4635],
+        }];
+
+        let text = similar_review_failure_text(
+            82,
+            &Recipient::ChannelUsername("@FurinaDeCanvas".into()),
+            &targets,
+        );
+
+        assert_eq!(
+            text,
+            "⚠️ 相似图审批 #82 未完成；图库内容已安全备份。\n\
+             请手动删除以下频道消息后再处理：\n\
+             • x:2084119062460961271\n\
+             https://t.me/FurinaDeCanvas/4634\n\
+             https://t.me/FurinaDeCanvas/4635"
+        );
+    }
+
+    #[test]
+    fn similar_failure_notice_supports_numeric_channel_links() {
+        let targets = vec![crate::gallery::GalleryTelegramTarget {
+            publication_id: "x:84:-1003664074984:6325".into(),
+            work_id: "x:2091492063619764518".into(),
+            chat_id: -1003664074984,
+            message_ids: vec![6325],
+        }];
+
+        let text =
+            similar_review_failure_text(84, &Recipient::Id(ChatId(-1003664074984)), &targets);
+
+        assert!(text.contains("https://t.me/c/3664074984/6325"));
+    }
+
+    #[test]
+    fn similar_failure_notice_stays_generic_before_targets_are_known() {
+        let text = similar_review_failure_text(
+            82,
+            &Recipient::ChannelUsername("@FurinaDeCanvas".into()),
+            &[],
+        );
+
+        assert_eq!(
+            text,
+            "⚠️ 相似图审批 #82 未完成；图库内容已安全备份，频道清理可重新操作"
+        );
+        assert!(!text.contains("https://t.me/"));
     }
 
     #[test]

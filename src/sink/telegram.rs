@@ -24,11 +24,13 @@ use crate::image_dedup::{
 };
 use crate::model::MediaItem;
 use crate::similar_review::{
-    claim_review as claim_similar_review, finish_review as finish_similar_review,
-    init_schema as init_similar_review_schema, load_review as load_similar_review,
-    parse_callback as parse_similar_callback, restore_review as restore_similar_review,
-    review_messages as similar_review_messages, work_prune_plan, SimilarDecision,
-    SimilarReviewGroup,
+    claim_manual_review as claim_manual_similar_review, claim_review as claim_similar_review,
+    finish_review as finish_similar_review, init_schema as init_similar_review_schema,
+    load_manual_review as load_manual_similar_review, load_review as load_similar_review,
+    mark_manual_cleanup as mark_manual_similar_cleanup, parse_callback as parse_similar_callback,
+    restore_manual_review as restore_manual_similar_review,
+    restore_review as restore_similar_review, review_messages as similar_review_messages,
+    work_prune_plan, SimilarDecision, SimilarReviewGroup,
 };
 use crate::sink::{
     needs_downscale, render_caption, Sink, PHOTO_TARGET_BYTES, PHOTO_TARGET_DIMENSION_SUM,
@@ -2822,6 +2824,26 @@ fn similar_confirm_keyboard(
     ])
 }
 
+fn similar_manual_cleanup_keyboard(token: i64, index: usize) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+        "✅ 我已手动删除频道消息",
+        format!("similar:{token}:manual:{index}"),
+    )]])
+}
+
+fn similar_manual_confirm_keyboard(token: i64, index: usize) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback(
+            "⚠️ 确认全部链接均已删除",
+            format!("similar:{token}:manual-confirm:{index}"),
+        )],
+        vec![InlineKeyboardButton::callback(
+            "↩️ 返回",
+            format!("similar:{token}:manual-cancel:{index}"),
+        )],
+    ])
+}
+
 #[cfg(test)]
 struct SimilarPrunePlan {
     keep_work_id: String,
@@ -2848,6 +2870,13 @@ fn next_prune_action(progress: PruneProgress) -> PruneAction {
         PruneProgress::GalleryPruned => PruneAction::DeleteTelegram,
         PruneProgress::TelegramDeleted => PruneAction::FinalizeGallery,
         PruneProgress::Complete => PruneAction::FinishReview,
+    }
+}
+
+fn initial_prune_progress(decision: SimilarDecision) -> PruneProgress {
+    match decision {
+        SimilarDecision::ManualConfirm(_) => PruneProgress::TelegramDeleted,
+        _ => PruneProgress::GalleryPruned,
     }
 }
 
@@ -2946,22 +2975,16 @@ fn remove_pruned_fingerprints(
     group: &SimilarReviewGroup,
     keep_work_id: &str,
 ) -> Result<()> {
-    for image in &group.images {
-        if image.work_id() == keep_work_id {
+    for post in group.posts() {
+        if post.work_id == keep_work_id {
             continue;
         }
-        let Some((work_id, image_index)) = image.image_id.rsplit_once('#') else {
-            continue;
-        };
-        let Some((source, source_id)) = work_id.split_once(':') else {
-            continue;
-        };
-        let Ok(image_index) = image_index.parse::<i64>() else {
+        let Some((source, source_id)) = post.work_id.split_once(':') else {
             continue;
         };
         conn.execute(
-            "DELETE FROM image_fingerprints WHERE source_kind=?1 AND source_id=?2 AND image_index=?3",
-            rusqlite::params![source, source_id, image_index],
+            "DELETE FROM image_fingerprints WHERE source_kind=?1 AND source_id=?2",
+            rusqlite::params![source, source_id],
         )?;
     }
     Ok(())
@@ -2973,7 +2996,45 @@ async fn handle_similar_callback(
     token: i64,
     decision: SimilarDecision,
 ) -> Result<()> {
+    let callback_message = q
+        .message
+        .as_ref()
+        .map(|message| (message.chat().id, message.id()));
     match decision {
+        SimilarDecision::ManualSelect(index) | SimilarDecision::ManualCancel(index) => {
+            let ready = {
+                let db = state.db.lock().await;
+                load_manual_similar_review(&db, token, index)?.is_some()
+            };
+            let Some((chat_id, message_id)) = callback_message else {
+                let _ = state
+                    .bot
+                    .answer_callback_query(q.id)
+                    .text("手动清理确认消息已失效")
+                    .await;
+                return Ok(());
+            };
+            if !ready {
+                let _ = state
+                    .bot
+                    .answer_callback_query(q.id)
+                    .text("该组已处理或手动清理状态失效")
+                    .await;
+                return Ok(());
+            }
+            let keyboard = match decision {
+                SimilarDecision::ManualSelect(_) => similar_manual_confirm_keyboard(token, index),
+                SimilarDecision::ManualCancel(_) => similar_manual_cleanup_keyboard(token, index),
+                _ => unreachable!(),
+            };
+            let _ = state.bot.answer_callback_query(q.id).await;
+            state
+                .bot
+                .edit_message_reply_markup(chat_id, message_id)
+                .reply_markup(keyboard)
+                .await?;
+            return Ok(());
+        }
         SimilarDecision::SelectKeep(_) | SimilarDecision::Cancel => {
             let loaded = {
                 let db = state.db.lock().await;
@@ -3017,12 +3078,28 @@ async fn handle_similar_callback(
                 .await?;
             return Ok(());
         }
-        SimilarDecision::KeepAll | SimilarDecision::ConfirmKeep(_) => {}
+        SimilarDecision::KeepAll
+        | SimilarDecision::ConfirmKeep(_)
+        | SimilarDecision::ManualConfirm(_) => {}
+    }
+
+    if matches!(decision, SimilarDecision::ManualConfirm(_)) && callback_message.is_none() {
+        let _ = state
+            .bot
+            .answer_callback_query(q.id)
+            .text("手动清理确认消息已失效")
+            .await;
+        return Ok(());
     }
 
     let claimed = {
         let db = state.db.lock().await;
-        let group = claim_similar_review(&db, token, decision)?;
+        let group = match decision {
+            SimilarDecision::ManualConfirm(index) => {
+                claim_manual_similar_review(&db, token, index)?
+            }
+            _ => claim_similar_review(&db, token, decision)?,
+        };
         let messages = similar_review_messages(&db, token)?;
         group.zip(messages)
     };
@@ -3040,17 +3117,21 @@ async fn handle_similar_callback(
         .text(match decision {
             SimilarDecision::KeepAll => "✅ 已记录全部保留",
             SimilarDecision::ConfirmKeep(_) => "⏳ 正在备份并整理图库…",
+            SimilarDecision::ManualConfirm(_) => "⏳ 正在完成手动清理…",
             _ => unreachable!(),
         })
         .await;
 
+    let manual_warning_message = matches!(decision, SimilarDecision::ManualConfirm(_))
+        .then_some(callback_message)
+        .flatten();
     let state = state.clone();
     tokio::spawn(async move {
         let mut manual_cleanup_targets = Vec::new();
         let result: Result<()> = async {
             match decision {
                 SimilarDecision::KeepAll => Ok(()),
-                SimilarDecision::ConfirmKeep(index) => {
+                SimilarDecision::ConfirmKeep(index) | SimilarDecision::ManualConfirm(index) => {
                     let plan =
                         work_prune_plan(&group, index).context("相似图审批选择的帖子序号无效")?;
                     let gallery = state
@@ -3065,7 +3146,7 @@ async fn handle_similar_callback(
                             &plan.remove_work_ids,
                         )
                         .await?;
-                    let mut progress = PruneProgress::GalleryPruned;
+                    let mut progress = initial_prune_progress(decision);
                     loop {
                         match next_prune_action(progress) {
                             PruneAction::DeleteTelegram => {
@@ -3129,10 +3210,25 @@ async fn handle_similar_callback(
                         );
                     }
                 }
+                if let Some((chat_id, message_id)) = manual_warning_message {
+                    if let Err(error) =
+                        tg_retry(|| state.bot.delete_message(chat_id, message_id)).await
+                    {
+                        tracing::warn!(
+                            token,
+                            message_id = message_id.0,
+                            error = %error,
+                            "删除手动清理确认消息失败"
+                        );
+                    }
+                }
             }
             Err(error) => {
                 tracing::warn!(token, error = %error, "相似图审批失败，恢复按钮");
-                if matches!(decision, SimilarDecision::ConfirmKeep(_)) {
+                if matches!(
+                    decision,
+                    SimilarDecision::ConfirmKeep(_) | SimilarDecision::ManualConfirm(_)
+                ) {
                     if let Some(gallery) = state.gallery.as_ref() {
                         let _ = gallery
                             .report_telegram_prune_failure(
@@ -3142,21 +3238,65 @@ async fn handle_similar_callback(
                             .await;
                     }
                 }
-                {
-                    let db = state.db.lock().await;
-                    let _ = restore_similar_review(&db, token);
+                let manual_index = match decision {
+                    SimilarDecision::ConfirmKeep(index) if !manual_cleanup_targets.is_empty() => {
+                        let db = state.db.lock().await;
+                        match mark_manual_similar_cleanup(&db, token, index) {
+                            Ok(true) => Some(index),
+                            Ok(false) | Err(_) => {
+                                let _ = restore_similar_review(&db, token);
+                                None
+                            }
+                        }
+                    }
+                    SimilarDecision::ManualConfirm(index) => {
+                        let db = state.db.lock().await;
+                        let _ = restore_manual_similar_review(&db, token, index);
+                        Some(index)
+                    }
+                    _ => {
+                        let db = state.db.lock().await;
+                        let _ = restore_similar_review(&db, token);
+                        None
+                    }
+                };
+
+                if matches!(decision, SimilarDecision::ManualConfirm(_)) {
+                    if let (Some((chat_id, message_id)), Some(index)) =
+                        (manual_warning_message, manual_index)
+                    {
+                        let _ = state
+                            .bot
+                            .edit_message_reply_markup(chat_id, message_id)
+                            .reply_markup(similar_manual_cleanup_keyboard(token, index))
+                            .await;
+                    }
+                } else if let Some(index) = manual_index {
+                    let _ = state
+                        .bot
+                        .send_message(
+                            state.review_chat.clone(),
+                            similar_review_failure_text(
+                                token,
+                                &state.publish_channel,
+                                &manual_cleanup_targets,
+                            ),
+                        )
+                        .reply_markup(similar_manual_cleanup_keyboard(token, index))
+                        .await;
+                } else {
+                    let _ = state
+                        .bot
+                        .send_message(
+                            state.review_chat.clone(),
+                            similar_review_failure_text(
+                                token,
+                                &state.publish_channel,
+                                &manual_cleanup_targets,
+                            ),
+                        )
+                        .await;
                 }
-                let _ = state
-                    .bot
-                    .send_message(
-                        state.review_chat.clone(),
-                        similar_review_failure_text(
-                            token,
-                            &state.publish_channel,
-                            &manual_cleanup_targets,
-                        ),
-                    )
-                    .await;
             }
         }
     });
@@ -3277,6 +3417,37 @@ mod tests {
     }
 
     #[test]
+    fn manual_cleanup_buttons_require_a_second_confirmation() {
+        let initial = serde_json::to_value(similar_manual_cleanup_keyboard(80, 1)).unwrap();
+        assert_eq!(
+            initial["inline_keyboard"][0][0]["callback_data"],
+            "similar:80:manual:1"
+        );
+
+        let confirm = serde_json::to_value(similar_manual_confirm_keyboard(80, 1)).unwrap();
+        assert_eq!(
+            confirm["inline_keyboard"][0][0]["callback_data"],
+            "similar:80:manual-confirm:1"
+        );
+        assert_eq!(
+            confirm["inline_keyboard"][1][0]["callback_data"],
+            "similar:80:manual-cancel:1"
+        );
+    }
+
+    #[test]
+    fn manual_confirmation_skips_the_bot_delete_step() {
+        assert_eq!(
+            initial_prune_progress(SimilarDecision::ConfirmKeep(1)),
+            PruneProgress::GalleryPruned
+        );
+        assert_eq!(
+            initial_prune_progress(SimilarDecision::ManualConfirm(1)),
+            PruneProgress::TelegramDeleted
+        );
+    }
+
+    #[test]
     fn publication_capture_records_batches_and_rejects_mixed_chats() {
         let mut builder = TelegramPublicationBuilder::default();
         builder.record(-100123, [41, 42]).unwrap();
@@ -3348,7 +3519,7 @@ mod tests {
                 image_index INTEGER NOT NULL
              );
              INSERT INTO image_fingerprints VALUES
-                ('douyin','10',0),('douyin','10',1),
+                ('douyin','10',0),('douyin','10',1),('douyin','10',2),
                 ('pixiv','20',0),('pixiv','20',1);",
         )
         .unwrap();

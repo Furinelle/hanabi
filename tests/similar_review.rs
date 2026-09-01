@@ -1,5 +1,6 @@
 use hanabi::similar_review::{
-    claim_review, finish_review, init_schema, parse_callback, register_review, restore_review,
+    claim_manual_review, claim_review, finish_review, init_schema, load_manual_review,
+    mark_manual_cleanup, parse_callback, register_review, restore_manual_review, restore_review,
     work_prune_plan, SimilarDecision, SimilarReviewGroup, SimilarReviewImage,
 };
 use rusqlite::Connection;
@@ -83,7 +84,68 @@ fn callback_parser_supports_keep_all_selection_confirmation_and_cancel() {
         parse_callback("similar:12:cancel"),
         Some((12, SimilarDecision::Cancel))
     );
+    assert_eq!(
+        parse_callback("similar:12:manual:2"),
+        Some((12, SimilarDecision::ManualSelect(2)))
+    );
+    assert_eq!(
+        parse_callback("similar:12:manual-confirm:2"),
+        Some((12, SimilarDecision::ManualConfirm(2)))
+    );
+    assert_eq!(
+        parse_callback("similar:12:manual-cancel:2"),
+        Some((12, SimilarDecision::ManualCancel(2)))
+    );
     assert_eq!(parse_callback("similar:bad:all"), None);
+}
+
+#[test]
+fn manual_cleanup_claim_requires_the_recorded_keep_index() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    let token = register_review(&conn, &group()).unwrap();
+    assert!(claim_review(&conn, token, SimilarDecision::ConfirmKeep(2))
+        .unwrap()
+        .is_some());
+
+    assert!(mark_manual_cleanup(&conn, token, 2).unwrap());
+    assert!(load_manual_review(&conn, token, 1).unwrap().is_none());
+    assert!(claim_manual_review(&conn, token, 1).unwrap().is_none());
+    assert!(load_manual_review(&conn, token, 2).unwrap().is_some());
+
+    let claimed = claim_manual_review(&conn, token, 2).unwrap().unwrap();
+    assert_eq!(claimed, group());
+    finish_review(&conn, token, SimilarDecision::ManualConfirm(2)).unwrap();
+    let row = conn
+        .query_row(
+            "SELECT state,decision FROM similar_reviews WHERE token=?1",
+            [token],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(row, ("decided".into(), "keep:2".into()));
+}
+
+#[test]
+fn interrupted_manual_completion_returns_to_manual_confirmation() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    let token = register_review(&conn, &group()).unwrap();
+    assert!(claim_review(&conn, token, SimilarDecision::ConfirmKeep(2))
+        .unwrap()
+        .is_some());
+    assert!(mark_manual_cleanup(&conn, token, 2).unwrap());
+    assert!(claim_manual_review(&conn, token, 2).unwrap().is_some());
+
+    init_schema(&conn).unwrap();
+
+    assert!(load_manual_review(&conn, token, 2).unwrap().is_some());
+    assert!(claim_review(&conn, token, SimilarDecision::KeepAll)
+        .unwrap()
+        .is_none());
+    assert!(claim_manual_review(&conn, token, 2).unwrap().is_some());
+    restore_manual_review(&conn, token, 2).unwrap();
+    assert!(load_manual_review(&conn, token, 2).unwrap().is_some());
 }
 
 #[test]

@@ -82,6 +82,9 @@ pub enum SimilarDecision {
     KeepAll,
     SelectKeep(usize),
     ConfirmKeep(usize),
+    ManualSelect(usize),
+    ManualConfirm(usize),
+    ManualCancel(usize),
     Cancel,
 }
 
@@ -89,11 +92,17 @@ impl SimilarDecision {
     fn persisted(self) -> String {
         match self {
             Self::KeepAll => "keep_all".into(),
-            Self::ConfirmKeep(index) => format!("keep:{index}"),
+            Self::ConfirmKeep(index) | Self::ManualConfirm(index) => format!("keep:{index}"),
             Self::SelectKeep(index) => format!("select:{index}"),
+            Self::ManualSelect(index) => format!("manual:select:{index}"),
+            Self::ManualCancel(index) => format!("manual:cancel:{index}"),
             Self::Cancel => "cancel".into(),
         }
     }
+}
+
+fn manual_decision(index: usize) -> String {
+    format!("manual:keep:{index}")
 }
 
 pub fn init_schema(conn: &Connection) -> Result<()> {
@@ -112,9 +121,17 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_similar_reviews_state
            ON similar_reviews(state, created_at);",
     )?;
-    conn.execute(
-        "UPDATE similar_reviews SET state='pending',decision=NULL WHERE state='processing'",
-        [],
+    conn.execute_batch(
+        "UPDATE similar_reviews
+         SET state=CASE
+               WHEN decision LIKE 'manual:keep:%' THEN 'manual_pending'
+               ELSE 'pending'
+             END,
+             decision=CASE
+               WHEN decision LIKE 'manual:keep:%' THEN decision
+               ELSE NULL
+             END
+         WHERE state='processing';",
     )?;
     Ok(())
 }
@@ -211,6 +228,50 @@ pub fn claim_review(
     Ok((changed == 1).then_some(group))
 }
 
+pub fn mark_manual_cleanup(conn: &Connection, token: i64, index: usize) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE similar_reviews SET state='manual_pending',decision=?3
+         WHERE token=?1 AND state='processing' AND decision=?2",
+        params![token, format!("keep:{index}"), manual_decision(index)],
+    )?;
+    Ok(changed == 1)
+}
+
+pub fn load_manual_review(
+    conn: &Connection,
+    token: i64,
+    index: usize,
+) -> Result<Option<SimilarReviewGroup>> {
+    conn.query_row(
+        "SELECT payload_json FROM similar_reviews
+         WHERE token=?1 AND state='manual_pending' AND decision=?2",
+        params![token, manual_decision(index)],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()?
+    .map(|payload| Ok(serde_json::from_str(&payload)?))
+    .transpose()
+}
+
+pub fn claim_manual_review(
+    conn: &Connection,
+    token: i64,
+    index: usize,
+) -> Result<Option<SimilarReviewGroup>> {
+    let Some(group) = load_manual_review(conn, token, index)? else {
+        return Ok(None);
+    };
+    if index == 0 || index > group.posts().len() {
+        return Ok(None);
+    }
+    let changed = conn.execute(
+        "UPDATE similar_reviews SET state='processing'
+         WHERE token=?1 AND state='manual_pending' AND decision=?2",
+        params![token, manual_decision(index)],
+    )?;
+    Ok((changed == 1).then_some(group))
+}
+
 pub fn finish_review(conn: &Connection, token: i64, decision: SimilarDecision) -> Result<()> {
     conn.execute(
         "UPDATE similar_reviews
@@ -223,8 +284,18 @@ pub fn finish_review(conn: &Connection, token: i64, decision: SimilarDecision) -
 
 pub fn restore_review(conn: &Connection, token: i64) -> Result<()> {
     conn.execute(
-        "UPDATE similar_reviews SET state='pending',decision=NULL WHERE token=?1 AND state='processing'",
+        "UPDATE similar_reviews SET state='pending',decision=NULL
+         WHERE token=?1 AND state='processing' AND decision NOT LIKE 'manual:keep:%'",
         params![token],
+    )?;
+    Ok(())
+}
+
+pub fn restore_manual_review(conn: &Connection, token: i64, index: usize) -> Result<()> {
+    conn.execute(
+        "UPDATE similar_reviews SET state='manual_pending'
+         WHERE token=?1 AND state='processing' AND decision=?2",
+        params![token, manual_decision(index)],
     )?;
     Ok(())
 }
@@ -240,6 +311,9 @@ pub fn parse_callback(value: &str) -> Option<(i64, SimilarDecision)> {
         "all" if parts.next().is_none() => SimilarDecision::KeepAll,
         "keep" => SimilarDecision::SelectKeep(parts.next()?.parse().ok()?),
         "confirm" => SimilarDecision::ConfirmKeep(parts.next()?.parse().ok()?),
+        "manual" => SimilarDecision::ManualSelect(parts.next()?.parse().ok()?),
+        "manual-confirm" => SimilarDecision::ManualConfirm(parts.next()?.parse().ok()?),
+        "manual-cancel" => SimilarDecision::ManualCancel(parts.next()?.parse().ok()?),
         "cancel" if parts.next().is_none() => SimilarDecision::Cancel,
         _ => return None,
     };

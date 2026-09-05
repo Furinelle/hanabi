@@ -38,7 +38,7 @@ use crate::sink::{
 
 /// pending 保留时长上限(秒);超期未审批自动清理(删消息+文件+记录)。
 const PENDING_TTL_SECS: i64 = 7 * 24 * 3600;
-/// 最近一次丢弃可撤销的保留时间。与 pending 一致，避免误丢弃文件永久占盘。
+/// 最近一次审批动作可撤销的保留时间。与 pending 一致，避免撤回文件永久占盘。
 const UNDO_TTL_SECS: i64 = PENDING_TTL_SECS;
 
 fn now_secs() -> i64 {
@@ -146,6 +146,7 @@ struct CommentJob {
     originals: Vec<PathBuf>,
     temp_dir: PathBuf,
     created_at: i64,
+    retain_dir: bool,
 }
 
 /// 评论区原图任务的兜底保留时长:超时仍未等到 auto-forward 则清临时目录,避免泄漏。
@@ -233,16 +234,17 @@ impl TelegramSink {
                 item_meta  TEXT NOT NULL DEFAULT '{}'
              );
              CREATE TABLE IF NOT EXISTS review_actions(
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                action     TEXT NOT NULL,
-                token      INTEGER NOT NULL,
-                files      TEXT NOT NULL DEFAULT '[]',
-                caption    TEXT NOT NULL DEFAULT '',
-                originals  TEXT NOT NULL DEFAULT '[]',
-                is_r18     INTEGER NOT NULL DEFAULT 0,
-                item_meta  TEXT NOT NULL DEFAULT '{}',
-                acted_at   INTEGER NOT NULL,
-                state      TEXT NOT NULL DEFAULT 'available'
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                action       TEXT NOT NULL,
+                token        INTEGER NOT NULL,
+                files        TEXT NOT NULL DEFAULT '[]',
+                caption      TEXT NOT NULL DEFAULT '',
+                originals    TEXT NOT NULL DEFAULT '[]',
+                is_r18       INTEGER NOT NULL DEFAULT 0,
+                item_meta    TEXT NOT NULL DEFAULT '{}',
+                acted_at     INTEGER NOT NULL,
+                state        TEXT NOT NULL DEFAULT 'available',
+                publication  TEXT NOT NULL DEFAULT ''
              );",
         )
         .context("初始化 pending 表失败")?;
@@ -283,6 +285,10 @@ impl TelegramSink {
         // item_meta: MediaItem JSON,审批「发送并入库」时带标签/来源入库。
         let _ = conn.execute(
             "ALTER TABLE pending ADD COLUMN item_meta TEXT NOT NULL DEFAULT '{}'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE review_actions ADD COLUMN publication TEXT NOT NULL DEFAULT ''",
             [],
         );
         // 进程崩溃时未完成的 publishing 没有活着的发送任务,启动后恢复为可重试状态。
@@ -410,7 +416,7 @@ impl TelegramSink {
         // 登记原图评论任务,等讨论组 auto-forward 到来再投递;登记则延后清理临时目录。
         // 部分批次已发出时同样登记(频道帖已存在,评论区原图仍有意义)。
         if let Some(mid) = sent.first() {
-            register_comment(&self.state, mid.0, files).await;
+            register_comment(&self.state, mid.0, files, false).await;
         }
         if let Some(e) = send_error {
             // 部分成功:整条重发会造成频道重复内容,按已发布收尾,转人工检查。
@@ -646,7 +652,9 @@ enum PendingClaim {
 
 struct UndoAction {
     id: i64,
+    action: String,
     row: PendingRow,
+    publication: String,
 }
 
 enum UndoClaim {
@@ -655,14 +663,37 @@ enum UndoClaim {
     Irreversible(String),
 }
 
-/// 原子完成一条审批并登记为“最近一次动作”。只保留最新 available 动作；若旧动作
-/// 是可撤销丢弃，返回其文件供事务提交后清理。正在 restoring 的旧动作由对应 /undo
-/// 任务持有，不能在这里删除或清文件。
+fn has_undo_payload(files: &str, originals: &str) -> bool {
+    let nonempty = |raw: &str| {
+        let trimmed = raw.trim();
+        !trimmed.is_empty() && trimmed != "[]" && trimmed != "null"
+    };
+    nonempty(files) || nonempty(originals)
+}
+
+fn encode_undo_publication(publication: Option<&GalleryPublication>) -> String {
+    publication
+        .and_then(|value| serde_json::to_string(value).ok())
+        .unwrap_or_default()
+}
+
+fn decode_undo_publication(raw: &str) -> Option<GalleryPublication> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "{}" {
+        return None;
+    }
+    serde_json::from_str(trimmed).ok()
+}
+
+/// 原子完成一条审批并登记为“最近一次动作”。只保留最新 available 动作；旧动作
+/// 若仍持有本地文件，返回这些路径供事务提交后清理。正在 restoring 的旧动作由
+/// 对应 /undo 任务持有，不能在这里删除或清文件。
 fn complete_and_record_action(
     db: &mut rusqlite::Connection,
     token: i64,
     action: &str,
     row: Option<&PendingRow>,
+    publication: Option<&GalleryPublication>,
 ) -> rusqlite::Result<Vec<Vec<PathBuf>>> {
     let tx = db.transaction()?;
     let changed = tx.execute(
@@ -683,9 +714,10 @@ fn complete_and_record_action(
         ),
         None => ("[]", "", "[]", false, "{}"),
     };
+    let publication_json = encode_undo_publication(publication);
     tx.execute(
-        "INSERT INTO review_actions(action,token,files,caption,originals,is_r18,item_meta,acted_at,state)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'available')",
+        "INSERT INTO review_actions(action,token,files,caption,originals,is_r18,item_meta,acted_at,state,publication)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'available',?9)",
         rusqlite::params![
             action,
             token,
@@ -694,15 +726,16 @@ fn complete_and_record_action(
             originals,
             is_r18,
             item_meta,
-            now_secs()
+            now_secs(),
+            publication_json
         ],
     )?;
     let new_id = tx.last_insert_rowid();
 
-    let old_discards: Vec<(String, String)> = {
+    let old_held: Vec<(String, String)> = {
         let mut stmt = tx.prepare(
             "SELECT files, originals FROM review_actions
-             WHERE id<>?1 AND state='available' AND action='discard'",
+             WHERE id<>?1 AND state='available'",
         )?;
         let rows = stmt
             .query_map([new_id], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -715,7 +748,7 @@ fn complete_and_record_action(
     )?;
     tx.commit()?;
 
-    Ok(old_discards
+    Ok(old_held
         .into_iter()
         .filter_map(|(files, originals)| {
             let raw = serde_json::from_str::<Vec<String>>(&originals)
@@ -727,13 +760,13 @@ fn complete_and_record_action(
         .collect())
 }
 
-/// 抢占调用时的最近一次动作。只有最近动作本身是丢弃才可恢复，避免在一次发布之后
-/// 错把更早的丢弃当作“最后一次动作”撤销。
+/// 抢占调用时的最近一次动作。丢弃、发送、发送并入库只要仍持有本地文件即可恢复。
+/// 旧版只登记了类型、没有文件的发布记录保持不可撤销，避免误恢复更早的丢弃。
 fn claim_latest_undo(db: &mut rusqlite::Connection) -> rusqlite::Result<UndoClaim> {
     let tx = db.transaction()?;
     let action = tx
         .query_row(
-            "SELECT id,action,token,files,caption,originals,is_r18,item_meta
+            "SELECT id,action,token,files,caption,originals,is_r18,item_meta,COALESCE(publication,'')
              FROM review_actions WHERE state='available' ORDER BY id DESC LIMIT 1",
             [],
             |r| {
@@ -746,15 +779,18 @@ fn claim_latest_undo(db: &mut rusqlite::Connection) -> rusqlite::Result<UndoClai
                     r.get::<_, String>(5)?,
                     r.get::<_, bool>(6)?,
                     r.get::<_, String>(7)?,
+                    r.get::<_, String>(8)?,
                 ))
             },
         )
         .optional()?;
-    let Some((id, action, _token, files, caption, originals, is_r18, item_meta)) = action else {
+    let Some((id, action, _token, files, caption, originals, is_r18, item_meta, publication)) =
+        action
+    else {
         tx.commit()?;
         return Ok(UndoClaim::Empty);
     };
-    if action != "discard" {
+    if action != "discard" && !has_undo_payload(&files, &originals) {
         tx.commit()?;
         return Ok(UndoClaim::Irreversible(action));
     }
@@ -769,7 +805,9 @@ fn claim_latest_undo(db: &mut rusqlite::Connection) -> rusqlite::Result<UndoClai
     tx.commit()?;
     Ok(UndoClaim::Claimed(UndoAction {
         id,
+        action,
         row: (files, caption, "[]".into(), originals, is_r18, item_meta),
+        publication,
     }))
 }
 
@@ -869,7 +907,7 @@ fn command_menu(gallery_enabled: bool) -> Vec<BotCommand> {
         ));
     }
     commands.extend([
-        BotCommand::new("undo", "撤销最近一次误丢弃"),
+        BotCommand::new("undo", "撤销最近一次审批动作"),
         BotCommand::new("status", "查看待审数和运行状态"),
         BotCommand::new("ping", "存活测试"),
         BotCommand::new("help", "查看命令列表"),
@@ -904,7 +942,13 @@ fn match_auto_forward(msg: &Message, publish_channel: &Recipient) -> Option<i32>
 }
 
 /// 登记原图评论任务:发布到频道后调用,等讨论组 auto-forward 到来再投递。
-async fn register_comment(state: &Arc<ReviewState>, first_msg_id: i32, originals: &[PathBuf]) {
+/// `retain_dir=true` 时目录由 review_actions 持有，投递后不能删，留给 /undo。
+async fn register_comment(
+    state: &Arc<ReviewState>,
+    first_msg_id: i32,
+    originals: &[PathBuf],
+    retain_dir: bool,
+) {
     let temp_dir = match originals.first().and_then(|p| p.parent()) {
         Some(d) => d.to_path_buf(),
         None => return,
@@ -915,6 +959,7 @@ async fn register_comment(state: &Arc<ReviewState>, first_msg_id: i32, originals
             originals: originals.to_vec(),
             temp_dir,
             created_at: now_secs(),
+            retain_dir,
         },
     );
 }
@@ -996,7 +1041,9 @@ async fn deliver_comment(state: &Arc<ReviewState>, anchor: &Message, chan_msg_id
             "原图已投递到帖子评论区"
         );
     }
-    remove_dir_all_bg(job.temp_dir);
+    if !job.retain_dir {
+        remove_dir_all_bg(job.temp_dir);
+    }
 }
 
 /// 兜底:清理超时仍未等到 auto-forward 的评论任务(频道没绑讨论组/转发丢失)。
@@ -1012,7 +1059,9 @@ async fn sweep_expired_comments(state: &Arc<ReviewState>) {
         keys.iter().filter_map(|k| map.remove(k)).collect()
     };
     for job in &expired {
-        remove_dir_all_bg(job.temp_dir.clone());
+        if !job.retain_dir {
+            remove_dir_all_bg(job.temp_dir.clone());
+        }
     }
     if !expired.is_empty() {
         tracing::info!(count = expired.len(), "清理超时未投递的评论任务临时目录");
@@ -1359,7 +1408,7 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
         let mut out = Vec::new();
         if let Ok(mut stmt) = db.prepare(
             "SELECT files FROM review_actions
-             WHERE state='available' AND action='discard'
+             WHERE state='available'
                AND (acted_at < ?1 OR id <> COALESCE(?2, -1))",
         ) {
             if let Ok(rows) = stmt.query_map(rusqlite::params![undo_cutoff, newest], |r| {
@@ -1436,8 +1485,7 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
                 out.extend(rows.flatten());
             }
         }
-        if let Ok(mut stmt) = db.prepare("SELECT files FROM review_actions WHERE action='discard'")
-        {
+        if let Ok(mut stmt) = db.prepare("SELECT files FROM review_actions") {
             if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
                 out.extend(rows.flatten());
             }
@@ -1964,14 +2012,14 @@ async fn finish_claimed(
     }
 
     // 频道帖发出后立即登记评论任务。Telegram 通常会在约 1 秒内把频道帖
-    // auto-forward 到讨论组；图库补偿副本已先独立落盘，所以评论任务可以安全清理原目录。
-    let registered = match (publish, first_id) {
-        (true, Some(mid)) if !work.originals.is_empty() => {
-            register_comment(state, mid.0, &work.originals).await;
-            true
+    // auto-forward 到讨论组。审批发布的原目录由 review_actions 持有，评论任务不得删除。
+    if publish {
+        if let Some(mid) = first_id {
+            if !work.originals.is_empty() {
+                register_comment(state, mid.0, &work.originals, true).await;
+            }
         }
-        _ => false,
-    };
+    }
 
     // 发布成功(或至少部分成功)且需要入库
     let mut archive_failed = false;
@@ -2012,8 +2060,8 @@ async fn finish_claimed(
         }
     }
 
-    // pending 删除与“最近一次动作”登记放在同一事务。丢弃时保留完整行和文件，
-    // 让 /undo 能重新生成审批卡片；发布动作只登记类型，用于阻止误撤销更早丢弃。
+    // pending 删除与“最近一次动作”登记放在同一事务。丢弃和发布都保留完整行与文件，
+    // 让 /undo 能撤回上一步并重新生成审批卡片。
     let action = if !publish {
         "discard"
     } else if archive && !archive_failed {
@@ -2021,16 +2069,17 @@ async fn finish_claimed(
     } else {
         "publish"
     };
-    let replaced_discards = {
+    let replaced_files = {
         let mut db = state.db.lock().await;
         complete_and_record_action(
             &mut db,
             token,
             action,
-            if publish { None } else { Some(&action_row) },
+            Some(&action_row),
+            gallery_publication.as_ref(),
         )
     };
-    let replaced_discards = match replaced_discards {
+    let replaced_files = match replaced_files {
         Ok(paths) => paths,
         Err(e) => {
             if !publish {
@@ -2058,14 +2107,11 @@ async fn finish_claimed(
             .delete_message(state.review_chat.clone(), MessageId(*mid))
             .await;
     }
-    // 新动作覆盖旧的可撤销丢弃后，旧文件不再有恢复价值；事务提交后再清理。
-    for paths in replaced_discards {
+    // 新动作覆盖旧的可撤销记录后，旧文件不再有恢复价值；事务提交后再清理。
+    for paths in replaced_files {
         cleanup(&paths);
     }
-    // 当前丢弃的文件由 review_actions 持有；发布文件仍按原评论任务语义清理。
-    if publish && !registered {
-        cleanup(&work.files);
-    }
+    // 当前动作的文件由 review_actions 持有，评论任务不得删掉可撤回目录。
     Ok(FinishOutcome { archive_failed })
 }
 
@@ -2178,6 +2224,54 @@ fn persist_gallery_publication(
             "保存图库 publication 映射失败"
         );
     }
+}
+
+async fn delete_undo_telegram_messages(bot: &Bot, publication: &GalleryPublication) -> Result<()> {
+    let chat = ChatId(publication.chat_id);
+    for message_id in &publication.message_ids {
+        match tg_retry(|| bot.delete_message(chat, MessageId(*message_id))).await {
+            Ok(_) => {}
+            Err(error) if is_idempotent_delete_error(&error.to_string()) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn cancel_undone_gallery_outbox(state: &ReviewState, item: &MediaItem) {
+    let Some(outbox) = state.gallery_outbox.as_ref() else {
+        return;
+    };
+    match outbox.cancel_retries(item.source.as_str(), &item.source_id) {
+        Ok(true) => tracing::info!(
+            source = item.source.as_str(),
+            id = %item.source_id,
+            "已停止该作品的图库补偿队列"
+        ),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            source = item.source.as_str(),
+            id = %item.source_id,
+            error = %error,
+            "停止图库补偿队列失败"
+        ),
+    }
+}
+
+async fn retract_undone_gallery(
+    state: &ReviewState,
+    action_id: i64,
+    item: &MediaItem,
+) -> Result<()> {
+    let Some(gallery) = state.gallery.as_ref() else {
+        tracing::warn!(action_id, "图库未配置，跳过撤回入库");
+        return Ok(());
+    };
+    let work_id = format!("{}:{}", item.source.as_str(), item.source_id);
+    gallery
+        .retract_work(&format!("hanabi-undo-{action_id}"), &work_id)
+        .await
+        .map_err(anyhow::Error::from)
 }
 
 fn to_gallery_publication(publication: &TelegramPublication) -> GalleryPublication {
@@ -2403,7 +2497,7 @@ pub async fn run_review_loop(
 
 /// 处理 `/` 命令(仅文本消息)。**仅响应审批私聊本人**(owner),陌生人忽略。
 /// /run 触发抓取；/approve 批准全部剩余待审；/approve_archive 批准并入库；
-/// /undo 撤销最近一次误丢弃并重新生成审批卡片；
+/// /undo 撤销最近一次审批动作并重新生成审批卡片；
 /// /status /ping /help 即时回复；
 /// 非命令的 Pixiv/X 链接交抓取循环直发频道。
 async fn handle_command(
@@ -2473,25 +2567,43 @@ async fn handle_command(
                     .send_message(
                         msg.chat.id,
                         format!(
-                            "ℹ️ 最近一次动作是“{label}”，已产生外部发布；/undo 仅恢复最近一次误丢弃"
+                            "ℹ️ 最近一次动作是“{label}”，没有可恢复的本地文件；无法撤回这次操作"
                         ),
                     )
                     .await?;
             }
             UndoClaim::Claimed(action) => {
                 let action_id = action.id;
+                let action_kind = action.action.clone();
+                let publication = decode_undo_publication(&action.publication);
                 let decoded = decode_pending(action.row);
                 let result: Result<()> = async {
                     let work = decoded?;
                     let item: MediaItem = serde_json::from_str(&work.item_meta)
-                        .context("最近丢弃记录的作品元数据无效")?;
+                        .context("最近审批记录的作品元数据无效")?;
                     let originals = if work.originals.is_empty() {
                         work.files
                     } else {
                         work.originals
                     };
                     if originals.is_empty() || originals.iter().any(|p| !p.is_file()) {
-                        anyhow::bail!("最近丢弃记录的图片文件已过期");
+                        anyhow::bail!("最近审批记录的图片文件已过期");
+                    }
+                    if let Some(publication) = &publication {
+                        if let Some(first) = publication.message_ids.first() {
+                            let _ = state.pending_comments.lock().await.remove(first);
+                        }
+                        delete_undo_telegram_messages(&state.bot, publication).await?;
+                    }
+                    if action_kind != "discard" {
+                        cancel_undone_gallery_outbox(state, &item);
+                        retract_undone_gallery(state, action_id, &item).await?;
+                    }
+                    {
+                        let db = state.db.lock().await;
+                        if let Err(error) = remove_work(&db, &item) {
+                            tracing::warn!(error = %error, action_id, "撤销时清除已发布指纹失败");
+                        }
                     }
                     TelegramSink {
                         state: state.clone(),
@@ -2509,16 +2621,21 @@ async fn handle_command(
                         if removed != 1 {
                             tracing::error!(action_id, "撤销成功后清理动作记录失败");
                         }
+                        let done = match action_kind.as_str() {
+                            "publish_archive" => "已撤回最近一次发送并入库，审批卡片已恢复",
+                            "publish" => "已撤回最近一次发送到频道，审批卡片已恢复",
+                            _ => "已撤销最近一次丢弃，审批卡片已恢复",
+                        };
                         state
                             .bot
-                            .send_message(msg.chat.id, "↩️ 已撤销最近一次丢弃，审批卡片已恢复")
+                            .send_message(msg.chat.id, format!("↩️ {done}"))
                             .await?;
                     }
                     Err(e) => {
                         let db = state.db.lock().await;
                         let _ = restore_undo(&db, action_id);
                         drop(db);
-                        tracing::warn!(error = %e, action_id, "撤销最近丢弃失败");
+                        tracing::warn!(error = %e, action_id, "撤销最近审批动作失败");
                         state
                             .bot
                             .send_message(
@@ -2603,7 +2720,7 @@ async fn handle_command(
                 ""
             };
             format!(
-                "命令列表:\n/run — 立即抓取一轮\n/approve — 批准并发布全部剩余待审(仅频道,不入库){archive_help}\n/undo — 撤销最近一次误丢弃并恢复审批卡片\n/status — 待审数+运行状态\n/ping — 存活测试\n/help — 本帮助\n\n💡 审批按钮:✅ 发送到频道 / 📦 发送并入库 / ❌ 丢弃\n💡 误点丢弃后立即发 /undo 可恢复；若最近动作已是发布，则不会误撤销更早的丢弃\n💡 先逐条点 ❌ 丢弃不想推送的图片，再发 /approve 或 /approve_archive 一键处理其余图片\n💡 直接发 Pixiv/X 作品链接 → 自动抓取并发布到频道(配置图库后同步入库)"
+                "命令列表:\n/run — 立即抓取一轮\n/approve — 批准并发布全部剩余待审(仅频道,不入库){archive_help}\n/undo — 撤销最近一次审批动作并恢复审批卡片\n/status — 待审数+运行状态\n/ping — 存活测试\n/help — 本帮助\n\n💡 审批按钮:✅ 发送到频道 / 📦 发送并入库 / ❌ 丢弃\n💡 误点发送、入库或丢弃后立即发 /undo 可撤回上一步并恢复审批卡片\n💡 先逐条点 ❌ 丢弃不想推送的图片，再发 /approve 或 /approve_archive 一键处理其余图片\n💡 直接发 Pixiv/X 作品链接 → 自动抓取并发布到频道(配置图库后同步入库)"
             )
         }
         _ => return Ok(()),
@@ -4027,7 +4144,7 @@ mod tests {
             "{\"source\":\"x\"}".into(),
         );
         assert!(
-            complete_and_record_action(&mut db, 1, "discard", Some(&row))
+            complete_and_record_action(&mut db, 1, "discard", Some(&row), None)
                 .unwrap()
                 .is_empty()
         );
@@ -4039,6 +4156,7 @@ mod tests {
         let UndoClaim::Claimed(first) = claim_latest_undo(&mut db).unwrap() else {
             panic!("discard should be undoable")
         };
+        assert_eq!(first.action, "discard");
         assert_eq!(first.row.1, "cap");
         assert!(matches!(
             claim_latest_undo(&mut db).unwrap(),
@@ -4080,13 +4198,130 @@ mod tests {
             false,
             "{}".into(),
         );
-        complete_and_record_action(&mut db, 1, "discard", Some(&row)).unwrap();
-        let released = complete_and_record_action(&mut db, 2, "publish", None).unwrap();
+        complete_and_record_action(&mut db, 1, "discard", Some(&row), None).unwrap();
+        let released = complete_and_record_action(&mut db, 2, "publish", None, None).unwrap();
         assert_eq!(released, vec![vec![PathBuf::from("/tmp/a.jpg")]]);
         assert!(matches!(
             claim_latest_undo(&mut db).unwrap(),
             UndoClaim::Irreversible(action) if action == "publish"
         ));
+    }
+
+    #[test]
+    fn publish_with_files_is_undoable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.db");
+        let _sink = TelegramSink::new(
+            "123:abc".into(),
+            "-1001234567890".into(),
+            "@chan".into(),
+            path.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let mut db = rusqlite::Connection::open(&path).unwrap();
+        db.execute(
+            "INSERT INTO pending(token,files,caption,msg_ids,originals,created_at,state,is_r18,item_meta)
+             VALUES(1,'[\"/tmp/a.jpg\"]','cap','[9]','[\"/tmp/a.jpg\"]',1,'publishing',0,'{\"source\":\"x\"}')",
+            [],
+        )
+        .unwrap();
+        let row: PendingRow = (
+            "[\"/tmp/a.jpg\"]".into(),
+            "cap".into(),
+            "[9]".into(),
+            "[\"/tmp/a.jpg\"]".into(),
+            false,
+            "{\"source\":\"x\"}".into(),
+        );
+        complete_and_record_action(&mut db, 1, "publish", Some(&row), None).unwrap();
+        let UndoClaim::Claimed(claimed) = claim_latest_undo(&mut db).unwrap() else {
+            panic!("publish with files should be undoable")
+        };
+        assert_eq!(claimed.action, "publish");
+        assert_eq!(claimed.row.1, "cap");
+    }
+
+    #[test]
+    fn publish_archive_with_files_is_undoable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.db");
+        let _sink = TelegramSink::new(
+            "123:abc".into(),
+            "-1001234567890".into(),
+            "@chan".into(),
+            path.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let mut db = rusqlite::Connection::open(&path).unwrap();
+        db.execute(
+            "INSERT INTO pending(token,files,caption,msg_ids,originals,created_at,state,is_r18,item_meta)
+             VALUES(1,'[\"/tmp/a.jpg\"]','cap','[9]','[\"/tmp/a.jpg\"]',1,'publishing',0,'{\"source\":\"douyin\"}')",
+            [],
+        )
+        .unwrap();
+        let row: PendingRow = (
+            "[\"/tmp/a.jpg\"]".into(),
+            "cap".into(),
+            "[9]".into(),
+            "[\"/tmp/a.jpg\"]".into(),
+            false,
+            "{\"source\":\"douyin\"}".into(),
+        );
+        complete_and_record_action(&mut db, 1, "publish_archive", Some(&row), None).unwrap();
+        let UndoClaim::Claimed(claimed) = claim_latest_undo(&mut db).unwrap() else {
+            panic!("publish_archive with files should be undoable")
+        };
+        assert_eq!(claimed.action, "publish_archive");
+    }
+
+    #[test]
+    fn stored_publication_is_returned_on_undo_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.db");
+        let _sink = TelegramSink::new(
+            "123:abc".into(),
+            "-1001234567890".into(),
+            "@chan".into(),
+            path.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let mut db = rusqlite::Connection::open(&path).unwrap();
+        db.execute(
+            "INSERT INTO pending(token,files,caption,msg_ids,originals,created_at,state,is_r18,item_meta)
+             VALUES(1,'[\"/tmp/a.jpg\"]','cap','[9]','[\"/tmp/a.jpg\"]',1,'publishing',0,'{\"source\":\"x\"}')",
+            [],
+        )
+        .unwrap();
+        let row: PendingRow = (
+            "[\"/tmp/a.jpg\"]".into(),
+            "cap".into(),
+            "[9]".into(),
+            "[\"/tmp/a.jpg\"]".into(),
+            false,
+            "{\"source\":\"x\"}".into(),
+        );
+        let publication = GalleryPublication {
+            chat_id: -1003664074984,
+            message_ids: vec![7118, 7119],
+            publish_state: GalleryPublishState::Full,
+        };
+        complete_and_record_action(&mut db, 1, "publish", Some(&row), Some(&publication)).unwrap();
+        let UndoClaim::Claimed(claimed) = claim_latest_undo(&mut db).unwrap() else {
+            panic!("publish with publication should be undoable")
+        };
+        let stored = decode_undo_publication(&claimed.publication).expect("publication json");
+        assert_eq!(stored.chat_id, -1003664074984);
+        assert_eq!(stored.message_ids, vec![7118, 7119]);
+    }
+
+    #[test]
+    fn empty_publish_payload_stays_irreversible() {
+        assert!(!has_undo_payload("[]", "[]"));
+        assert!(has_undo_payload("[\"/tmp/a.jpg\"]", "[]"));
+        assert!(has_undo_payload("[]", "[\"/tmp/a.jpg\"]"));
     }
 
     #[test]

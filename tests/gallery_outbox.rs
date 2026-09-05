@@ -160,6 +160,23 @@ fn startup_recovers_a_completed_staging_directory_after_interrupted_enqueue() {
 }
 
 #[test]
+fn cancel_retries_stops_queued_gallery_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("hanabi.db");
+    let root = temp.path().join("gallery-outbox");
+    let source = temp.path().join("original.jpg");
+    std::fs::write(&source, b"original bytes").unwrap();
+    let item = sample_item();
+    let outbox = GalleryOutbox::open(&db_path, &root).unwrap();
+    outbox
+        .enqueue(&item, std::slice::from_ref(&source), "HTTP 500")
+        .unwrap();
+    assert_eq!(outbox.pending_count().unwrap(), 1);
+    assert!(outbox.cancel_retries("douyin", &item.source_id).unwrap());
+    assert_eq!(outbox.pending_count().unwrap(), 0);
+}
+
+#[test]
 fn successful_initial_upload_resolves_the_staged_queue_without_retrying() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("hanabi.db");

@@ -376,6 +376,19 @@ impl GalleryOutbox {
         Ok(true)
     }
 
+    /// 撤回审批时停掉该作品的图库补偿：pending/staging/failed/uploading 都标完成，
+    /// 避免 /undo 之后补偿队列再次入库。目录留给后续 completed 清理，以免和在途上传抢删。
+    pub fn cancel_retries(&self, source_kind: &str, source_id: &str) -> Result<bool> {
+        let conn = open_connection(&self.db_path)?;
+        let changed = conn.execute(
+            "UPDATE gallery_outbox SET state='completed',claimed_at=0
+             WHERE source_kind=?1 AND source_id=?2
+               AND state IN ('pending','staging','failed','uploading')",
+            rusqlite::params![source_kind, source_id],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn enqueue(
         &self,
         item: &MediaItem,

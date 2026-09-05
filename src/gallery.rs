@@ -283,6 +283,41 @@ impl GalleryClient {
         self.post_telegram_result(decision_id, true, None).await
     }
 
+    pub async fn retract_work(
+        &self,
+        decision_id: &str,
+        work_id: &str,
+    ) -> std::result::Result<(), GalleryIngestError> {
+        let url = format!("{}/api/catalog/retract", self.endpoint);
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(&self.token)
+            .json(&CatalogRetractRequest {
+                decision_id,
+                work_id,
+            })
+            .send()
+            .await
+            .map_err(|error| {
+                GalleryIngestError::transient(format!("请求 Vitrine 撤回作品失败: {error}"))
+            })?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if status.as_u16() == 409 && body.contains("work not active") {
+            return Ok(());
+        }
+        if !status.is_success() {
+            let message = format!("Vitrine 撤回作品 HTTP {status}: {body}");
+            return Err(if retryable_status(status) {
+                GalleryIngestError::transient(message)
+            } else {
+                GalleryIngestError::permanent(message)
+            });
+        }
+        Ok(())
+    }
+
     pub async fn report_telegram_prune_failure(
         &self,
         decision_id: &str,
@@ -326,6 +361,12 @@ impl GalleryClient {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CatalogRetractRequest<'a> {
+    decision_id: &'a str,
+    work_id: &'a str,
 }
 
 #[derive(Debug, serde::Serialize)]

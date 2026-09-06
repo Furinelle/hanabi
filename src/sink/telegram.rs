@@ -19,18 +19,21 @@ use crate::gallery::{GalleryClient, GalleryIngestError, GalleryPublication, Gall
 use crate::gallery_outbox::{GalleryOutbox, QueuedGalleryWork};
 use crate::image_dedup::{
     evaluate_work, init_schema as init_image_dedup_schema, inspect_image, mark_work_status,
-    record_work, remove_work, remove_work_key, render_review_notice, ExactAction, ImageFingerprint,
+    record_work, remove_work, remove_work_key, ExactAction, ImageFingerprint, SimilarImage,
     WorkStatus, WorkSummary,
 };
 use crate::model::MediaItem;
 use crate::similar_review::{
-    claim_manual_review as claim_manual_similar_review, claim_review as claim_similar_review,
+    candidate_was_published, claim_manual_review as claim_manual_similar_review,
+    claim_review as claim_similar_review, delete_review as delete_similar_review,
     finish_review as finish_similar_review, init_schema as init_similar_review_schema,
     load_manual_review as load_manual_similar_review, load_review as load_similar_review,
-    mark_manual_cleanup as mark_manual_similar_cleanup, parse_callback as parse_similar_callback,
-    restore_manual_review as restore_manual_similar_review,
+    mark_candidate_published, mark_manual_cleanup as mark_manual_similar_cleanup,
+    parse_callback as parse_similar_callback, register_review as register_similar_review,
+    remove_pending_candidate_reviews, restore_manual_review as restore_manual_similar_review,
     restore_review as restore_similar_review, review_messages as similar_review_messages,
-    work_prune_plan, SimilarDecision, SimilarReviewGroup,
+    set_review_messages as set_similar_review_messages, work_prune_plan, SimilarDecision,
+    SimilarReviewGroup, SimilarReviewImage, SimilarReviewPendingCandidate,
 };
 use crate::sink::{
     needs_downscale, render_caption, Sink, PHOTO_TARGET_BYTES, PHOTO_TARGET_DIMENSION_SUM,
@@ -62,6 +65,8 @@ pub struct LinkJob {
 pub enum PublishOutcome {
     Full,
     Partial,
+    DeferredReview,
+    Skipped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +91,14 @@ pub struct PublishResult {
 impl PartialEq<PublishOutcome> for PublishResult {
     fn eq(&self, other: &PublishOutcome) -> bool {
         self.outcome == *other
+    }
+}
+
+fn empty_publication() -> TelegramPublication {
+    TelegramPublication {
+        chat_id: 0,
+        message_ids: Vec::new(),
+        publish_state: PublicationState::Full,
     }
 }
 
@@ -291,12 +304,17 @@ impl TelegramSink {
             "ALTER TABLE review_actions ADD COLUMN publication TEXT NOT NULL DEFAULT ''",
             [],
         );
-        // 进程崩溃时未完成的 publishing 没有活着的发送任务,启动后恢复为可重试状态。
+        // 进程崩溃时未完成的发布没有活着的发送任务,启动后恢复为原审批状态。
         conn.execute(
             "UPDATE pending SET state='pending' WHERE state='publishing'",
             [],
         )
         .context("恢复中断的审批发布失败")?;
+        conn.execute(
+            "UPDATE pending SET state='similar' WHERE state='similar_publishing'",
+            [],
+        )
+        .context("恢复中断的相似图审批发布失败")?;
         conn.execute(
             "UPDATE review_actions SET state='available' WHERE state='restoring'",
             [],
@@ -372,6 +390,44 @@ impl TelegramSink {
             anyhow::bail!("无图片可发: {}", item.source_id);
         }
         let fingerprints = inspect_images(files).await?;
+        let evaluation = {
+            let db = self.state.db.lock().await;
+            evaluate_work(&db, item, &fingerprints)?
+        };
+        let replacement = match &evaluation.exact_action {
+            ExactAction::SkipCurrent(_) => {
+                cleanup(files);
+                return Ok(PublishResult {
+                    outcome: PublishOutcome::Skipped,
+                    publication: empty_publication(),
+                });
+            }
+            ExactAction::ReplacePending(old) => {
+                if !supersede_pending_work(&self.state, old).await? {
+                    cleanup(files);
+                    return Ok(PublishResult {
+                        outcome: PublishOutcome::Skipped,
+                        publication: empty_publication(),
+                    });
+                }
+                None
+            }
+            ExactAction::ReplacePublished(old) => {
+                if self.state.gallery.is_none() {
+                    anyhow::bail!("严格同图替换已发布作品需要已配置 Vitrine");
+                }
+                Some(old.clone())
+            }
+            ExactAction::None => None,
+        };
+        if replacement.is_none() && !evaluation.similar.is_empty() {
+            self.queue_similar_review(item, files, &fingerprints, &evaluation.similar)
+                .await?;
+            return Ok(PublishResult {
+                outcome: PublishOutcome::DeferredReview,
+                publication: empty_publication(),
+            });
+        }
         let caption = render_caption(item);
         let files_owned: Vec<PathBuf> = files.to_vec();
         let prepared = tokio::task::spawn_blocking(move || prepare_all(&files_owned)).await??;
@@ -454,6 +510,30 @@ impl TelegramSink {
         if let Err(error) = record_work(&db, item, &fingerprints, WorkStatus::Published) {
             tracing::warn!(error = %error, id = %item.source_id, "登记直发图片指纹失败");
         }
+        drop(db);
+        if let Some(old) = replacement {
+            if let Err(error) = self.replace_published_work(item, &old).await {
+                tracing::error!(
+                    id = %item.source_id,
+                    old_source = old.source.as_str(),
+                    old_id = %old.source_id,
+                    error = %error,
+                    "高清严格同图已发布，但旧作品未完成同步清理"
+                );
+                let _ = self
+                    .state
+                    .bot
+                    .send_message(
+                        self.state.review_chat.clone(),
+                        format!(
+                            "⚠️ 高清版本已发布，但旧 {}:{} 尚未完成图库/频道清理：{error}",
+                            old.source.as_str(),
+                            old.source_id
+                        ),
+                    )
+                    .await;
+            }
+        }
         Ok(PublishResult {
             outcome: PublishOutcome::Full,
             publication,
@@ -492,7 +572,7 @@ impl TelegramSink {
                     continue;
                 }
             };
-            match finish_claimed(&self.state, token, row, true, archive).await {
+            match finish_claimed(&self.state, token, row, true, archive, true).await {
                 Ok(outcome) => {
                     summary.succeeded += 1;
                     if outcome.archive_failed {
@@ -599,6 +679,284 @@ impl TelegramSink {
         }
     }
 
+    async fn queue_similar_review(
+        &self,
+        item: &MediaItem,
+        files: &[PathBuf],
+        fingerprints: &[ImageFingerprint],
+        matches: &[SimilarImage],
+    ) -> Result<()> {
+        let gallery = self
+            .state
+            .gallery
+            .as_ref()
+            .context("相似图审批需要已配置 Vitrine")?;
+        let candidate_token =
+            i64::try_from(self.state.next_token()).context("审批 token 超出范围")?;
+        let candidate_work_id = format!("{}:{}", item.source.as_str(), item.source_id);
+        let candidate_fingerprint = fingerprints
+            .first()
+            .map(|fingerprint| fingerprint.content_sha256.as_str())
+            .context("相似图候选缺少图片指纹")?;
+        let review_nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let review_root =
+            crate::util::pending_root().join(format!("hanabi_similar_{candidate_token}"));
+        let mut group = SimilarReviewGroup {
+            group_key: format!(
+                "pending:{candidate_work_id}:{candidate_fingerprint}:{candidate_token}:{review_nonce}"
+            ),
+            images: fingerprints
+                .iter()
+                .enumerate()
+                .map(|(index, fingerprint)| SimilarReviewImage {
+                    image_id: format!("{candidate_work_id}#{index}"),
+                    r2_key: String::new(),
+                    label: review_image_label(&candidate_work_id, index, fingerprint),
+                })
+                .collect(),
+            pending_candidate: Some(SimilarReviewPendingCandidate {
+                work_id: candidate_work_id.clone(),
+                pending_token: candidate_token,
+            }),
+        };
+        let mut existing_groups = Vec::<(String, Vec<PathBuf>)>::new();
+        let mut seen_work_ids = HashSet::new();
+        for matched in matches {
+            let work_id = format!(
+                "{}:{}",
+                matched.existing_work.source.as_str(),
+                matched.existing_work.source_id
+            );
+            if !seen_work_ids.insert(work_id.clone()) {
+                continue;
+            }
+            let paths = gallery
+                .download_work_images(
+                    &work_id,
+                    &review_root.join(format!("existing-{}", existing_groups.len())),
+                )
+                .await
+                .map_err(anyhow::Error::from)?;
+            for (index, media) in paths.iter().enumerate() {
+                group.images.push(SimilarReviewImage {
+                    image_id: format!("{work_id}#{index}"),
+                    r2_key: media.r2_key.clone(),
+                    label: format!("{work_id} p{index}"),
+                });
+            }
+            existing_groups.push((work_id, paths.into_iter().map(|media| media.path).collect()));
+        }
+        if existing_groups.is_empty() {
+            remove_dir_all_bg(review_root);
+            anyhow::bail!("相似图审批没有可读取的图库作品");
+        }
+
+        let review_token = {
+            let db = self.state.db.lock().await;
+            register_similar_review(&db, &group)?
+        };
+        let candidate_caption = format!("【相似图候选】\n{}", render_caption(item));
+        let mut review_ids = Vec::new();
+        let (prepared, candidate_ids) =
+            match send_similar_preview(&self.state, files, &candidate_caption).await {
+                Ok(value) => value,
+                Err(error) => {
+                    let db = self.state.db.lock().await;
+                    let _ = delete_similar_review(&db, review_token);
+                    remove_dir_all_bg(review_root);
+                    return Err(error);
+                }
+            };
+        review_ids.extend(candidate_ids);
+        for (work_id, paths) in &existing_groups {
+            match send_similar_preview(&self.state, paths, &format!("【图库作品】{work_id}")).await
+            {
+                Ok((_, ids)) => review_ids.extend(ids),
+                Err(error) => {
+                    cleanup_review_messages(&self.state, &review_ids).await;
+                    let db = self.state.db.lock().await;
+                    let _ = delete_similar_review(&db, review_token);
+                    remove_dir_all_bg(review_root);
+                    return Err(error);
+                }
+            }
+        }
+        let control = match tg_retry(|| {
+            self.state
+                .bot
+                .send_message(
+                    self.state.review_chat.clone(),
+                    similar_review_text(review_token, &group),
+                )
+                .reply_markup(similar_review_keyboard(review_token, &group))
+        })
+        .await
+        {
+            Ok(message) => message,
+            Err(error) => {
+                cleanup_review_messages(&self.state, &review_ids).await;
+                let db = self.state.db.lock().await;
+                let _ = delete_similar_review(&db, review_token);
+                remove_dir_all_bg(review_root);
+                return Err(error.into());
+            }
+        };
+        let mut all_review_ids = review_ids.clone();
+        all_review_ids.push(control.id);
+
+        let persisted = async {
+            let files_json = serde_json::to_string(
+                &prepared
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+            )?;
+            let originals_json = serde_json::to_string(
+                &files
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+            )?;
+            let review_message_ids: Vec<i32> = review_ids.iter().map(|id| id.0).collect();
+            let pending_message_ids: Vec<i32> = all_review_ids.iter().map(|id| id.0).collect();
+            let messages_json = serde_json::to_string(&review_message_ids)?;
+            let pending_messages_json = serde_json::to_string(&pending_message_ids)?;
+            let item_meta = serde_json::to_string(item)?;
+            let db = self.state.db.lock().await;
+            let tx = db.unchecked_transaction()?;
+            let updated = tx.execute(
+                "UPDATE similar_reviews SET media_message_ids=?2,control_message_id=?3
+                 WHERE token=?1 AND state='pending'",
+                rusqlite::params![review_token, messages_json, control.id.0],
+            )?;
+            if updated != 1 {
+                anyhow::bail!("相似图审批记录已失效");
+            }
+            tx.execute(
+                "INSERT INTO pending(token,files,caption,msg_ids,originals,created_at,state,is_r18,item_meta)
+                 VALUES(?1,?2,?3,?4,?5,?6,'similar',?7,?8)",
+                rusqlite::params![
+                    candidate_token,
+                    files_json,
+                    render_caption(item),
+                    pending_messages_json,
+                    originals_json,
+                    now_secs(),
+                    item.is_r18,
+                    item_meta,
+                ],
+            )?;
+            record_work(&tx, item, fingerprints, WorkStatus::Pending)?;
+            tx.commit()?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        remove_dir_all_bg(review_root);
+        if let Err(error) = persisted {
+            cleanup_review_messages(&self.state, &all_review_ids).await;
+            let db = self.state.db.lock().await;
+            let _ = delete_similar_review(&db, review_token);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn replace_published_work(&self, item: &MediaItem, old: &WorkSummary) -> Result<()> {
+        let keep_work_id = format!("{}:{}", item.source.as_str(), item.source_id);
+        let old_work_id = format!("{}:{}", old.source.as_str(), old.source_id);
+        let group = SimilarReviewGroup {
+            group_key: format!("exact:{keep_work_id}:{old_work_id}"),
+            images: vec![
+                SimilarReviewImage {
+                    image_id: format!("{keep_work_id}#0"),
+                    r2_key: String::new(),
+                    label: keep_work_id.clone(),
+                },
+                SimilarReviewImage {
+                    image_id: format!("{old_work_id}#0"),
+                    r2_key: String::new(),
+                    label: old_work_id,
+                },
+            ],
+            pending_candidate: None,
+        };
+        let token = {
+            let db = self.state.db.lock().await;
+            let token = register_similar_review(&db, &group)?;
+            claim_similar_review(&db, token, SimilarDecision::ConfirmKeep(1))?
+                .context("严格同图替换已在处理中或已完成")?;
+            token
+        };
+        let mut manual_cleanup_targets = Vec::new();
+        match prune_similar_selection(
+            &self.state,
+            token,
+            &group,
+            SimilarDecision::ConfirmKeep(1),
+            &mut manual_cleanup_targets,
+        )
+        .await
+        {
+            Ok(()) => {
+                let db = self.state.db.lock().await;
+                finish_similar_review(&db, token, SimilarDecision::ConfirmKeep(1))?;
+            }
+            Err(error) => {
+                if let Some(gallery) = self.state.gallery.as_ref() {
+                    let _ = gallery
+                        .report_telegram_prune_failure(
+                            &format!("hanabi-similar-{token}"),
+                            &error.to_string(),
+                        )
+                        .await;
+                }
+                if !manual_cleanup_targets.is_empty() {
+                    let manual_ready = {
+                        let db = self.state.db.lock().await;
+                        mark_manual_similar_cleanup(&db, token, 1).unwrap_or(false)
+                    };
+                    if manual_ready {
+                        let _ = self
+                            .state
+                            .bot
+                            .send_message(
+                                self.state.review_chat.clone(),
+                                similar_review_failure_text(
+                                    token,
+                                    &self.state.publish_channel,
+                                    &manual_cleanup_targets,
+                                ),
+                            )
+                            .reply_markup(similar_manual_cleanup_keyboard(token, 1))
+                            .await;
+                        return Ok(());
+                    }
+                }
+                {
+                    let db = self.state.db.lock().await;
+                    let _ = restore_similar_review(&db, token);
+                }
+                let retry = self
+                    .state
+                    .bot
+                    .send_message(
+                        self.state.review_chat.clone(),
+                        format!("⚠️ 高清版本已发布，但旧作品尚未完成同步清理：{error}"),
+                    )
+                    .reply_markup(similar_confirm_keyboard(token, &group, 1))
+                    .await;
+                if let Ok(message) = retry {
+                    let db = self.state.db.lock().await;
+                    let _ = set_similar_review_messages(&db, token, &[], message.id.0);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 删审批私聊里的若干消息(手动链接发布后清理:用户链接 + "抓取中"提示)。
     pub async fn delete_review_messages(&self, msg_ids: &[i32]) {
         for id in msg_ids {
@@ -697,7 +1055,7 @@ fn complete_and_record_action(
 ) -> rusqlite::Result<Vec<Vec<PathBuf>>> {
     let tx = db.transaction()?;
     let changed = tx.execute(
-        "DELETE FROM pending WHERE token=?1 AND state='publishing'",
+        "DELETE FROM pending WHERE token=?1 AND state IN ('publishing','similar_publishing')",
         [token],
     )?;
     if changed != 1 {
@@ -829,10 +1187,15 @@ fn restore_undo(db: &rusqlite::Connection, id: i64) -> rusqlite::Result<usize> {
 ///
 /// 两次 callback 都可能同时到达；条件 UPDATE 让数据库只允许一个回调从 pending
 /// 转为 publishing，另一个回调只会拿到 Publishing，绝不会再启动第二次上传。
-fn claim_pending(db: &rusqlite::Connection, token: i64) -> rusqlite::Result<PendingClaim> {
+fn claim_pending_in_state(
+    db: &rusqlite::Connection,
+    token: i64,
+    from_state: &str,
+    publishing_state: &str,
+) -> rusqlite::Result<PendingClaim> {
     let changed = db.execute(
-        "UPDATE pending SET state='publishing' WHERE token=?1 AND state='pending'",
-        [token],
+        "UPDATE pending SET state=?3 WHERE token=?1 AND state=?2",
+        rusqlite::params![token, from_state, publishing_state],
     )?;
     if changed == 0 {
         let exists = db
@@ -853,10 +1216,38 @@ fn claim_pending(db: &rusqlite::Connection, token: i64) -> rusqlite::Result<Pend
     Ok(PendingClaim::Claimed(row))
 }
 
+fn claim_pending(db: &rusqlite::Connection, token: i64) -> rusqlite::Result<PendingClaim> {
+    claim_pending_in_state(db, token, "pending", "publishing")
+}
+
+fn claim_similar_pending(db: &rusqlite::Connection, token: i64) -> rusqlite::Result<PendingClaim> {
+    claim_pending_in_state(db, token, "similar", "similar_publishing")
+}
+
 /// 发布失败时放弃抢占，让原审批按钮可以重试。
 fn restore_pending(db: &rusqlite::Connection, token: i64) -> rusqlite::Result<usize> {
     db.execute(
         "UPDATE pending SET state='pending' WHERE token=?1 AND state='publishing'",
+        [token],
+    )
+}
+
+#[cfg(test)]
+fn restore_similar_pending(db: &rusqlite::Connection, token: i64) -> rusqlite::Result<usize> {
+    db.execute(
+        "UPDATE pending SET state='similar' WHERE token=?1 AND state='similar_publishing'",
+        [token],
+    )
+}
+
+fn restore_claimed_pending(db: &rusqlite::Connection, token: i64) -> rusqlite::Result<usize> {
+    db.execute(
+        "UPDATE pending
+         SET state=CASE state
+            WHEN 'publishing' THEN 'pending'
+            WHEN 'similar_publishing' THEN 'similar'
+         END
+         WHERE token=?1 AND state IN ('publishing','similar_publishing')",
         [token],
     )
 }
@@ -1379,17 +1770,78 @@ fn cleanup(files: &[PathBuf]) {
     }
 }
 
+fn review_image_label(work_id: &str, index: usize, fingerprint: &ImageFingerprint) -> String {
+    format!(
+        "{work_id} p{index} · {} · {}",
+        fingerprint.dimensions_label(),
+        review_bytes(fingerprint.bytes)
+    )
+}
+
+fn review_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{} KiB", bytes.div_ceil(1024))
+    }
+}
+
+async fn cleanup_review_messages(state: &Arc<ReviewState>, message_ids: &[MessageId]) {
+    for message_id in message_ids {
+        let _ = tg_retry(|| {
+            state
+                .bot
+                .delete_message(state.review_chat.clone(), *message_id)
+        })
+        .await;
+    }
+}
+
+async fn send_similar_preview(
+    state: &Arc<ReviewState>,
+    files: &[PathBuf],
+    caption: &str,
+) -> Result<(Vec<PathBuf>, Vec<MessageId>)> {
+    if files.is_empty() {
+        anyhow::bail!("相似图审批没有可发送的图片");
+    }
+    let files_owned = files.to_vec();
+    let prepared = tokio::task::spawn_blocking(move || prepare_all(&files_owned)).await??;
+    let mut sent = Vec::new();
+    let mut publication = TelegramPublicationBuilder::default();
+    if let Err(error) = send_group(
+        &state.bot,
+        &state.review_chat,
+        &prepared,
+        caption,
+        false,
+        &mut sent,
+        &mut publication,
+        &mut || {},
+    )
+    .await
+    {
+        cleanup_review_messages(state, &sent).await;
+        return Err(error);
+    }
+    Ok((prepared, sent))
+}
+
 /// 启动清理:① 删超期未审 pending(消息+文件+记录);② 删持久待审目录中
 /// 不被任何 pending 引用的孤儿目录(多为旧版本/重启遗留)。
 async fn cleanup_stale(state: &Arc<ReviewState>) {
     // ⓪ 僵尸 publishing 兜底:DELETE/restore 因 DB 写失败未完成时,记录会永远停在
     // publishing(按钮恒回"已在发布中",TTL 清理又只认 pending)。超过 TTL+24h 的
-    // publishing 不可能仍在途,恢复为 pending 交给下面的正常清理/重试。
+    // publishing 不可能仍在途,恢复为原审批状态交给下面的正常清理/重试。
     {
         let db = state.db.lock().await;
         let zombie_cutoff = now_secs() - PENDING_TTL_SECS - 24 * 3600;
         let _ = db.execute(
             "UPDATE pending SET state='pending' WHERE state='publishing' AND created_at > 0 AND created_at < ?1",
+            [zombie_cutoff],
+        );
+        let _ = db.execute(
+            "UPDATE pending SET state='similar' WHERE state='similar_publishing' AND created_at > 0 AND created_at < ?1",
             [zombie_cutoff],
         );
     }
@@ -1436,9 +1888,10 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
         let db = state.db.lock().await;
         let mut out = Vec::new();
         if let Ok(mut stmt) = db.prepare(
-            // 只清 pending:publishing 表示有发布任务在途,清了会与其互踩
+            // 只清未在发布中的审批：publishing 表示有发布任务在途,清了会与其互踩
             // (删其正在上传的文件、DELETE 其记录,失败后的 restore 变成空操作)。
-            "SELECT token, files, msg_ids, COALESCE(item_meta, '{}') FROM pending WHERE created_at > 0 AND created_at < ?1 AND state='pending'",
+            "SELECT token, files, msg_ids, COALESCE(item_meta, '{}') FROM pending
+             WHERE created_at > 0 AND created_at < ?1 AND state IN ('pending','similar')",
         ) {
             if let Ok(rows) = stmt.query_map([cutoff], |r| {
                 Ok((
@@ -1468,6 +1921,7 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
         }
         let db = state.db.lock().await;
         let _ = db.execute("DELETE FROM pending WHERE token=?1", [*token]);
+        let _ = remove_pending_candidate_reviews(&db, *token);
         if let Ok(item) = serde_json::from_str::<MediaItem>(item_meta) {
             let _ = remove_work(&db, &item);
         }
@@ -1560,7 +2014,8 @@ async fn inspect_images(files: &[PathBuf]) -> Result<Vec<ImageFingerprint>> {
 fn backfill_pending_image_catalog(conn: &rusqlite::Connection) -> Result<usize> {
     let rows: Vec<(String, String, String)> = {
         let mut stmt = conn.prepare(
-            "SELECT COALESCE(item_meta, '{}'),originals,files FROM pending WHERE state='pending'",
+            "SELECT COALESCE(item_meta, '{}'),originals,files FROM pending
+             WHERE state IN ('pending','similar')",
         )?;
         let mapped = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         mapped.collect::<rusqlite::Result<_>>()?
@@ -1709,49 +2164,25 @@ impl Sink for TelegramSink {
                     "严格同图自动去重,用高清版本替换旧审批"
                 );
             }
+            ExactAction::ReplacePublished(_) if item.origin == "manual" => {
+                self.publish_direct(item, files).await?;
+                return Ok(());
+            }
+            // 自动抓取仍需保留普通内容审批；手动链接走上面的无确认替换。
+            ExactAction::ReplacePublished(_) => {}
             ExactAction::None => {}
         }
 
-        let dropped: HashSet<usize> = evaluation.drop_current_indices.iter().copied().collect();
-        let originals: Vec<PathBuf> = files
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| !dropped.contains(index))
-            .map(|(_, path)| path.clone())
-            .collect();
-        let kept_fingerprints: Vec<ImageFingerprint> = fingerprints
-            .into_iter()
-            .enumerate()
-            .filter(|(index, _)| !dropped.contains(index))
-            .map(|(_, fingerprint)| fingerprint)
-            .collect();
-        if originals.is_empty() {
-            tracing::info!(id = %item.source_id, "当前作品图片均与其他帖子严格同图,自动跳过审批");
-            cleanup(files);
+        if !evaluation.similar.is_empty() {
+            self.queue_similar_review(item, files, &fingerprints, &evaluation.similar)
+                .await?;
             return Ok(());
         }
-        for index in &evaluation.drop_current_indices {
-            if let Some(path) = files.get(*index) {
-                let _ = std::fs::remove_file(path);
-            }
-        }
 
-        let mut effective_item = item.clone();
-        if effective_item.images.len() == files.len() {
-            effective_item.images = effective_item
-                .images
-                .into_iter()
-                .enumerate()
-                .filter(|(index, _)| !dropped.contains(index))
-                .map(|(_, image)| image)
-                .collect();
-            effective_item.page_count = effective_item.images.len() as u32;
-        }
-        let caption = format!(
-            "{}{}",
-            render_caption(&effective_item),
-            render_review_notice(&evaluation.similar)
-        );
+        let originals = files.to_vec();
+        let kept_fingerprints = fingerprints;
+        let effective_item = item.clone();
+        let caption = render_caption(&effective_item);
         let files_owned = originals.clone();
         // 原始(缩放前)路径:审批通过后发原画质 document 进频道帖评论区(发 photo 用缩放版)。
         // 全套图缩放(CPU 阻塞,放 blocking 线程);审批需要看到全部,批准后直接复用。
@@ -1898,6 +2329,7 @@ struct PendingWork {
 
 struct FinishOutcome {
     archive_failed: bool,
+    partial_publish: bool,
 }
 
 fn decode_pending(row: PendingRow) -> Result<PendingWork> {
@@ -1923,21 +2355,22 @@ fn decode_pending(row: PendingRow) -> Result<PendingWork> {
 }
 
 /// 完成一条已抢占的审批。发布/解析失败会恢复为 pending，供按钮或下一次
-/// `/approve` 重试；成功后删除审批消息、pending 记录并接续原图评论任务。
-/// `archive=true` 时在发布成功后额外入库 Vitrine。
+/// `/approve` 重试；成功后删除 pending 记录并接续原图评论任务。
+/// `archive=true` 时在发布成功后额外入库 Vitrine。相似图组由外层统一清理消息。
 async fn finish_claimed(
     state: &Arc<ReviewState>,
     token: i64,
     row: PendingRow,
     publish: bool,
     archive: bool,
+    delete_review_messages: bool,
 ) -> Result<FinishOutcome> {
     let action_row = row.clone();
     let work = match decode_pending(row) {
         Ok(work) => work,
         Err(e) => {
             let db = state.db.lock().await;
-            let _ = restore_pending(&db, token);
+            let _ = restore_claimed_pending(&db, token);
             return Err(e);
         }
     };
@@ -1977,6 +2410,7 @@ async fn finish_claimed(
         .as_ref()
         .and_then(|captured| captured.message_ids.first().copied())
         .map(MessageId);
+    let partial_publish = publish && first_id.is_some() && send_result.is_err();
     if let Some(captured) = &publication {
         tracing::debug!(
             chat_id = captured.chat_id,
@@ -1993,7 +2427,7 @@ async fn finish_claimed(
             // 一张都没发出:恢复 pending,原审批按钮/下次 /approve 可安全重试。
             let restore = {
                 let db = state.db.lock().await;
-                restore_pending(&db, token)
+                restore_claimed_pending(&db, token)
             };
             if let Err(restore_error) = restore {
                 tracing::error!(error = %restore_error, token, "审批发布失败后恢复待审状态失败");
@@ -2084,7 +2518,7 @@ async fn finish_claimed(
         Err(e) => {
             if !publish {
                 let db = state.db.lock().await;
-                let _ = restore_pending(&db, token);
+                let _ = restore_claimed_pending(&db, token);
             }
             return Err(e).context("登记最近审批动作失败");
         }
@@ -2101,18 +2535,23 @@ async fn finish_claimed(
         }
     }
 
-    for mid in &work.msg_ids {
-        let _ = state
-            .bot
-            .delete_message(state.review_chat.clone(), MessageId(*mid))
-            .await;
+    if delete_review_messages {
+        for mid in &work.msg_ids {
+            let _ = state
+                .bot
+                .delete_message(state.review_chat.clone(), MessageId(*mid))
+                .await;
+        }
     }
     // 新动作覆盖旧的可撤销记录后，旧文件不再有恢复价值；事务提交后再清理。
     for paths in replaced_files {
         cleanup(&paths);
     }
     // 当前动作的文件由 review_actions 持有，评论任务不得删掉可撤回目录。
-    Ok(FinishOutcome { archive_failed })
+    Ok(FinishOutcome {
+        archive_failed,
+        partial_publish,
+    })
 }
 
 async fn archive_pending_work(
@@ -2380,7 +2819,7 @@ async fn publish_all_claimed(
     let mut succeeded = 0usize;
     let mut archive_failed = 0usize;
     for (token, row) in claimed {
-        match finish_claimed(&state, token, row, true, archive).await {
+        match finish_claimed(&state, token, row, true, archive, true).await {
             Ok(outcome) => {
                 succeeded += 1;
                 if outcome.archive_failed {
@@ -2859,7 +3298,7 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
     tokio::spawn(async move {
         let inner = tokio::spawn({
             let state = state.clone();
-            async move { finish_claimed(&state, token, row, publish, archive).await }
+            async move { finish_claimed(&state, token, row, publish, archive, true).await }
         });
         match inner.await {
             Ok(Ok(_)) => {}
@@ -3107,6 +3546,145 @@ fn remove_pruned_fingerprints(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum PendingCandidateAction {
+    Publish,
+    Discard,
+    None,
+}
+
+enum PendingCandidateClaim {
+    Claimed(PendingRow),
+    Published,
+}
+
+fn pending_candidate_action(
+    group: &SimilarReviewGroup,
+    decision: SimilarDecision,
+) -> Option<PendingCandidateAction> {
+    let candidate = group.pending_candidate.as_ref()?;
+    match decision {
+        SimilarDecision::KeepAll => Some(PendingCandidateAction::Publish),
+        SimilarDecision::ConfirmKeep(index) => {
+            group.posts().get(index.checked_sub(1)?).map(|post| {
+                if post.work_id == candidate.work_id {
+                    PendingCandidateAction::Publish
+                } else {
+                    PendingCandidateAction::Discard
+                }
+            })
+        }
+        SimilarDecision::ManualConfirm(_) => Some(PendingCandidateAction::None),
+        _ => None,
+    }
+}
+
+async fn finish_pending_candidate(
+    state: &Arc<ReviewState>,
+    review_token: i64,
+    candidate: &SimilarReviewPendingCandidate,
+    action: PendingCandidateAction,
+) -> Result<()> {
+    if matches!(action, PendingCandidateAction::None) {
+        return Ok(());
+    }
+    let claim = {
+        let db = state.db.lock().await;
+        match claim_similar_pending(&db, candidate.pending_token)? {
+            PendingClaim::Claimed(row) => Some(PendingCandidateClaim::Claimed(row)),
+            PendingClaim::Missing if matches!(action, PendingCandidateAction::Publish) => {
+                candidate_was_published(&db, review_token)?
+                    .then_some(PendingCandidateClaim::Published)
+            }
+            PendingClaim::Missing | PendingClaim::Publishing => None,
+        }
+    };
+    let Some(claim) = claim else {
+        anyhow::bail!("相似图候选已失效或正在处理");
+    };
+    let row = match claim {
+        PendingCandidateClaim::Claimed(row) => row,
+        PendingCandidateClaim::Published => return Ok(()),
+    };
+    let outcome = finish_claimed(
+        state,
+        candidate.pending_token,
+        row,
+        matches!(action, PendingCandidateAction::Publish),
+        matches!(action, PendingCandidateAction::Publish),
+        false,
+    )
+    .await?;
+    if matches!(action, PendingCandidateAction::Publish) {
+        if outcome.partial_publish {
+            anyhow::bail!("候选作品仅部分发布，保留旧作品并等待人工处理");
+        }
+        let db = state.db.lock().await;
+        if !mark_candidate_published(&db, review_token)? {
+            anyhow::bail!("候选作品已发频道，但未能保存相似图替换状态");
+        }
+    }
+    if outcome.archive_failed {
+        anyhow::bail!("候选作品已发频道，但图库尚未完成入库；保留旧作品以便重试");
+    }
+    Ok(())
+}
+
+async fn prune_similar_selection(
+    state: &Arc<ReviewState>,
+    token: i64,
+    group: &SimilarReviewGroup,
+    decision: SimilarDecision,
+    manual_cleanup_targets: &mut Vec<crate::gallery::GalleryTelegramTarget>,
+) -> Result<()> {
+    let index = match decision {
+        SimilarDecision::ConfirmKeep(index) | SimilarDecision::ManualConfirm(index) => index,
+        _ => return Ok(()),
+    };
+    let plan = work_prune_plan(group, index).context("相似图审批选择的帖子序号无效")?;
+    if plan.remove_work_ids.is_empty() {
+        return Ok(());
+    }
+    let gallery = state
+        .gallery
+        .as_ref()
+        .context("Vitrine 未配置，不能执行相似图整理")?;
+    let decision_id = format!("hanabi-similar-{token}");
+    let pruned = gallery
+        .prune_similar_works(&decision_id, &plan.keep_work_id, &plan.remove_work_ids)
+        .await?;
+    let mut progress = initial_prune_progress(decision);
+    loop {
+        match next_prune_action(progress) {
+            PruneAction::DeleteTelegram => {
+                if let Err(error) =
+                    delete_mapped_telegram_messages(&state.bot, &pruned.telegram_targets).await
+                {
+                    *manual_cleanup_targets = pruned.telegram_targets.clone();
+                    return Err(error);
+                }
+                progress = PruneProgress::TelegramDeleted;
+            }
+            PruneAction::FinalizeGallery => {
+                gallery.finish_telegram_prune(&decision_id).await?;
+                progress = PruneProgress::Complete;
+            }
+            PruneAction::FinishReview => break,
+        }
+    }
+    let db = state.db.lock().await;
+    remove_pruned_fingerprints(&db, group, &plan.keep_work_id)?;
+    tracing::info!(
+        token,
+        keep_index = index,
+        keep_work_id = plan.keep_work_id,
+        removed_works = pruned.removed_work_ids.len(),
+        replayed = pruned.replayed,
+        "相似图审批整理完成"
+    );
+    Ok(())
+}
+
 async fn handle_similar_callback(
     state: &Arc<ReviewState>,
     q: CallbackQuery,
@@ -3246,56 +3824,23 @@ async fn handle_similar_callback(
     tokio::spawn(async move {
         let mut manual_cleanup_targets = Vec::new();
         let result: Result<()> = async {
+            if let (Some(candidate), Some(action)) = (
+                group.pending_candidate.as_ref(),
+                pending_candidate_action(&group, decision),
+            ) {
+                finish_pending_candidate(&state, token, candidate, action).await?;
+            }
             match decision {
                 SimilarDecision::KeepAll => Ok(()),
-                SimilarDecision::ConfirmKeep(index) | SimilarDecision::ManualConfirm(index) => {
-                    let plan =
-                        work_prune_plan(&group, index).context("相似图审批选择的帖子序号无效")?;
-                    let gallery = state
-                        .gallery
-                        .as_ref()
-                        .context("Vitrine 未配置，不能执行相似图整理")?;
-                    let decision_id = format!("hanabi-similar-{token}");
-                    let pruned = gallery
-                        .prune_similar_works(
-                            &decision_id,
-                            &plan.keep_work_id,
-                            &plan.remove_work_ids,
-                        )
-                        .await?;
-                    let mut progress = initial_prune_progress(decision);
-                    loop {
-                        match next_prune_action(progress) {
-                            PruneAction::DeleteTelegram => {
-                                if let Err(error) = delete_mapped_telegram_messages(
-                                    &state.bot,
-                                    &pruned.telegram_targets,
-                                )
-                                .await
-                                {
-                                    manual_cleanup_targets = pruned.telegram_targets.clone();
-                                    return Err(error);
-                                }
-                                progress = PruneProgress::TelegramDeleted;
-                            }
-                            PruneAction::FinalizeGallery => {
-                                gallery.finish_telegram_prune(&decision_id).await?;
-                                progress = PruneProgress::Complete;
-                            }
-                            PruneAction::FinishReview => break,
-                        }
-                    }
-                    let db = state.db.lock().await;
-                    remove_pruned_fingerprints(&db, &group, &plan.keep_work_id)?;
-                    tracing::info!(
+                SimilarDecision::ConfirmKeep(_) | SimilarDecision::ManualConfirm(_) => {
+                    prune_similar_selection(
+                        &state,
                         token,
-                        keep_index = index,
-                        keep_work_id = plan.keep_work_id,
-                        removed_works = pruned.removed_work_ids.len(),
-                        replayed = pruned.replayed,
-                        "相似图审批整理完成"
-                    );
-                    Ok(())
+                        &group,
+                        decision,
+                        &mut manual_cleanup_targets,
+                    )
+                    .await
                 }
                 _ => unreachable!(),
             }
@@ -3449,6 +3994,29 @@ mod tests {
                     label: "pixiv:20 p1".into(),
                 },
             ],
+            pending_candidate: None,
+        }
+    }
+
+    fn pending_candidate_similar_group() -> SimilarReviewGroup {
+        SimilarReviewGroup {
+            group_key: "pending-candidate".into(),
+            images: vec![
+                crate::similar_review::SimilarReviewImage {
+                    image_id: "pixiv:30#0".into(),
+                    r2_key: String::new(),
+                    label: "pixiv:30 p0".into(),
+                },
+                crate::similar_review::SimilarReviewImage {
+                    image_id: "x:40#0".into(),
+                    r2_key: "x/40/a/00.jpg".into(),
+                    label: "x:40 p0".into(),
+                },
+            ],
+            pending_candidate: Some(crate::similar_review::SimilarReviewPendingCandidate {
+                work_id: "pixiv:30".into(),
+                pending_token: 73,
+            }),
         }
     }
 
@@ -3565,6 +4133,23 @@ mod tests {
     }
 
     #[test]
+    fn pending_candidate_is_published_only_when_its_post_is_kept() {
+        let group = pending_candidate_similar_group();
+        assert!(matches!(
+            pending_candidate_action(&group, SimilarDecision::ConfirmKeep(1)),
+            Some(PendingCandidateAction::Publish)
+        ));
+        assert!(matches!(
+            pending_candidate_action(&group, SimilarDecision::ConfirmKeep(2)),
+            Some(PendingCandidateAction::Discard)
+        ));
+        assert!(matches!(
+            pending_candidate_action(&group, SimilarDecision::ManualConfirm(1)),
+            Some(PendingCandidateAction::None)
+        ));
+    }
+
+    #[test]
     fn publication_capture_records_batches_and_rejects_mixed_chats() {
         let mut builder = TelegramPublicationBuilder::default();
         builder.record(-100123, [41, 42]).unwrap();
@@ -3592,6 +4177,7 @@ mod tests {
                     label: "douyin:1 p1 · 2844×1600 · 1.6 MiB · verty".into(),
                 },
             ],
+            pending_candidate: None,
         };
 
         let text = similar_review_text(74, &group);
@@ -4013,6 +4599,39 @@ mod tests {
             claim_pending(&db, 1).unwrap(),
             PendingClaim::Claimed(_)
         ));
+    }
+
+    #[test]
+    fn similar_pending_is_excluded_from_bulk_approval_and_claimed_separately() {
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE pending(
+                token INTEGER PRIMARY KEY,
+                files TEXT NOT NULL,
+                caption TEXT NOT NULL,
+                msg_ids TEXT NOT NULL,
+                originals TEXT NOT NULL DEFAULT '[]',
+                created_at INTEGER NOT NULL DEFAULT 0,
+                state TEXT NOT NULL DEFAULT 'pending',
+                is_r18 INTEGER NOT NULL DEFAULT 0,
+                item_meta TEXT NOT NULL DEFAULT '{}'
+            );
+            INSERT INTO pending VALUES(7, '[]', 'similar', '[]', '[]', 1, 'similar', 0, '{}');",
+        )
+        .unwrap();
+
+        assert!(claim_all_pending(&mut db).unwrap().is_empty());
+        assert!(matches!(
+            claim_similar_pending(&db, 7).unwrap(),
+            PendingClaim::Claimed((_, caption, _, _, _, _)) if caption == "similar"
+        ));
+        let state: String = db
+            .query_row("SELECT state FROM pending WHERE token=7", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "similar_publishing");
+        assert_eq!(restore_similar_pending(&db, 7).unwrap(), 1);
     }
 
     #[test]

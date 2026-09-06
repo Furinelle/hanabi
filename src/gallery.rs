@@ -1,6 +1,6 @@
 //! Vitrine 图库入库客户端：把本地图片 + 作品元数据 POST 到 CF Workers。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use reqwest::multipart::{Form, Part};
@@ -33,6 +33,28 @@ struct CatalogPruneRequest<'a> {
 struct CatalogPruneResponse {
     ok: bool,
     removed: usize,
+}
+
+const CATALOG_WORK_PAGE_SIZE: usize = 100;
+
+#[derive(Debug, serde::Deserialize)]
+struct CatalogPage {
+    ok: bool,
+    images: Vec<CatalogImage>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CatalogImage {
+    work_id: String,
+    page_index: u32,
+    r2_key: String,
+    content_type: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GalleryWorkImage {
+    pub(crate) r2_key: String,
+    pub(crate) path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -175,6 +197,114 @@ impl GalleryClient {
             "图库入库成功: {body}"
         );
         Ok(())
+    }
+
+    pub(crate) async fn download_work_images(
+        &self,
+        work_id: &str,
+        destination: &Path,
+    ) -> std::result::Result<Vec<GalleryWorkImage>, GalleryIngestError> {
+        let mut images = Vec::new();
+        let mut offset = 0_usize;
+        loop {
+            let url = (if offset == 0 {
+                catalog_work_url(&self.endpoint, work_id)
+            } else {
+                catalog_work_page_url(&self.endpoint, work_id, offset)
+            })
+            .map_err(|error| {
+                GalleryIngestError::permanent(format!("构造 Vitrine 作品目录地址失败: {error}"))
+            })?;
+            let response = self
+                .client
+                .get(url)
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .map_err(|error| {
+                    GalleryIngestError::transient(format!("请求 Vitrine 作品目录失败: {error}"))
+                })?;
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            if !status.is_success() {
+                let message = format!("Vitrine 作品目录 HTTP {status}: {body}");
+                return Err(if retryable_status(status) {
+                    GalleryIngestError::transient(message)
+                } else {
+                    GalleryIngestError::permanent(message)
+                });
+            }
+            let page: CatalogPage = serde_json::from_str(&body).map_err(|error| {
+                GalleryIngestError::transient(format!("解析 Vitrine 作品目录失败: {error}"))
+            })?;
+            if !page.ok || page.images.iter().any(|image| image.work_id != work_id) {
+                return Err(GalleryIngestError::permanent(
+                    "Vitrine 作品目录返回无效数据",
+                ));
+            }
+            let count = page.images.len();
+            images.extend(page.images);
+            if count < CATALOG_WORK_PAGE_SIZE {
+                break;
+            }
+            offset += count;
+        }
+        if images.is_empty() {
+            return Err(GalleryIngestError::permanent(format!(
+                "Vitrine 未找到作品: {work_id}"
+            )));
+        }
+        images.sort_by_key(|image| image.page_index);
+        let destination = destination.to_path_buf();
+        let create_destination = destination.clone();
+        tokio::task::spawn_blocking(move || std::fs::create_dir_all(&create_destination))
+            .await
+            .map_err(|error| {
+                GalleryIngestError::transient(format!("创建相似图审批目录失败: {error}"))
+            })?
+            .map_err(|error| {
+                GalleryIngestError::permanent(format!("创建相似图审批目录失败: {error}"))
+            })?;
+
+        let mut downloaded = Vec::with_capacity(images.len());
+        for (index, image) in images.into_iter().enumerate() {
+            let media_url = crate::gallery_sync::catalog_media_url(&self.endpoint, &image.r2_key)
+                .map_err(|error| {
+                GalleryIngestError::permanent(format!("构造 Vitrine 原图地址失败: {error}"))
+            })?;
+            let response = self
+                .client
+                .get(media_url)
+                .send()
+                .await
+                .map_err(|error| {
+                    GalleryIngestError::transient(format!("下载 Vitrine 原图失败: {error}"))
+                })?
+                .error_for_status()
+                .map_err(|error| {
+                    GalleryIngestError::transient(format!("下载 Vitrine 原图返回错误状态: {error}"))
+                })?;
+            let bytes = response.bytes().await.map_err(|error| {
+                GalleryIngestError::transient(format!("读取 Vitrine 原图失败: {error}"))
+            })?;
+            let extension = media_extension(&image.r2_key, &image.content_type);
+            let path = destination.join(format!("{index:02}.{extension}"));
+            let write_path = path.clone();
+            let bytes = bytes.to_vec();
+            tokio::task::spawn_blocking(move || std::fs::write(&write_path, bytes))
+                .await
+                .map_err(|error| {
+                    GalleryIngestError::transient(format!("写入相似图审批原图失败: {error}"))
+                })?
+                .map_err(|error| {
+                    GalleryIngestError::permanent(format!("写入相似图审批原图失败: {error}"))
+                })?;
+            downloaded.push(GalleryWorkImage {
+                r2_key: image.r2_key,
+                path,
+            });
+        }
+        Ok(downloaded)
     }
 
     pub async fn prune_similar(
@@ -363,6 +493,46 @@ impl GalleryClient {
     }
 }
 
+fn catalog_work_url(endpoint: &str, work_id: &str) -> Result<String> {
+    catalog_work_page_url(endpoint, work_id, 0)
+}
+
+fn catalog_work_page_url(endpoint: &str, work_id: &str, offset: usize) -> Result<String> {
+    let mut url =
+        reqwest::Url::parse(endpoint.trim_end_matches('/')).context("Vitrine endpoint 无效")?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Vitrine endpoint 不能作为基础 URL"))?;
+        segments.pop_if_empty();
+        segments.push("api");
+        segments.push("catalog");
+    }
+    url.query_pairs_mut()
+        .append_pair("work_id", work_id)
+        .append_pair("limit", &CATALOG_WORK_PAGE_SIZE.to_string())
+        .append_pair("offset", &offset.to_string());
+    Ok(url.to_string())
+}
+
+fn media_extension(r2_key: &str, content_type: &str) -> String {
+    r2_key
+        .rsplit_once('.')
+        .map(|(_, extension)| extension)
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension.len() <= 8
+                && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| match content_type {
+            "image/png" => "png".into(),
+            "image/webp" => "webp".into(),
+            "image/gif" => "gif".into(),
+            _ => "jpg".into(),
+        })
+}
+
 #[derive(Debug, serde::Serialize)]
 struct CatalogRetractRequest<'a> {
     decision_id: &'a str,
@@ -506,8 +676,9 @@ fn content_type_for(name: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{idempotency_key, retryable_status, GalleryClient};
+    use super::{catalog_work_url, idempotency_key, retryable_status, GalleryClient};
     use crate::model::{Author, ImageRef, MediaItem, SourceKind};
+    use std::io::{Read, Write};
 
     fn item() -> MediaItem {
         MediaItem {
@@ -574,5 +745,58 @@ mod tests {
                 reqwest::StatusCode::from_u16(code).unwrap()
             ));
         }
+    }
+
+    #[test]
+    fn catalog_work_url_preserves_the_exact_work_id() {
+        let url = reqwest::Url::parse(
+            &catalog_work_url("https://gallery.example.test/", "pixiv:123").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(url.path(), "/api/catalog");
+        assert!(url
+            .query_pairs()
+            .any(|(key, value)| key == "work_id" && value == "pixiv:123"));
+    }
+
+    #[tokio::test]
+    async fn download_work_images_fetches_the_requested_full_group() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            let bodies = [
+                br#"{"ok":true,"images":[{"work_id":"pixiv:123","page_index":0,"r2_key":"pixiv/123/v/00.jpg","content_type":"image/jpeg"}]}"#.as_slice(),
+                b"gallery-image".as_slice(),
+            ];
+            for body in bodies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let count = stream.read(&mut request).unwrap();
+                requests.push(String::from_utf8_lossy(&request[..count]).into_owned());
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(body).unwrap();
+            }
+            requests
+        });
+        let destination = tempfile::tempdir().unwrap();
+        let client = GalleryClient::new(format!("http://{address}"), "test-token".into()).unwrap();
+
+        let images = client
+            .download_work_images("pixiv:123", destination.path())
+            .await
+            .unwrap();
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].r2_key, "pixiv/123/v/00.jpg");
+        assert_eq!(std::fs::read(&images[0].path).unwrap(), b"gallery-image");
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("GET /api/catalog?work_id=pixiv%3A123"));
+        assert!(requests[1].starts_with("GET /media/pixiv/123/v/00.jpg"));
     }
 }

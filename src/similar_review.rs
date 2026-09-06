@@ -21,6 +21,14 @@ impl SimilarReviewImage {
 pub struct SimilarReviewGroup {
     pub group_key: String,
     pub images: Vec<SimilarReviewImage>,
+    #[serde(default)]
+    pub pending_candidate: Option<SimilarReviewPendingCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimilarReviewPendingCandidate {
+    pub work_id: String,
+    pub pending_token: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,16 +49,20 @@ pub fn work_prune_plan(
 ) -> Option<WorkPruneRequest> {
     let posts = group.posts();
     let keep_post = posts.get(keep_post_index.checked_sub(1)?)?;
+    let pending_candidate = group
+        .pending_candidate
+        .as_ref()
+        .map(|candidate| candidate.work_id.as_str());
     let mut remove_work_ids = Vec::new();
     for post in &posts {
-        if post.work_id == keep_post.work_id {
+        if post.work_id == keep_post.work_id || Some(post.work_id.as_str()) == pending_candidate {
             continue;
         }
         if !remove_work_ids.contains(&post.work_id) {
             remove_work_ids.push(post.work_id.clone());
         }
     }
-    if remove_work_ids.is_empty() || remove_work_ids.len() > 20 {
+    if remove_work_ids.len() > 20 {
         return None;
     }
     Some(WorkPruneRequest {
@@ -115,6 +127,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             decision           TEXT,
             media_message_ids  TEXT NOT NULL DEFAULT '[]',
             control_message_id INTEGER,
+            candidate_published INTEGER NOT NULL DEFAULT 0,
             created_at         INTEGER NOT NULL,
             decided_at         INTEGER
          );
@@ -133,6 +146,10 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
              END
          WHERE state='processing';",
     )?;
+    let _ = conn.execute(
+        "ALTER TABLE similar_reviews ADD COLUMN candidate_published INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     Ok(())
 }
 
@@ -170,6 +187,62 @@ pub fn set_review_messages(
         ],
     )?;
     Ok(())
+}
+
+pub fn delete_review(conn: &Connection, token: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM similar_reviews WHERE token=?1 AND state='pending'",
+        params![token],
+    )?;
+    Ok(())
+}
+
+pub fn remove_pending_candidate_reviews(conn: &Connection, pending_token: i64) -> Result<usize> {
+    let rows: Vec<(i64, String)> = {
+        let mut stmt =
+            conn.prepare("SELECT token,payload_json FROM similar_reviews WHERE state='pending'")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    let tokens: Vec<i64> = rows
+        .into_iter()
+        .filter_map(|(token, payload)| {
+            serde_json::from_str::<SimilarReviewGroup>(&payload)
+                .ok()
+                .and_then(|group| {
+                    (group.pending_candidate.as_ref()?.pending_token == pending_token)
+                        .then_some(token)
+                })
+        })
+        .collect();
+    let mut removed = 0;
+    for token in tokens {
+        removed += conn.execute(
+            "DELETE FROM similar_reviews WHERE token=?1 AND state='pending'",
+            params![token],
+        )?;
+    }
+    Ok(removed)
+}
+
+pub fn mark_candidate_published(conn: &Connection, token: i64) -> Result<bool> {
+    Ok(conn.execute(
+        "UPDATE similar_reviews SET candidate_published=1 WHERE token=?1",
+        params![token],
+    )? == 1)
+}
+
+pub fn candidate_was_published(conn: &Connection, token: i64) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT candidate_published FROM similar_reviews WHERE token=?1",
+            params![token],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false))
 }
 
 pub fn review_messages(conn: &Connection, token: i64) -> Result<Option<(Vec<i32>, Option<i32>)>> {

@@ -1,8 +1,7 @@
-//! 抖音图文(note/slides)解析:gallery-dl 不支持抖音,这里用 reqwest 直接抓分享页。
-//! 路线(免签名,对标 versenilvis/douyin-downloader):移动端 UA 跟随短链 → note 页 HTML
-//! → 抠 `window._ROUTER_DATA` JSON → 取 images[].url_list(无水印全分辨率 + 备用 CDN)、作者、desc 标签。
-//! 混合图/视频 slides 页无 SSR 数据时,改请求 slidesinfo,只取 clip_type=2 的静态图片。
-//! 比 pixiv/x 脆:抖音改 `_ROUTER_DATA` 结构或加验证墙时会失效,失败优雅提示即可。
+//! 抖音图文(note/slides)解析:gallery-dl 不支持抖音。
+//! 分享页 `_ROUTER_DATA` 已不再带 aweme 图文,note/video 直接走签名详情桥。
+//! `/share/slides/` 仍可用免签 slidesinfo,只取 clip_type=2 的静态图片。
+//! 比 pixiv/x 脆:签名接口会 403/空 200,失败时提示刷新 Cookie。
 
 use std::{
     cmp::Reverse,
@@ -561,40 +560,74 @@ pub fn is_user_profile_url(url: &reqwest::Url) -> bool {
     path.starts_with("/user/") || path.starts_with("/share/user/")
 }
 
-/// 抓 note 页并解析为 MediaItem。`url` 可为短链(自动跟随跳转)。
+/// 是否为单条作品落点（图文 / 视频 / slides）。短链本身不算。
+pub fn is_aweme_content_url(url: &reqwest::Url) -> bool {
+    aweme_kind_and_id(url).is_some()
+}
+
+fn aweme_kind_and_id(url: &reqwest::Url) -> Option<(&str, &str)> {
+    let segs: Vec<&str> = url.path_segments()?.filter(|s| !s.is_empty()).collect();
+    let (kind, id) = match segs.as_slice() {
+        ["share", kind, id, ..] | [kind, id, ..] => (*kind, *id),
+        _ => return None,
+    };
+    if matches!(kind, "note" | "video" | "slides")
+        && !id.is_empty()
+        && id.bytes().all(|b| b.is_ascii_digit())
+    {
+        Some((kind, id))
+    } else {
+        None
+    }
+}
+
+/// 抓 note/slides 并解析为 MediaItem。`url` 可为短链(签名桥会跟随跳转)。
 pub async fn fetch_note(
     client: &reqwest::Client,
     runtime: &DouyinCfg,
     url: &str,
     origin: &str,
 ) -> Result<MediaItem> {
-    match fetch_note_with_validator(client, url, origin, is_douyin_url).await {
-        Ok(item) => Ok(item),
-        Err(page_error) => {
-            let runtime = runtime.clone();
-            let target = url.to_string();
-            let response = tokio::task::spawn_blocking(move || {
-                run_douyin_helper(&runtime, "detail", target, Vec::new())
-            })
-            .await
-            .context("抖音作品详情桥接任务 join 失败")?
-            .with_context(|| format!("页面解析失败后作品详情桥接也失败: {page_error:#}"))?;
-            let raw = response.item.context("抖音作品详情桥接响应缺少 item")?;
-            let image_policy = if response.resolved_url.contains("/slides/") {
-                ImagePolicy::StaticSlidesOnly
-            } else {
-                ImagePolicy::All
-            };
-            let item = parse_item(&raw, origin, image_policy)
-                .context("抖音作品详情没有可发布的静态图片")?;
-            tracing::info!(
-                id = %item.source_id,
-                page_error = %format!("{page_error:#}"),
-                "抖音页面解析失败后通过签名详情接口恢复"
-            );
-            Ok(item)
+    // `/share/slides/` 的 slidesinfo 仍免签可用;失败再走签名详情。
+    // note 页 SSR 已空,直接走签名详情,不再三次抓空 HTML。
+    if reqwest::Url::parse(url)
+        .ok()
+        .as_ref()
+        .and_then(slides_id)
+        .is_some()
+    {
+        match fetch_note_with_validator(client, url, origin, is_douyin_url).await {
+            Ok(item) => return Ok(item),
+            Err(page_error) => {
+                return fetch_signed_detail(runtime, url, origin)
+                    .await
+                    .with_context(|| {
+                        format!("slidesinfo 失败后作品详情桥接也失败: {page_error:#}")
+                    });
+            }
         }
     }
+    fetch_signed_detail(runtime, url, origin).await
+}
+
+async fn fetch_signed_detail(runtime: &DouyinCfg, url: &str, origin: &str) -> Result<MediaItem> {
+    let runtime = runtime.clone();
+    let target = url.to_string();
+    let response = tokio::task::spawn_blocking(move || {
+        run_douyin_helper(&runtime, "detail", target, Vec::new())
+    })
+    .await
+    .context("抖音作品详情桥接任务 join 失败")??;
+    let raw = response.item.context("抖音作品详情桥接响应缺少 item")?;
+    let image_policy = if response.resolved_url.contains("/slides/") {
+        ImagePolicy::StaticSlidesOnly
+    } else {
+        ImagePolicy::All
+    };
+    let item =
+        parse_item(&raw, origin, image_policy).context("抖音作品详情没有可发布的静态图片")?;
+    tracing::info!(id = %item.source_id, "抖音作品通过签名详情接口解析");
+    Ok(item)
 }
 
 async fn fetch_note_with_validator<F>(
@@ -1014,6 +1047,30 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn detects_aweme_content_landing_paths() {
+        assert!(is_aweme_content_url(
+            &reqwest::Url::parse("https://www.iesdouyin.com/share/note/7658659240013951482/")
+                .unwrap()
+        ));
+        assert!(is_aweme_content_url(
+            &reqwest::Url::parse("https://www.douyin.com/note/7658659240013951482").unwrap()
+        ));
+        assert!(is_aweme_content_url(
+            &reqwest::Url::parse("https://www.douyin.com/video/1234567890123456789").unwrap()
+        ));
+        assert!(is_aweme_content_url(
+            &reqwest::Url::parse("https://www.iesdouyin.com/share/slides/7668950916557299363/")
+                .unwrap()
+        ));
+        assert!(!is_aweme_content_url(
+            &reqwest::Url::parse("https://www.douyin.com/user/MS4wTEST").unwrap()
+        ));
+        assert!(!is_aweme_content_url(
+            &reqwest::Url::parse("https://v.douyin.com/fDWOTo86Vhk/").unwrap()
+        ));
+    }
+
     #[tokio::test]
     async fn fetch_note_retries_transient_page_without_router_data() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1081,21 +1138,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_note_falls_back_to_signed_detail_bridge() {
+    async fn fetch_note_uses_signed_detail_without_html() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
+        let html_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let html_hits_for_server = html_hits.clone();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
-            for _ in 0..PAGE_MAX_ATTEMPTS {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0_u8; 4096];
-                let _ = stream.read(&mut request).unwrap();
-                let body = "<html><body>transient page without router data</body></html>";
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
+            while stop_rx.try_recv().is_err() {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    html_hits_for_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let body = "<html><body>should not be fetched</body></html>";
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                } else {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
             }
         });
 
@@ -1129,10 +1192,12 @@ json.dump({"item": {
         )
         .await
         .unwrap();
+        let _ = stop_tx.send(());
+        server.join().unwrap();
         assert_eq!(item.source_id, "7669448423591181257");
         assert_eq!(item.images.len(), 1);
         assert_eq!(item.title.as_deref(), Some("桥接恢复"));
-        server.join().unwrap();
+        assert_eq!(html_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1205,6 +1270,66 @@ json.dump({"item": {
         assert!(paths[1].starts_with("/web/api/v2/aweme/slidesinfo/?"));
         assert!(paths[1].contains("aweme_ids=%5B7668950916557299363%5D"));
         assert!(paths[1].contains("request_source=200"));
+    }
+
+    #[tokio::test]
+    async fn fetch_note_slides_falls_back_to_signed_detail() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            while stop_rx.try_recv().is_err() {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let body = r#"{"status_code":1}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                } else {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let helper = temp.path().join("detail_helper.py");
+        std::fs::write(
+            &helper,
+            r#"import json, sys
+request = json.load(sys.stdin)
+assert request["operation"] == "detail"
+json.dump({
+    "resolved_url": "https://www.iesdouyin.com/share/slides/7668950916557299363/",
+    "item": {
+        "aweme_id": "7668950916557299363",
+        "desc": "回退",
+        "author": {"nickname": "tester", "sec_uid": "MS4wSLIDES"},
+        "images": [{"clip_type": 2, "url_list": ["https://p3/first.webp"]}]
+    }
+}, sys.stdout)
+"#,
+        )
+        .unwrap();
+        let runtime = DouyinCfg {
+            python_command: "python3".to_string(),
+            helper_path: helper.to_string_lossy().into_owned(),
+            ..DouyinCfg::default()
+        };
+        let item = fetch_note(
+            &build_client().unwrap(),
+            &runtime,
+            &format!("http://{addr}/share/slides/7668950916557299363/"),
+            "manual",
+        )
+        .await
+        .unwrap();
+        let _ = stop_tx.send(());
+        server.join().unwrap();
+        assert_eq!(item.source_id, "7668950916557299363");
+        assert_eq!(item.images.len(), 1);
+        assert_eq!(item.title.as_deref(), Some("回退"));
     }
 
     #[tokio::test]

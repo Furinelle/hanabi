@@ -646,8 +646,29 @@ async fn handle_douyin(
             }
         }
         Err(note_error) => {
-            // 作者短链最终会落到 /share/user/...，自然没有 note 页的 _ROUTER_DATA。
-            // 用作者桥接器再判一次：成功即按多作品主页处理；两条路径都失败才反馈解析失败。
+            // 已落到 note/video/slides 时再走作者桥只会报「不是主页」,掩盖详情接口风控。
+            // 短链预解析失败时仍用用户原链接判断,避免完整作品 URL 被误送进主页桥。
+            let known_content = resolved_url
+                .clone()
+                .or_else(|| reqwest::Url::parse(resolved_target).ok())
+                .as_ref()
+                .is_some_and(douyin::is_aweme_content_url);
+            if known_content {
+                tracing::warn!(error = %note_error, "抖音作品解析失败");
+                sink.delete_review_messages(&[job.user_msg_id]).await;
+                let no_images = format!("{note_error:#}").contains("没有可发布的静态图片");
+                sink.edit_review_text(
+                    job.notice_msg_id,
+                    if no_images {
+                        "⚠️ 抖音作品没有可发布图片,未发布"
+                    } else {
+                        "ℹ️ 抖音解析失败(可能 Cookie 失效或触发风控)"
+                    },
+                )
+                .await;
+                return Ok(());
+            }
+            // 作者短链若预解析失败,再判一次主页桥。
             match douyin::fetch_user_feed(runtime, &job.url, "manual").await {
                 Ok(items) if !items.is_empty() => {
                     tracing::info!(items = items.len(), "手动抖音作者主页解析成功,进入批量审批");
@@ -662,8 +683,11 @@ async fn handle_douyin(
                 Err(user_error) => {
                     tracing::warn!(note_error = %note_error, user_error = %user_error, "抖音解析失败");
                     sink.delete_review_messages(&[job.user_msg_id]).await;
-                    sink.edit_review_text(job.notice_msg_id, "ℹ️ 抖音解析失败(可能改版或需验证)")
-                        .await;
+                    sink.edit_review_text(
+                        job.notice_msg_id,
+                        "ℹ️ 抖音解析失败(可能 Cookie 失效或触发风控)",
+                    )
+                    .await;
                 }
             }
         }

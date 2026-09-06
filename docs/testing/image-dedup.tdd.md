@@ -30,7 +30,7 @@ No external plan file was supplied. The tests were derived from these user journ
 | 1 | The same visual content at different resolutions is strict-equal and the larger resolution wins | `strict_same_survives_resolution_change_and_prefers_more_pixels` | unit | PASS |
 | 2 | A local visual edit is review-only similarity, never strict equality | `a_small_visual_edit_is_similar_but_never_strict_same` | unit | PASS |
 | 3 | Structurally unrelated images are not flagged | `unrelated_images_are_not_marked_similar` | unit | PASS |
-| 4 | A higher-quality strict duplicate replaces a pending record, while published history is not silently deleted | `catalog_replaces_pending_lower_quality_but_not_published_history` | SQLite integration | PASS |
+| 4 | A higher-quality strict duplicate replaces a pending record or enters the published-work replacement path | `catalog_replaces_pending_or_published_lower_quality_history` | SQLite integration | PASS |
 | 5 | Similarity notices show both sources, dimensions, and file sizes | `similar_notice_contains_both_sources_resolution_and_file_size` | integration | PASS |
 | 6 | A mixed work loses only its strict-duplicate page and keeps unique pages | `mixed_work_drops_only_strict_duplicate_images_and_keeps_unique_ones` | SQLite integration | PASS |
 | 7 | Existing pending media is fingerprinted once during upgrade startup | `existing_pending_media_is_backfilled_into_image_catalog` | SQLite integration | PASS |
@@ -44,7 +44,7 @@ No external plan file was supplied. The tests were derived from these user journ
 
 The repository does not provide `cargo-llvm-cov`. Native Rust instrumentation plus the local LLVM tools reported for `src/image_dedup.rs`: 87.03% regions, 85.11% functions, and 89.88% lines.
 
-No live Telegram E2E was run because the test environment intentionally has no bot/channel credentials. Telegram network calls remain behind the existing delivery path; the new deterministic image and database behavior is covered without external side effects. Previously published Telegram posts are treated as immutable: they block future strict duplicates but are never silently deleted to replace an older low-resolution post.
+No live Telegram E2E was run because the test environment intentionally has no bot/channel credentials. Telegram network calls remain behind the existing delivery path; deterministic image and database behavior is covered without external side effects. Published low-resolution works are removed only through the Vitrine whole-work receipt and their recorded Telegram mapping; a missing mapping or failed Bot API deletion leaves a recoverable manual-cleanup workflow instead of silently deleting either version.
 
 ## Merge evidence
 

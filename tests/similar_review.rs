@@ -1,7 +1,9 @@
 use hanabi::similar_review::{
-    claim_manual_review, claim_review, finish_review, init_schema, load_manual_review,
-    mark_manual_cleanup, parse_callback, register_review, restore_manual_review, restore_review,
+    candidate_was_published, claim_manual_review, claim_review, finish_review, init_schema,
+    load_manual_review, mark_candidate_published, mark_manual_cleanup, parse_callback,
+    register_review, remove_pending_candidate_reviews, restore_manual_review, restore_review,
     work_prune_plan, SimilarDecision, SimilarReviewGroup, SimilarReviewImage,
+    SimilarReviewPendingCandidate,
 };
 use rusqlite::Connection;
 
@@ -20,6 +22,7 @@ fn group() -> SimilarReviewGroup {
                 label: "#2 · 1200×1800 · 1.0 MiB".into(),
             },
         ],
+        pending_candidate: None,
     }
 }
 
@@ -48,6 +51,39 @@ fn multi_page_group() -> SimilarReviewGroup {
                 label: "pixiv:20 p1".into(),
             },
         ],
+        pending_candidate: None,
+    }
+}
+
+fn pending_candidate_group() -> SimilarReviewGroup {
+    SimilarReviewGroup {
+        group_key: "group-pending-candidate".into(),
+        images: vec![
+            SimilarReviewImage {
+                image_id: "pixiv:30#0".into(),
+                r2_key: "".into(),
+                label: "pixiv:30 p0".into(),
+            },
+            SimilarReviewImage {
+                image_id: "pixiv:30#1".into(),
+                r2_key: "".into(),
+                label: "pixiv:30 p1".into(),
+            },
+            SimilarReviewImage {
+                image_id: "x:40#0".into(),
+                r2_key: "x/40/a/00.jpg".into(),
+                label: "x:40 p0".into(),
+            },
+            SimilarReviewImage {
+                image_id: "x:40#1".into(),
+                r2_key: "x/40/a/01.jpg".into(),
+                label: "x:40 p1".into(),
+            },
+        ],
+        pending_candidate: Some(SimilarReviewPendingCandidate {
+            work_id: "pixiv:30".into(),
+            pending_token: 73,
+        }),
     }
 }
 
@@ -229,6 +265,7 @@ fn four_image_similarity_group() -> SimilarReviewGroup {
                 label: "pixiv p1".into(),
             },
         ],
+        pending_candidate: None,
     }
 }
 
@@ -238,4 +275,45 @@ fn selecting_pixiv_builds_whole_work_request() {
     let request = work_prune_plan(&group, 2).unwrap();
     assert_eq!(request.keep_work_id, "pixiv:147342918");
     assert_eq!(request.remove_work_ids, vec!["douyin:7669678713420921673"]);
+}
+
+#[test]
+fn selecting_an_existing_post_never_prunes_the_unpublished_candidate() {
+    let group = pending_candidate_group();
+    let request = work_prune_plan(&group, 2).unwrap();
+
+    assert_eq!(request.keep_work_id, "x:40");
+    assert!(request.remove_work_ids.is_empty());
+}
+
+#[test]
+fn selecting_the_pending_candidate_prunes_the_entire_existing_post() {
+    let group = pending_candidate_group();
+    let request = work_prune_plan(&group, 1).unwrap();
+
+    assert_eq!(request.keep_work_id, "pixiv:30");
+    assert_eq!(request.remove_work_ids, vec!["x:40"]);
+}
+
+#[test]
+fn expiring_a_pending_candidate_removes_its_orphaned_review_record() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    let token = register_review(&conn, &pending_candidate_group()).unwrap();
+
+    assert_eq!(remove_pending_candidate_reviews(&conn, 73).unwrap(), 1);
+    assert!(claim_review(&conn, token, SimilarDecision::KeepAll)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn published_candidate_marker_only_allows_a_full_candidate_to_resume_pruning() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+    let token = register_review(&conn, &pending_candidate_group()).unwrap();
+
+    assert!(!candidate_was_published(&conn, token).unwrap());
+    assert!(mark_candidate_published(&conn, token).unwrap());
+    assert!(candidate_was_published(&conn, token).unwrap());
 }

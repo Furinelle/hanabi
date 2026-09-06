@@ -14,6 +14,7 @@ use crate::model::{MediaItem, SourceKind};
 const HASH_SIDE: u32 = 8;
 const COLOR_SIDE: u32 = 4;
 const MAX_SIMILAR_NOTICES: usize = 3;
+const MAX_SIMILAR_REVIEW_WORKS: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MatchKind {
@@ -99,6 +100,7 @@ pub enum ExactAction {
     None,
     SkipCurrent(WorkSummary),
     ReplacePending(WorkSummary),
+    ReplacePublished(WorkSummary),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,7 +117,6 @@ pub struct SimilarImage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DedupEvaluation {
     pub exact_action: ExactAction,
-    pub drop_current_indices: Vec<usize>,
     pub similar: Vec<SimilarImage>,
 }
 
@@ -468,7 +469,11 @@ pub fn evaluate_work(
         .filter(|work| work.status == WorkStatus::Published)
         .max_by(|left, right| work_quality_cmp(left, right))
     {
-        ExactAction::SkipCurrent(published.clone())
+        if current_quality_cmp(current, &published.images) == Ordering::Greater {
+            ExactAction::ReplacePublished(published.clone())
+        } else {
+            ExactAction::SkipCurrent(published.clone())
+        }
     } else if let Some(pending) = exact_works
         .iter()
         .copied()
@@ -483,38 +488,12 @@ pub fn evaluate_work(
         ExactAction::None
     };
 
-    let mut drop_current_indices = Vec::new();
-    if matches!(exact_action, ExactAction::None) {
-        for (current_index, fingerprint) in current.iter().enumerate() {
-            let should_drop = existing.iter().any(|work| {
-                if (work.source.as_str(), work.source_id.as_str())
-                    == (current_key.0.as_str(), current_key.1.as_str())
-                {
-                    return false;
-                }
-                work.images.iter().any(|old| {
-                    classify_similarity(fingerprint, old) == MatchKind::StrictSame
-                        && (work.status == WorkStatus::Published
-                            || old.quality_cmp(fingerprint) != Ordering::Less)
-                })
-            });
-            if should_drop {
-                drop_current_indices.push(current_index);
-            }
-        }
-    }
-
-    drop_current_indices.sort_unstable();
-
     let exact_work_keys: HashSet<(String, String)> = exact_works
         .iter()
         .map(|work| (work.source.as_str().to_string(), work.source_id.clone()))
         .collect();
     let mut similar = Vec::new();
     for (current_index, fingerprint) in current.iter().enumerate() {
-        if drop_current_indices.contains(&current_index) {
-            continue;
-        }
         for work in &existing {
             if exact_work_keys.contains(&(work.source.as_str().to_string(), work.source_id.clone()))
                 || (work.source.as_str(), work.source_id.as_str())
@@ -524,16 +503,28 @@ pub fn evaluate_work(
             }
             for (existing_index, old) in work.images.iter().enumerate() {
                 let matched = classify_similarity(fingerprint, old);
-                if let MatchKind::Similar { distance } | MatchKind::Partial { distance } = matched {
-                    similar.push(SimilarImage {
+                match matched {
+                    MatchKind::StrictSame => similar.push(SimilarImage {
                         current_index,
                         current: fingerprint.clone(),
                         existing_index,
                         existing: old.clone(),
                         existing_work: work.clone(),
-                        distance,
-                        partial: matches!(matched, MatchKind::Partial { .. }),
-                    });
+                        distance: 0,
+                        partial: false,
+                    }),
+                    MatchKind::Similar { distance } | MatchKind::Partial { distance } => {
+                        similar.push(SimilarImage {
+                            current_index,
+                            current: fingerprint.clone(),
+                            existing_index,
+                            existing: old.clone(),
+                            existing_work: work.clone(),
+                            distance,
+                            partial: matches!(matched, MatchKind::Partial { .. }),
+                        });
+                    }
+                    MatchKind::Different => {}
                 }
             }
         }
@@ -544,11 +535,11 @@ pub fn evaluate_work(
             && left.existing_work.source == right.existing_work.source
             && left.existing_work.source_id == right.existing_work.source_id
     });
-    similar.truncate(MAX_SIMILAR_NOTICES);
+    // 提示文案只显示最接近的三项；真正的整作品审批保留所有可安全清理的候选。
+    similar.truncate(MAX_SIMILAR_REVIEW_WORKS);
 
     Ok(DedupEvaluation {
         exact_action,
-        drop_current_indices,
         similar,
     })
 }

@@ -133,7 +133,7 @@ fn unrelated_images_are_not_marked_similar() {
 }
 
 #[test]
-fn catalog_replaces_pending_lower_quality_but_not_published_history() {
+fn catalog_replaces_pending_or_published_lower_quality_history() {
     let dir = tempfile::tempdir().unwrap();
     let small_path = dir.path().join("small.png");
     let large_path = dir.path().join("large.png");
@@ -164,7 +164,7 @@ fn catalog_replaces_pending_lower_quality_but_not_published_history() {
     let published = evaluate_work(&conn, &x, std::slice::from_ref(&large)).unwrap();
     assert!(matches!(
         published.exact_action,
-        ExactAction::SkipCurrent(ref old) if old.status == WorkStatus::Published
+        ExactAction::ReplacePublished(ref old) if old.status == WorkStatus::Published
     ));
 
     remove_work(&conn, &pixiv).unwrap();
@@ -214,7 +214,7 @@ fn similar_notice_contains_both_sources_resolution_and_file_size() {
 }
 
 #[test]
-fn mixed_work_drops_only_strict_duplicate_images_and_keeps_unique_ones() {
+fn partial_strict_duplicate_requires_a_whole_work_review() {
     let dir = tempfile::tempdir().unwrap();
     let duplicate_path = dir.path().join("duplicate.png");
     let unique_path = dir.path().join("unique.png");
@@ -245,7 +245,37 @@ fn mixed_work_drops_only_strict_duplicate_images_and_keeps_unique_ones() {
 
     let evaluation = evaluate_work(&conn, &mixed, &[duplicate, unique]).unwrap();
     assert!(matches!(evaluation.exact_action, ExactAction::None));
-    assert_eq!(evaluation.drop_current_indices, vec![0]);
+    assert_eq!(evaluation.similar.len(), 1);
+    assert_eq!(evaluation.similar[0].existing_work.source_id, "p3");
+}
+
+#[test]
+fn lower_quality_strict_duplicate_still_keeps_published_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let small_path = dir.path().join("small.png");
+    let large_path = dir.path().join("large.png");
+    save_png(&small_path, &patterned(320, 240));
+    save_png(&large_path, &patterned(1280, 960));
+    let small = inspect_image(&small_path).unwrap();
+    let large = inspect_image(&large_path).unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    init_schema(&conn).unwrap();
+
+    let old = item(SourceKind::X, "x9", "高清已发布");
+    let current = item(SourceKind::Pixiv, "p9", "低清重发");
+    record_work(
+        &conn,
+        &old,
+        std::slice::from_ref(&large),
+        WorkStatus::Published,
+    )
+    .unwrap();
+
+    let evaluation = evaluate_work(&conn, &current, &[small]).unwrap();
+    assert!(matches!(
+        evaluation.exact_action,
+        ExactAction::SkipCurrent(ref old) if old.status == WorkStatus::Published
+    ));
 }
 
 #[test]
@@ -267,7 +297,6 @@ fn same_post_images_are_never_compared_with_each_other() {
     let evaluation = evaluate_work(&conn, &current, &[fingerprint.clone(), fingerprint]).unwrap();
 
     assert!(matches!(evaluation.exact_action, ExactAction::None));
-    assert!(evaluation.drop_current_indices.is_empty());
     assert!(evaluation.similar.is_empty());
 }
 

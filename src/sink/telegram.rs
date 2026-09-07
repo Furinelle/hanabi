@@ -928,6 +928,7 @@ impl TelegramSink {
                                     token,
                                     &self.state.publish_channel,
                                     &manual_cleanup_targets,
+                                    &error.to_string(),
                                 ),
                             )
                             .reply_markup(similar_manual_cleanup_keyboard(token, 1))
@@ -3464,9 +3465,15 @@ fn similar_review_failure_text(
     token: i64,
     publish_channel: &Recipient,
     targets: &[crate::gallery::GalleryTelegramTarget],
+    failure: &str,
 ) -> String {
-    let generic =
-        || format!("⚠️ 相似图审批 #{token} 未完成；图库内容已安全备份，频道清理可重新操作");
+    let generic = || {
+        format!(
+            "⚠️ 相似图审批 #{token} 未完成。\n\
+             原因：{failure}\n\
+             未取得可供手动删除的精确频道消息，请勿猜测删除。"
+        )
+    };
     if targets.is_empty() {
         return generic();
     }
@@ -3942,6 +3949,7 @@ async fn handle_similar_callback(
                                 token,
                                 &state.publish_channel,
                                 &manual_cleanup_targets,
+                                &error.to_string(),
                             ),
                         )
                         .reply_markup(similar_manual_cleanup_keyboard(token, index))
@@ -3955,6 +3963,7 @@ async fn handle_similar_callback(
                                 token,
                                 &state.publish_channel,
                                 &manual_cleanup_targets,
+                                &error.to_string(),
                             ),
                         )
                         .await;
@@ -4059,6 +4068,7 @@ mod tests {
             82,
             &Recipient::ChannelUsername("@FurinaDeCanvas".into()),
             &targets,
+            "Forbidden: bot is not an administrator",
         );
 
         assert_eq!(
@@ -4080,24 +4090,33 @@ mod tests {
             message_ids: vec![6325],
         }];
 
-        let text =
-            similar_review_failure_text(84, &Recipient::Id(ChatId(-1003664074984)), &targets);
+        let text = similar_review_failure_text(
+            84,
+            &Recipient::Id(ChatId(-1003664074984)),
+            &targets,
+            "Bad Request: message can't be deleted",
+        );
 
         assert!(text.contains("https://t.me/c/3664074984/6325"));
     }
 
     #[test]
-    fn similar_failure_notice_stays_generic_before_targets_are_known() {
+    fn similar_failure_notice_explains_failure_before_targets_are_known() {
+        let error = "Vitrine 整作品整理 HTTP 409 Conflict: telegram publication mapping missing: pixiv:148352123";
         let text = similar_review_failure_text(
             82,
             &Recipient::ChannelUsername("@FurinaDeCanvas".into()),
             &[],
+            error,
         );
 
         assert_eq!(
             text,
-            "⚠️ 相似图审批 #82 未完成；图库内容已安全备份，频道清理可重新操作"
+            "⚠️ 相似图审批 #82 未完成。\n\
+             原因：Vitrine 整作品整理 HTTP 409 Conflict: telegram publication mapping missing: pixiv:148352123\n\
+             未取得可供手动删除的精确频道消息，请勿猜测删除。"
         );
+        assert!(!text.contains("已安全备份"));
         assert!(!text.contains("https://t.me/"));
     }
 

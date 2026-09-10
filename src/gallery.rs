@@ -36,6 +36,7 @@ struct CatalogPruneResponse {
 }
 
 const CATALOG_WORK_PAGE_SIZE: usize = 100;
+const MAX_GALLERY_TITLE_BYTES: usize = 512;
 
 #[derive(Debug, serde::Deserialize)]
 struct CatalogPage {
@@ -597,11 +598,15 @@ fn gallery_meta(
     item: &MediaItem,
     publication: Option<&GalleryPublication>,
 ) -> serde_json::Result<String> {
+    let title = item
+        .title
+        .as_deref()
+        .map(|title| truncate_utf8_bytes(title, MAX_GALLERY_TITLE_BYTES));
     let mut meta = serde_json::json!({
         "source": item.source.as_str(),
         "source_id": item.source_id,
         "source_url": item.url,
-        "title": item.title,
+        "title": title,
         "author_name": item.author.name,
         "author_url": item.author.url,
         "tags": item.tags,
@@ -612,6 +617,14 @@ fn gallery_meta(
         meta["telegram_publication"] = serde_json::to_value(publication)?;
     }
     serde_json::to_string(&meta)
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> &str {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
@@ -676,7 +689,10 @@ fn content_type_for(name: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{catalog_work_url, idempotency_key, retryable_status, GalleryClient};
+    use super::{
+        catalog_work_url, gallery_meta, idempotency_key, retryable_status, GalleryClient,
+        MAX_GALLERY_TITLE_BYTES,
+    };
     use crate::model::{Author, ImageRef, MediaItem, SourceKind};
     use std::io::{Read, Write};
 
@@ -731,6 +747,18 @@ mod tests {
         std::fs::write(&copied, b"changed bytes").unwrap();
         let changed = idempotency_key(&item(), &[copied.as_path()]).unwrap();
         assert_ne!(a, changed);
+    }
+
+    #[test]
+    fn gallery_meta_truncates_title_at_utf8_boundary() {
+        let mut item = item();
+        item.title = Some("中".repeat(171));
+
+        let meta: serde_json::Value =
+            serde_json::from_str(&gallery_meta(&item, None).unwrap()).unwrap();
+        let title = meta["title"].as_str().unwrap();
+        assert_eq!(title, "中".repeat(170));
+        assert!(title.len() <= MAX_GALLERY_TITLE_BYTES);
     }
 
     #[test]

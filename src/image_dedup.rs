@@ -35,6 +35,8 @@ pub struct RegionFingerprint {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageFingerprint {
+    #[serde(default)]
+    pub solid_color: bool,
     pub content_sha256: String,
     pub strict_key: String,
     pub average_hash: u64,
@@ -143,6 +145,7 @@ fn fingerprint_from_bytes(
         .map(|value| format!("{value:?}").to_ascii_uppercase())
         .unwrap_or_else(|_| "UNKNOWN".into());
     let image = image::load_from_memory(encoded).context("解码图片失败")?;
+    let solid_color = is_solid_color(&image);
     let width = image.width();
     let height = image.height();
     let visual = visual_fingerprint(&image);
@@ -151,6 +154,7 @@ fn fingerprint_from_bytes(
     let regions = split_regions(&image);
 
     Ok(ImageFingerprint {
+        solid_color,
         content_sha256: hex_digest(encoded),
         strict_key,
         average_hash: visual.0,
@@ -163,6 +167,22 @@ fn fingerprint_from_bytes(
         format,
         regions,
     })
+}
+
+// Allow tiny JPEG rounding noise, but inspect every pixel so small details survive.
+fn is_solid_color(image: &image::DynamicImage) -> bool {
+    let mut min = [255_u8; 4];
+    let mut max = [0_u8; 4];
+    for pixel in image.to_rgba8().pixels() {
+        for channel in 0..4 {
+            min[channel] = min[channel].min(pixel[channel]);
+            max[channel] = max[channel].max(pixel[channel]);
+            if max[channel] - min[channel] > 5 {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn luma_hashes(image: &image::DynamicImage) -> (u64, u64) {
@@ -270,6 +290,9 @@ fn split_regions_sequential(image: &image::DynamicImage) -> Vec<RegionFingerprin
 }
 
 pub fn classify_similarity(left: &ImageFingerprint, right: &ImageFingerprint) -> MatchKind {
+    if left.solid_color || right.solid_color {
+        return MatchKind::Different;
+    }
     if left.content_sha256 == right.content_sha256 {
         return MatchKind::StrictSame;
     }
@@ -375,6 +398,10 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         "ALTER TABLE image_fingerprints ADD COLUMN regions_json TEXT NOT NULL DEFAULT '[]'",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE image_fingerprints ADD COLUMN solid_color INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     Ok(())
 }
 
@@ -398,8 +425,8 @@ pub fn record_work(
             "INSERT INTO image_fingerprints(
                 source_kind,source_id,image_index,title,source_url,status,
                 content_sha256,strict_key,average_hash,difference_hash,color_key,detail_key,
-                width,height,bytes,format,regions_json,recorded_at
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                width,height,bytes,format,regions_json,recorded_at,solid_color
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             params![
                 kind,
                 source_id,
@@ -419,6 +446,7 @@ pub fn record_work(
                 fingerprint.format,
                 serde_json::to_string(&fingerprint.regions)?,
                 now,
+                fingerprint.solid_color,
             ],
         )?;
     }
@@ -582,7 +610,7 @@ fn load_works(conn: &Connection) -> Result<Vec<WorkSummary>> {
     let mut stmt = conn.prepare(
         "SELECT source_kind,source_id,image_index,title,source_url,status,
                 content_sha256,strict_key,average_hash,difference_hash,color_key,detail_key,
-                width,height,bytes,format,COALESCE(regions_json, '[]')
+                width,height,bytes,format,COALESCE(regions_json, '[]'),solid_color
          FROM image_fingerprints
          ORDER BY source_kind,source_id,image_index",
     )?;
@@ -595,6 +623,7 @@ fn load_works(conn: &Connection) -> Result<Vec<WorkSummary>> {
             row.get::<_, String>(4)?,
             row.get::<_, String>(5)?,
             ImageFingerprint {
+                solid_color: row.get(17)?,
                 content_sha256: row.get(6)?,
                 strict_key: row.get(7)?,
                 average_hash: parse_hash(row.get::<_, String>(8)?),

@@ -22,6 +22,7 @@ fn record(page_index: u32, sha256: &str) -> CatalogImageRecord {
 
 fn fingerprint(sha256: &str) -> ImageFingerprint {
     ImageFingerprint {
+        solid_color: false,
         content_sha256: sha256.into(),
         strict_key: "strict".into(),
         average_hash: 1,

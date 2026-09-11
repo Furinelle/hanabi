@@ -389,7 +389,15 @@ impl TelegramSink {
         if files.is_empty() {
             anyhow::bail!("无图片可发: {}", item.source_id);
         }
-        let fingerprints = inspect_images(files).await?;
+        let (kept_files, fingerprints) = inspect_non_solid_images(files).await?;
+        if kept_files.is_empty() {
+            cleanup(files);
+            return Ok(PublishResult {
+                outcome: PublishOutcome::Skipped,
+                publication: empty_publication(),
+            });
+        }
+        let files = kept_files.as_slice();
         let evaluation = {
             let db = self.state.db.lock().await;
             evaluate_work(&db, item, &fingerprints)?
@@ -2001,6 +2009,23 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
     .await;
 }
 
+async fn inspect_non_solid_images(
+    files: &[PathBuf],
+) -> Result<(Vec<PathBuf>, Vec<ImageFingerprint>)> {
+    let fingerprints = inspect_images(files).await?;
+    let mut kept_files = Vec::new();
+    let mut kept_fingerprints = Vec::new();
+    for (file, fingerprint) in files.iter().zip(fingerprints) {
+        if fingerprint.solid_color {
+            tracing::info!(path = %file.display(), "跳过纯色图片");
+        } else {
+            kept_files.push(file.clone());
+            kept_fingerprints.push(fingerprint);
+        }
+    }
+    Ok((kept_files, kept_fingerprints))
+}
+
 async fn inspect_images(files: &[PathBuf]) -> Result<Vec<ImageFingerprint>> {
     let files = files.to_vec();
     tokio::task::spawn_blocking(move || {
@@ -2130,7 +2155,12 @@ impl Sink for TelegramSink {
         if files.is_empty() {
             anyhow::bail!("无图片可发: {}", item.source_id);
         }
-        let fingerprints = inspect_images(files).await?;
+        let (kept_files, fingerprints) = inspect_non_solid_images(files).await?;
+        if kept_files.is_empty() {
+            cleanup(files);
+            return Ok(());
+        }
+        let files = kept_files.as_slice();
         let evaluation = {
             let db = self.state.db.lock().await;
             evaluate_work(&db, item, &fingerprints)?
@@ -3977,6 +4007,25 @@ async fn handle_similar_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn solid_filter_preserves_order_and_handles_an_all_solid_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let black = dir.path().join("black.png");
+        let detail = dir.path().join("detail.png");
+        let mut image = image::RgbImage::new(20, 20);
+        image.save(&black).unwrap();
+        image.put_pixel(10, 10, image::Rgb([200, 100, 50]));
+        image.save(&detail).unwrap();
+        let (files, fingerprints) = inspect_non_solid_images(&[black.clone(), detail.clone()])
+            .await
+            .unwrap();
+        assert_eq!(files, vec![detail]);
+        assert_eq!(fingerprints.len(), 1);
+        assert!(!fingerprints[0].solid_color);
+        let (files, fingerprints) = inspect_non_solid_images(&[black]).await.unwrap();
+        assert!(files.is_empty() && fingerprints.is_empty());
+    }
 
     fn multi_post_similar_group() -> SimilarReviewGroup {
         SimilarReviewGroup {

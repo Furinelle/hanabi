@@ -360,3 +360,56 @@ fn same_platform_different_posts_still_request_similar_review() {
     assert_eq!(evaluation.similar.len(), 1);
     assert_eq!(evaluation.similar[0].existing_work.source_id, "x7");
 }
+
+#[test]
+fn solid_colors_and_jpeg_noise_do_not_match_but_small_details_survive() {
+    let dir = tempfile::tempdir().unwrap();
+    for (index, color) in [[0, 0, 0], [255, 255, 255], [230, 30, 80]]
+        .iter()
+        .enumerate()
+    {
+        let path = dir.path().join(format!("{index}.png"));
+        save_png(&path, &ImageBuffer::from_pixel(100, 100, Rgb(*color)));
+        let fingerprint = inspect_image(&path).unwrap();
+        assert!(fingerprint.solid_color);
+        assert_eq!(
+            classify_similarity(&fingerprint, &fingerprint),
+            MatchKind::Different
+        );
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        record_work(
+            &conn,
+            &item(SourceKind::X, "solid", "solid"),
+            std::slice::from_ref(&fingerprint),
+            WorkStatus::Published,
+        )
+        .unwrap();
+        let result = evaluate_work(
+            &conn,
+            &item(SourceKind::Pixiv, "other", "other"),
+            &[fingerprint],
+        )
+        .unwrap();
+        assert!(result.similar.is_empty());
+        assert!(matches!(result.exact_action, ExactAction::None));
+    }
+    let path = dir.path().join("noise.png");
+    let mut noisy = ImageBuffer::from_fn(100, 100, |x, y| Rgb([(x % 3) as u8, (y % 6) as u8, 0]));
+    save_png(&path, &noisy);
+    assert!(inspect_image(&path).unwrap().solid_color);
+    noisy.put_pixel(50, 50, Rgb([30, 30, 30]));
+    save_png(&path, &noisy);
+    assert!(!inspect_image(&path).unwrap().solid_color);
+}
+
+#[test]
+fn transparency_details_are_not_solid_color() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("alpha.png");
+    let image = image::RgbaImage::from_fn(20, 20, |x, _| {
+        image::Rgba([0, 0, 0, if x < 10 { 0 } else { 255 }])
+    });
+    image.save(&path).unwrap();
+    assert!(!inspect_image(&path).unwrap().solid_color);
+}

@@ -90,8 +90,8 @@ pub fn import_catalog_image(
         "INSERT INTO image_fingerprints(
             source_kind,source_id,image_index,title,source_url,status,
             content_sha256,strict_key,average_hash,difference_hash,color_key,detail_key,
-            width,height,bytes,format,regions_json,recorded_at
-         ) VALUES(?1,?2,?3,?4,?5,'published',?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+            width,height,bytes,format,regions_json,recorded_at,solid_color
+         ) VALUES(?1,?2,?3,?4,?5,'published',?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
          ON CONFLICT(source_kind,source_id,image_index) DO UPDATE SET
             title=excluded.title,
             source_url=excluded.source_url,
@@ -107,7 +107,8 @@ pub fn import_catalog_image(
             bytes=excluded.bytes,
             format=excluded.format,
             regions_json=excluded.regions_json,
-            recorded_at=excluded.recorded_at",
+            recorded_at=excluded.recorded_at,
+            solid_color=excluded.solid_color",
         params![
             image.source.as_str(),
             image.source_id,
@@ -126,6 +127,7 @@ pub fn import_catalog_image(
             fingerprint.format,
             serde_json::to_string(&fingerprint.regions)?,
             now,
+            fingerprint.solid_color,
         ],
     )?;
     Ok(true)

@@ -413,3 +413,19 @@ fn transparency_details_are_not_solid_color() {
     image.save(&path).unwrap();
     assert!(!inspect_image(&path).unwrap().solid_color);
 }
+
+#[test]
+fn fully_transparent_images_are_solid_despite_hidden_rgb() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("transparent.png");
+    let image = image::RgbaImage::from_fn(20, 20, |x, _| {
+        image::Rgba([if x < 10 { 0 } else { 255 }, 0, 0, 0])
+    });
+    image.save(&path).unwrap();
+    let fingerprint = inspect_image(&path).unwrap();
+    assert!(fingerprint.solid_color);
+    assert_eq!(
+        classify_similarity(&fingerprint, &fingerprint),
+        MatchKind::Different
+    );
+}

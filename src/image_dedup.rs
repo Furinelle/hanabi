@@ -171,9 +171,13 @@ fn fingerprint_from_bytes(
 
 // Allow tiny JPEG rounding noise, but inspect every pixel so small details survive.
 fn is_solid_color(image: &image::DynamicImage) -> bool {
+    let rgba = image.to_rgba8();
+    if rgba.pixels().all(|pixel| pixel[3] == 0) {
+        return true;
+    }
     let mut min = [255_u8; 4];
     let mut max = [0_u8; 4];
-    for pixel in image.to_rgba8().pixels() {
+    for pixel in rgba.pixels() {
         for channel in 0..4 {
             min[channel] = min[channel].min(pixel[channel]);
             max[channel] = max[channel].max(pixel[channel]);

@@ -1,0 +1,9 @@
+# Private runtime data must not be shared with ChatGPT.
+/config.toml
+/config.toml.*
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.log

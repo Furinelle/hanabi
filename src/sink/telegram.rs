@@ -1748,6 +1748,9 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
     if !expired.is_empty() {
         tracing::info!(count = expired.len(), "清理超期 pending");
     }
+    if let Err(error) = image_review::refresh_existing(state).await {
+        tracing::warn!(%error, "清理相似图审批消息待重试");
+    }
     image_review::collect_retired(state).await;
 
     // ② 孤儿临时目录。先把 files JSON 收集成 owned(释放 db 锁),再在锁外解析。

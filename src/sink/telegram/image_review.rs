@@ -81,6 +81,142 @@ fn old_keyboard(token: i64, index: usize, deleted: bool) -> InlineKeyboardMarkup
     )]])
 }
 
+// Message IDs: 0 was never displayed; -1 was removed and can be recreated by /undo.
+fn original_info(original: &Path) -> Result<String> {
+    let (width, height) = image::image_dimensions(original)?;
+    Ok(format!(
+        "{}×{} · {}",
+        width,
+        height,
+        review_bytes(std::fs::metadata(original)?.len())
+    ))
+}
+
+fn old_caption(image_id: &str, original: &Path) -> Result<String> {
+    Ok(format!(
+        "【相似旧图 · 默认保留】\n{}\n原图：{}\n删除只影响这一张；误点可 /undo。",
+        crate::sink::html_escape(image_id),
+        original_info(original)?
+    ))
+}
+
+async fn save_cards(state: &Arc<ReviewState>, session: &Session) -> Result<()> {
+    let db = state.db.lock().await;
+    let tx = db.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE image_review_sessions SET payload=?2 WHERE token=?1",
+        rusqlite::params![session.token, serde_json::to_string(session)?],
+    )?;
+    tx.execute(
+        "UPDATE pending SET msg_ids=?2 WHERE token=?1",
+        rusqlite::params![
+            session.token,
+            serde_json::to_string(&session.all_messages())?
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+async fn cleanup_cards(state: &Arc<ReviewState>, session: &mut Session, all: bool) -> Result<()> {
+    let mut ids = Vec::new();
+    if all {
+        ids.extend(session.messages.iter().copied().filter(|id| *id > 0));
+    }
+    ids.extend(
+        session
+            .old
+            .iter()
+            .filter(|old| all || old.deleted)
+            .map(|old| old.message_id)
+            .filter(|id| *id > 0),
+    );
+    if all {
+        ids.extend(session.control_message.filter(|id| *id > 0));
+    }
+    let mut removed = HashSet::new();
+    for id in ids {
+        let result = tg_retry(|| {
+            state
+                .bot
+                .delete_message(state.review_chat.clone(), MessageId(id))
+        })
+        .await;
+        match result {
+            Ok(_) => {
+                removed.insert(id);
+            }
+            Err(error) if error.to_string().contains("message to delete not found") => {
+                removed.insert(id);
+            }
+            Err(error) => {
+                tracing::warn!(%error, token=session.token, message_id=id, "清理相似图审批消息失败，保留消息编号供重试")
+            }
+        }
+    }
+    for id in &mut session.messages {
+        if removed.contains(id) {
+            *id = -1;
+        }
+    }
+    for old in &mut session.old {
+        if removed.contains(&old.message_id) {
+            old.message_id = -1;
+        }
+    }
+    if session
+        .control_message
+        .is_some_and(|id| removed.contains(&id))
+    {
+        session.control_message = Some(-1);
+    }
+    save_cards(state, session).await?;
+    if !removed.is_empty() {
+        tracing::info!(
+            token = session.token,
+            removed = removed.len(),
+            "已清理相似图审批消息"
+        );
+    }
+    Ok(())
+}
+
+async fn restore_card(
+    state: &Arc<ReviewState>,
+    id: i32,
+    original: &Path,
+    caption: String,
+    buttons: InlineKeyboardMarkup,
+) -> Result<i32> {
+    if id > 0 {
+        match tg_retry(|| {
+            state
+                .bot
+                .edit_message_caption(state.review_chat.clone(), MessageId(id))
+                .caption(caption.clone())
+                .parse_mode(ParseMode::Html)
+                .reply_markup(buttons.clone())
+        })
+        .await
+        {
+            Ok(_) => return Ok(id),
+            Err(error) if error.to_string().contains("message is not modified") => return Ok(id),
+            Err(error) if error.to_string().contains("message to edit not found") => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let path = original.to_path_buf();
+    let prepared = tokio::task::spawn_blocking(move || prepare_all(&[path])).await??;
+    send_card(state, &prepared[0], caption, buttons).await
+}
+
+fn gallery_controls(token: i64) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+        "✅ 保留其余旧图并结束",
+        format!("image:{token}:finish:0"),
+    )]])
+}
+
 async fn send_card(
     state: &Arc<ReviewState>,
     path: &Path,
@@ -212,11 +348,9 @@ async fn queue_inner(
                             state,
                             &prepared[0],
                             format!(
-                                "【相似旧图 · 默认保留】\n{}\n对应候选第 {} 张 · {} · {}",
-                                crate::sink::html_escape(&old.image_id),
-                                index + 1,
-                                matched.existing.dimensions_label(),
-                                review_bytes(matched.existing.bytes)
+                                "{}\n对应候选第 {} 张",
+                                old_caption(&old.image_id, &old.path)?,
+                                index + 1
                             ),
                             old_keyboard(token, old_index, false),
                         )
@@ -281,6 +415,7 @@ impl Session {
             .copied()
             .chain(self.old.iter().map(|i| i.message_id).filter(|id| *id > 0))
             .chain(self.control_message)
+            .filter(|id| *id > 0)
             .collect()
     }
 
@@ -371,26 +506,53 @@ fn record_choice(db: &rusqlite::Connection, before: &Session, after: &Session) -
     Ok(())
 }
 
-async fn refresh(state: &Arc<ReviewState>, session: &Session, decided: bool) -> Result<()> {
-    for (index, id) in session.messages.iter().enumerate() {
-        let buttons = if decided {
-            InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new())
-        } else {
-            keyboard(session.token, index, session.choices[index])
-        };
-        // A repeated refresh after a network timeout may legitimately find the same markup.
-        if let Err(error) = tg_retry(|| {
+async fn refresh(state: &Arc<ReviewState>, session: &mut Session) -> Result<()> {
+    for index in 0..session.messages.len() {
+        let caption = format!(
+            "【候选 {}/{}】\n{}\n{}\n\n逐张保留／丢弃，审完自动发送并入库。误点可 /undo。",
+            index + 1,
+            session.messages.len(),
+            render_caption(&session.item),
+            format_args!(
+                "原图 p{index} · {}",
+                original_info(&session.originals[index])?
+            )
+        );
+        session.messages[index] = restore_card(
+            state,
+            session.messages[index],
+            &session.originals[index],
+            caption,
+            keyboard(session.token, index, session.choices[index]),
+        )
+        .await?;
+        save_cards(state, session).await?;
+    }
+    for index in 0..session.old.len() {
+        let old = &session.old[index];
+        if old.message_id == 0 || old.deleted {
+            continue;
+        }
+        session.old[index].message_id = restore_card(
+            state,
+            old.message_id,
+            &old.path,
+            old_caption(&old.image_id, &old.path)?,
+            old_keyboard(session.token, index, false),
+        )
+        .await?;
+        save_cards(state, session).await?;
+    }
+    if session.choices.is_empty() && session.control_message.is_some_and(|id| id <= 0) {
+        let message = tg_retry(|| {
             state
                 .bot
-                .edit_message_reply_markup(state.review_chat.clone(), MessageId(*id))
-                .reply_markup(buttons.clone())
+                .send_message(state.review_chat.clone(), "逐张处理；其余图片默认保留。")
+                .reply_markup(gallery_controls(session.token))
         })
-        .await
-        {
-            if !error.to_string().contains("message is not modified") {
-                return Err(error.into());
-            }
-        }
+        .await?;
+        session.control_message = Some(message.id.0);
+        save_cards(state, session).await?;
     }
     Ok(())
 }
@@ -485,6 +647,9 @@ async fn apply_choice(
             tx.commit()?;
         }
 
+        if let Err(error) = cleanup_cards(state, &mut session, true).await {
+            tracing::warn!(%error, token, "审批已结束，消息清理待重试");
+        }
         return Ok(());
     }
     if action == "delete" {
@@ -558,16 +723,15 @@ async fn apply_choice(
                 let db = state.db.lock().await;
                 record_work(&db, &session.item, &fps, WorkStatus::Published)?;
             }
-            refresh(&state, &session, true).await?;
+            if let Err(error) = cleanup_cards(&state, &mut session, true).await {
+                tracing::warn!(%error, token, "审批已完成，消息清理待重试");
+            }
             let text = if outcome.partial_publish {
                 "⚠️ 仅部分图片发送成功，可 /undo 撤回后重审".to_string()
             } else if outcome.archive_failed {
                 "⚠️ 频道已发，图库入库未完成；可 /undo 撤回".to_string()
             } else {
-                format!(
-                    "✅ 已处理：保留 {selected} 张，丢弃 {} 张。其余旧图保留。误点可 /undo。",
-                    session.choices.len() - selected
-                )
+                return Ok(());
             };
             state
                 .bot
@@ -595,7 +759,23 @@ async fn apply_choice(
 }
 
 pub(super) async fn undo(state: &Arc<ReviewState>, action: &UndoAction) -> Result<()> {
-    let session: Session = serde_json::from_str(&action.row.5)?;
+    let mut session: Session = serde_json::from_str(&action.row.5)?;
+    {
+        let db = state.db.lock().await;
+        if let Some((current, _)) = load(&db, session.token)? {
+            session.messages = current.messages;
+            session.control_message = current.control_message;
+            for old in &mut session.old {
+                if let Some(now) = current
+                    .old
+                    .iter()
+                    .find(|now| now.image_id == old.image_id && now.r2_key == old.r2_key)
+                {
+                    old.message_id = now.message_id;
+                }
+            }
+        }
+    }
     if let Some(publication) = decode_undo_publication(&action.publication) {
         if let Some(first) = publication.message_ids.first() {
             state.pending_comments.lock().await.remove(first);
@@ -628,7 +808,7 @@ pub(super) async fn undo(state: &Arc<ReviewState>, action: &UndoAction) -> Resul
         }
         tx.commit()?;
     }
-    refresh(state, &session, false).await?;
+    refresh(state, &mut session).await?;
     Ok(())
 }
 
@@ -701,6 +881,9 @@ async fn delete_old(
     index: usize,
     guard: tokio::sync::OwnedMutexGuard<()>,
 ) -> Result<()> {
+    if session.old.get(index).is_some_and(|old| old.deleted) {
+        return cleanup_cards(state, &mut session, false).await;
+    }
     let Some(old) = session
         .old
         .get(index)
@@ -814,16 +997,8 @@ async fn delete_old(
                     format!("⚠️ 删除未完成：{error}。{suffix}"),
                 )
                 .await;
-        } else if let Err(error) = state
-            .bot
-            .edit_message_reply_markup(
-                state.review_chat.clone(),
-                MessageId(session.old[index].message_id),
-            )
-            .reply_markup(old_keyboard(session.token, index, true))
-            .await
-        {
-            tracing::warn!(%error, token=session.token, "图库旧图已删除，更新审批按钮失败");
+        } else if let Err(error) = cleanup_cards(&state, &mut session, false).await {
+            tracing::warn!(%error, token=session.token, "图库旧图已删除，消息清理待重试");
         }
     });
     Ok(())
@@ -898,7 +1073,7 @@ pub(super) async fn undo_delete(state: &Arc<ReviewState>, action: &UndoAction) -
     }
     // Confirm cancellation even when deletion is still prepared on the server.
     gallery.review_image(&serde_json::json!({"decision_id":journal.decision_id,"r2_key":journal.r2_key,"action":"restore","restored":journal.restored})).await?;
-    let session = {
+    let mut session = {
         let db = state.db.lock().await;
         let tx = db.unchecked_transaction()?;
         let (mut session, _) = load(&tx, journal.token)?.context("审批记录已过期")?;
@@ -941,18 +1116,24 @@ pub(super) async fn undo_delete(state: &Arc<ReviewState>, action: &UndoAction) -
         tx.commit()?;
         session
     };
-    if let Err(error) = state
-        .bot
-        .edit_message_reply_markup(
-            state.review_chat.clone(),
-            MessageId(session.old[journal.index].message_id),
+    let old = &session.old[journal.index];
+    let restored_card: Result<i32> = async {
+        restore_card(
+            state,
+            old.message_id,
+            &old.path,
+            old_caption(&old.image_id, &old.path)?,
+            old_keyboard(journal.token, journal.index, false),
         )
-        .reply_markup(old_keyboard(journal.token, journal.index, false))
         .await
-    {
-        if !error.to_string().contains("message is not modified") {
-            return Err(error.into());
+    }
+    .await;
+    match restored_card {
+        Ok(id) => {
+            session.old[journal.index].message_id = id;
+            save_cards(state, &session).await?;
         }
+        Err(error) => tracing::warn!(%error, token=journal.token, "图库已恢复，重建审批卡片失败"),
     }
     Ok(())
 }
@@ -989,7 +1170,7 @@ pub(super) async fn collect_retired(state: &Arc<ReviewState>) {
         let sessions={
             let mut stmt=tx.prepare("SELECT payload FROM image_review_sessions s WHERE NOT EXISTS(SELECT 1 FROM pending p WHERE p.token=s.token) AND NOT EXISTS(SELECT 1 FROM review_actions a WHERE a.token=s.token AND a.state IN ('available','restoring'))")?;
             let rows=stmt.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            rows.into_iter().map(|raw| serde_json::from_str(&raw)).collect::<serde_json::Result<Vec<Session>>>()?
+            rows.into_iter().map(|raw| serde_json::from_str(&raw)).collect::<serde_json::Result<Vec<Session>>>()?.into_iter().filter(|session| session.all_messages().is_empty()).collect::<Vec<_>>()
         };
         for session in &sessions { tx.execute("DELETE FROM image_review_sessions WHERE token=?1",[session.token])?; }
         tx.commit()?;
@@ -1147,10 +1328,7 @@ async fn migrate_gallery_legacy(
                 let message_id = send_card(
                     state,
                     &prepared[0],
-                    format!(
-                        "【旧图 · 默认保留】\n{}\n删除只影响这一张；误点可 /undo。",
-                        crate::sink::html_escape(&image_id)
-                    ),
+                    old_caption(&image_id, &dest)?,
                     old_keyboard(token, session.old.len(), false),
                 )
                 .await?;
@@ -1172,12 +1350,7 @@ async fn migrate_gallery_legacy(
                 state.review_chat.clone(),
                 "旧审批已改为逐张处理；需要删哪张，就点那张图下的删除。",
             )
-            .reply_markup(InlineKeyboardMarkup::new(vec![vec![
-                InlineKeyboardButton::callback(
-                    "✅ 保留其余旧图并结束",
-                    format!("image:{token}:finish:0"),
-                ),
-            ]]))
+            .reply_markup(gallery_controls(token))
             .await?;
         session.control_message = Some(control.id.0);
         let db = state.db.lock().await;
@@ -1225,6 +1398,54 @@ async fn migrate_gallery_legacy(
     Ok(true)
 }
 
+pub(super) async fn refresh_existing(state: &Arc<ReviewState>) -> Result<()> {
+    let sessions = {
+        let db = state.db.lock().await;
+        let mut stmt = db.prepare(
+            "SELECT payload,state FROM image_review_sessions WHERE state IN ('pending','decided')",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (payload, status) in sessions {
+        let mut session: Session = serde_json::from_str(&payload)?;
+        cleanup_cards(state, &mut session, status == "decided").await?;
+        if status == "pending" {
+            for (index, old) in session.old.iter().enumerate() {
+                if old.message_id <= 0 || old.deleted {
+                    continue;
+                }
+                let caption = match old_caption(&old.image_id, &old.path) {
+                    Ok(caption) => caption,
+                    Err(error) => {
+                        tracing::warn!(%error, token=session.token, "读取相似图画质信息失败");
+                        continue;
+                    }
+                };
+                if let Err(error) = tg_retry(|| {
+                    state
+                        .bot
+                        .edit_message_caption(state.review_chat.clone(), MessageId(old.message_id))
+                        .caption(caption.clone())
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(old_keyboard(session.token, index, false))
+                })
+                .await
+                {
+                    if !error.to_string().contains("message is not modified") {
+                        tracing::warn!(%error, token=session.token, "补充相似图画质信息失败");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn migrate_pending(state: Arc<ReviewState>) {
     let tokens = {
         let db = state.db.lock().await;
@@ -1242,6 +1463,10 @@ pub(super) async fn migrate_pending(state: Arc<ReviewState>) {
         if let Err(error) = migrate_legacy(&state, token).await {
             tracing::warn!(token,%error,"迁移旧相似图审批失败，旧记录保留");
         }
+    }
+    let _guard = state.review_gate.lock().await;
+    if let Err(error) = refresh_existing(&state).await {
+        tracing::warn!(%error, "更新已有相似图审批卡片失败");
     }
 }
 
@@ -1399,13 +1624,187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finished_gallery_cards_retry_cleanup_and_reappear_on_undo() {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for step in 0..7 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&mut socket);
+                let mut route = String::new();
+                reader.read_line(&mut route).unwrap();
+                let mut length = 0;
+                let mut chunked = false;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(n) = line.to_lowercase().strip_prefix("content-length:") {
+                        length = n.trim().parse().unwrap();
+                    }
+                    if line.to_lowercase().contains("transfer-encoding: chunked") {
+                        chunked = true;
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                if chunked {
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        let count = usize::from_str_radix(line.trim(), 16).unwrap();
+                        if count == 0 {
+                            reader.read_line(&mut String::new()).unwrap();
+                            break;
+                        }
+                        let start = body.len();
+                        body.resize(start + count, 0);
+                        reader.read_exact(&mut body[start..]).unwrap();
+                        reader.read_exact(&mut [0; 2]).unwrap();
+                    }
+                }
+                let (status, result) = if step < 4 {
+                    assert!(route.to_lowercase().contains("deletemessage"));
+                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["message_id"], [10, 11, 12, 10][step]);
+                    if step == 0 {
+                        (
+                            "400 Bad Request",
+                            serde_json::json!({"ok":false,"error_code":400,"description":"Bad Request: message can't be deleted"}),
+                        )
+                    } else {
+                        ("200 OK", serde_json::json!({"ok":true,"result":true}))
+                    }
+                } else {
+                    if step < 6 {
+                        assert!(route.to_lowercase().contains("sendphoto"));
+                        let body = String::from_utf8_lossy(&body);
+                        assert!(body.contains("320×240") && body.contains("KiB"));
+                    } else {
+                        assert!(route.to_lowercase().contains("sendmessage"));
+                    }
+                    (
+                        "200 OK",
+                        serde_json::json!({"ok":true,"result":{"message_id":20+step,"date":1,"chat":{"id":123,"type":"private"},"text":"review"}}),
+                    )
+                };
+                let body = result.to_string();
+                write!(socket,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = TelegramSink::new(
+            "123:fake".into(),
+            "123".into(),
+            "-100123".into(),
+            dir.path().join("hanabi.db").to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let inner = Arc::get_mut(&mut sink.state).unwrap();
+        inner.bot = inner
+            .bot
+            .clone()
+            .set_api_url(reqwest::Url::parse(&base).unwrap());
+        let state = sink.state();
+        let mut review = session();
+        review.originals.clear();
+        review.prepared.clear();
+        review.choices.clear();
+        review.messages.clear();
+        review.control_message = Some(12);
+        review.old = (0..2)
+            .map(|index| {
+                let path = dir.path().join(format!("old-{index}.png"));
+                image::RgbImage::new(320, 240).save(&path).unwrap();
+                OldImage {
+                    image_id: format!("pixiv:123#{index}"),
+                    r2_key: format!("{index}.png"),
+                    path,
+                    message_id: 10 + index,
+                    deleted: false,
+                }
+            })
+            .collect();
+        {
+            let db = state.db.lock().await;
+            db.execute(
+                "INSERT INTO image_review_sessions(token,payload) VALUES(?1,?2)",
+                rusqlite::params![review.token, serde_json::to_string(&review).unwrap()],
+            )
+            .unwrap();
+            insert_pending(&db, &review).unwrap();
+        }
+        let guard = state.review_gate.clone().lock_owned().await;
+        apply_choice(&state, review.token, "finish", 0, guard)
+            .await
+            .unwrap();
+        {
+            let db = state.db.lock().await;
+            let (saved, status) = load(&db, review.token).unwrap().unwrap();
+            assert_eq!(status, "decided");
+            assert_eq!(saved.all_messages(), vec![10]);
+            assert!(saved.old.iter().all(|old| old.path.is_file()));
+        }
+        refresh_existing(&state).await.unwrap();
+        let action = {
+            let mut db = state.db.lock().await;
+            assert!(load(&db, review.token)
+                .unwrap()
+                .unwrap()
+                .0
+                .all_messages()
+                .is_empty());
+            let UndoClaim::Claimed(action) = claim_latest_undo(&mut db).unwrap() else {
+                panic!("finish remains undoable")
+            };
+            action
+        };
+        undo(&state, &action).await.unwrap();
+        let db = state.db.lock().await;
+        let (saved, status) = load(&db, review.token).unwrap().unwrap();
+        assert_eq!(status, "pending");
+        assert_eq!(saved.all_messages(), vec![24, 25, 26]);
+        let pending_ids: String = db
+            .query_row(
+                "SELECT msg_ids FROM pending WHERE token=?1",
+                [review.token],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<i32>>(&pending_ids).unwrap(),
+            vec![24, 25, 26]
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn historical_card_uses_original_dimensions_and_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.png");
+        image::RgbImage::new(320, 240).save(&original).unwrap();
+        let caption = old_caption("pixiv:<123>#0", &original).unwrap();
+        assert!(caption.contains("320×240"));
+        assert!(caption.contains(&review_bytes(std::fs::metadata(&original).unwrap().len())));
+        assert!(caption.contains("pixiv:&lt;123&gt;#0"));
+    }
+
+    #[tokio::test]
     async fn gallery_deletion_survives_missing_or_failed_telegram_and_remains_undoable() {
         use std::io::{BufRead, Read, Write};
         for scenario in [
             "telegram_failure",
             "missing_targets",
             "gallery_failure",
-            "markup_failure",
+            "cleanup_failure",
+            "cleanup_success",
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -1415,7 +1814,7 @@ mod tests {
             let server_stop = stop.clone();
             let server_calls = calls.clone();
             let server = std::thread::spawn(move || {
-                let targets = if scenario == "missing_targets" {
+                let targets = if matches!(scenario, "missing_targets" | "cleanup_success") {
                     serde_json::json!([])
                 } else {
                     serde_json::json!([
@@ -1479,13 +1878,16 @@ mod tests {
                             }
                         }
                     } else if route.contains("deletemessage")
-                        || (scenario == "markup_failure"
-                            && route.contains("editmessagereplymarkup"))
+                        && (scenario == "cleanup_failure"
+                            || (body["chat_id"] != serde_json::json!(123)
+                                && body["chat_id"] != serde_json::json!("123")))
                     {
                         (
                             "400 Bad Request",
                             serde_json::json!({"ok":false,"error_code":400,"description":"Bad Request: message can't be deleted"}),
                         )
+                    } else if route.contains("deletemessage") {
+                        ("200 OK", serde_json::json!({"ok":true,"result":true}))
                     } else if route.contains("copymessage") {
                         (
                             "200 OK",
@@ -1494,7 +1896,7 @@ mod tests {
                     } else {
                         (
                             "200 OK",
-                            serde_json::json!({"ok":true,"result":{"message_id":10,"date":1,"chat":{"id":123,"type":"private"},"text":"review"}}),
+                            serde_json::json!({"ok":true,"result":{"message_id":101,"date":1,"chat":{"id":123,"type":"private"},"text":"review"}}),
                         )
                     };
                     let body = response.to_string();
@@ -1554,6 +1956,15 @@ mod tests {
                 assert_eq!(saved.old[0].deleted, !gallery_failed, "{scenario}");
                 assert_eq!(status, "pending", "{scenario}");
                 assert_eq!(
+                    saved.old[0].message_id,
+                    if gallery_failed || scenario == "cleanup_failure" {
+                        10
+                    } else {
+                        -1
+                    },
+                    "{scenario}"
+                );
+                assert_eq!(
                     fingerprint_snapshot(&db, "pixiv:321#0").unwrap().is_some(),
                     gallery_failed,
                     "{scenario}"
@@ -1575,10 +1986,12 @@ mod tests {
                         .iter()
                         .filter(|(r, _)| r.contains("deletemessage"))
                         .count(),
-                    if gallery_failed || scenario == "missing_targets" {
+                    if gallery_failed {
                         0
+                    } else if matches!(scenario, "missing_targets" | "cleanup_success") {
+                        1
                     } else {
-                        2
+                        3
                     },
                     "{scenario}"
                 );
@@ -1591,7 +2004,10 @@ mod tests {
                     "{scenario}"
                 );
             }
-            if matches!(scenario, "telegram_failure" | "missing_targets") {
+            if matches!(
+                scenario,
+                "telegram_failure" | "missing_targets" | "cleanup_success"
+            ) {
                 let action = {
                     let mut db = state.db.lock().await;
                     let UndoClaim::Claimed(action) = claim_latest_undo(&mut db).unwrap() else {
@@ -1600,7 +2016,9 @@ mod tests {
                     action
                 };
                 // Empty mappings and intact channel posts require no local display preparation.
-                std::fs::remove_file(&path).unwrap();
+                if scenario != "cleanup_success" {
+                    std::fs::remove_file(&path).unwrap();
+                }
                 undo_delete(&state, &action).await.unwrap();
                 let db = state.db.lock().await;
                 assert!(!load(&db, review.token).unwrap().unwrap().0.old[0].deleted);
@@ -1613,7 +2031,11 @@ mod tests {
                     .1["restored"];
                 assert_eq!(
                     restored.as_array().unwrap().len(),
-                    if scenario == "missing_targets" { 0 } else { 2 }
+                    if matches!(scenario, "missing_targets" | "cleanup_success") {
+                        0
+                    } else {
+                        2
+                    }
                 );
                 if scenario == "telegram_failure" {
                     assert_eq!(restored[0]["message_id"], 11);
@@ -1624,11 +2046,25 @@ mod tests {
                         .iter()
                         .filter(|(r, _)| r.contains("copymessage"))
                         .count(),
-                    if scenario == "missing_targets" { 0 } else { 2 }
+                    if matches!(scenario, "missing_targets" | "cleanup_success") {
+                        0
+                    } else {
+                        2
+                    }
                 );
-                assert!(!calls.iter().any(|(r, _)| r.contains("sendphoto")
-                    || r.contains("sendmediagroup")
-                    || r.contains("senddocument")));
+                assert_eq!(
+                    calls
+                        .iter()
+                        .filter(|(r, _)| r.contains("sendphoto") || r.contains("senddocument"))
+                        .count(),
+                    usize::from(scenario == "cleanup_success")
+                );
+                if scenario == "cleanup_success" {
+                    assert_eq!(
+                        load(&db, review.token).unwrap().unwrap().0.old[0].message_id,
+                        101
+                    );
+                }
             }
             stop.store(true, Ordering::SeqCst);
             server.join().unwrap();
@@ -1694,7 +2130,7 @@ mod tests {
                             )
                         }
                     } else {
-                        assert!(route.to_lowercase().contains("editmessagereplymarkup"));
+                        assert!(route.to_lowercase().contains("editmessagecaption"));
                         (
                             "200 OK",
                             serde_json::json!({"ok":true,"result":{"message_id":10,"date":1,"chat":{"id":123,"type":"private"},"text":"review"}}),
@@ -1961,6 +2397,10 @@ mod tests {
                 .unwrap();
             drop(state.review_gate.lock().await);
         }
+        {
+            let db = state.db.lock().await;
+            assert!(load(&db, 50).unwrap().unwrap().0.all_messages().is_empty());
+        }
         let action = {
             let mut db = state.db.lock().await;
             let UndoClaim::Claimed(action) = claim_latest_undo(&mut db).unwrap() else {
@@ -1988,7 +2428,7 @@ mod tests {
                 .iter()
                 .filter(|p| p.to_lowercase().ends_with("sendphoto"))
                 .count(),
-            1
+            3
         );
         assert_eq!(
             paths.iter().filter(|p| p.as_str() == "/api/ingest").count(),

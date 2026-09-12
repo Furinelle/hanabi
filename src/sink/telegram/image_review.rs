@@ -704,6 +704,9 @@ async fn delete_old(
         anyhow::bail!("该旧图已删除或审批已失效");
     };
     let gallery = state.gallery.as_ref().context("图库未配置")?.clone();
+    if !old.path.is_file() {
+        anyhow::bail!("这张旧图的恢复文件已过期，未执行删除");
+    }
     let mut journal = DeleteUndo {
         session_state: status,
         token: session.token,
@@ -943,7 +946,7 @@ pub(super) async fn cleanup_unreferenced(state: &Arc<ReviewState>, paths: &[Path
     };
     let db = state.db.lock().await;
     let referenced = (|| -> rusqlite::Result<bool> {
-        let mut stmt = db.prepare("SELECT files FROM pending UNION ALL SELECT files FROM review_actions WHERE state IN ('available','restoring')")?;
+        let mut stmt = db.prepare("SELECT files FROM pending UNION ALL SELECT files FROM review_actions WHERE state IN ('available','restoring') UNION ALL SELECT json_array(COALESCE(json_extract(payload,'$.originals[0]'),json_extract(payload,'$.old[0].path'))) FROM image_review_sessions")?;
         for row in stmt.query_map([], |row| row.get::<_,String>(0))? {
             let Ok(files) = serde_json::from_str::<Vec<PathBuf>>(&row?) else { return Ok(true); };
             if files.iter().any(|p| p.parent() == Some(parent)) { return Ok(true); }
@@ -1377,6 +1380,61 @@ mod tests {
         assert!(!candidate.to_string().contains("confirm"));
         assert!(!old.to_string().contains("confirm"));
     }
+    #[tokio::test]
+    async fn visible_completed_cards_keep_their_undo_files_until_collected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("hanabi.db");
+        let sink = TelegramSink::new(
+            "123:fake".into(),
+            "123".into(),
+            "@channel".into(),
+            db_path.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let state = sink.state();
+        for gallery_only in [false, true] {
+            let root = dir
+                .path()
+                .join(if gallery_only { "old" } else { "candidate" });
+            std::fs::create_dir(&root).unwrap();
+            let path = root.join("original.png");
+            std::fs::write(&path, b"original").unwrap();
+            let mut review = session();
+            review.originals = if gallery_only {
+                vec![]
+            } else {
+                vec![path.clone()]
+            };
+            review.old = vec![OldImage {
+                image_id: "pixiv:321#0".into(),
+                r2_key: "old.png".into(),
+                path: path.clone(),
+                message_id: 10,
+                deleted: false,
+            }];
+            {
+                let db = state.db.lock().await;
+                db.execute("INSERT OR REPLACE INTO image_review_sessions(token,payload,state) VALUES(?1,?2,'decided')",rusqlite::params![review.token,serde_json::to_string(&review).unwrap()]).unwrap();
+            }
+            cleanup_unreferenced(&state, std::slice::from_ref(&path)).await;
+            assert!(
+                path.is_file(),
+                "a visible old-image delete button must still have undo data"
+            );
+            {
+                let db = state.db.lock().await;
+                db.execute(
+                    "DELETE FROM image_review_sessions WHERE token=?1",
+                    [review.token],
+                )
+                .unwrap();
+            }
+            cleanup_unreferenced(&state, std::slice::from_ref(&path)).await;
+            assert!(!path.exists());
+        }
+    }
+
     #[tokio::test]
     async fn publish_selected_pages_then_undo_restores_the_unfiltered_review() {
         use std::io::{Read, Write};

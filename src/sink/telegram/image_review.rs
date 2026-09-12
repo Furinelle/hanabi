@@ -884,8 +884,9 @@ pub(super) async fn undo_delete(state: &Arc<ReviewState>, action: &UndoAction) -
                 rusqlite::params![action.id, serde_json::to_string(&journal)?],
             )?;
         }
-        gallery.review_image(&serde_json::json!({"decision_id":journal.decision_id,"r2_key":journal.r2_key,"action":"restore","restored":journal.restored})).await?;
     }
+    // Confirm cancellation even when deletion is still prepared on the server.
+    gallery.review_image(&serde_json::json!({"decision_id":journal.decision_id,"r2_key":journal.r2_key,"action":"restore","restored":journal.restored})).await?;
     let session = {
         let db = state.db.lock().await;
         let tx = db.unchecked_transaction()?;
@@ -1385,6 +1386,155 @@ mod tests {
         assert!(!candidate.to_string().contains("confirm"));
         assert!(!old.to_string().contains("confirm"));
     }
+
+    #[tokio::test]
+    async fn undo_old_image_confirms_remote_restore_before_changing_local_state() {
+        use std::io::{BufRead, Read, Write};
+        for (remote_state, reject) in [
+            ("prepared", true),
+            ("prepared", false),
+            ("deleted", false),
+            ("restored", false),
+            ("unexpected", true),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                for step in 0..if reject { 2 } else { 3 } {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
+                    let mut reader = std::io::BufReader::new(&mut socket);
+                    let mut route = String::new();
+                    reader.read_line(&mut route).unwrap();
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    let (status, response) = if step < 2 {
+                        assert!(route.starts_with("POST /api/catalog/image-review "));
+                        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        assert_eq!(
+                            body["action"],
+                            if step == 0 { "prepare" } else { "restore" }
+                        );
+                        if step == 1 {
+                            assert_eq!(
+                                body["restored"].as_array().unwrap().len(),
+                                usize::from(remote_state == "deleted")
+                            );
+                        }
+                        if step == 1 && reject {
+                            (
+                                "409 Conflict",
+                                serde_json::json!({"ok":false,"error":"decision changed"}),
+                            )
+                        } else {
+                            (
+                                "200 OK",
+                                serde_json::json!({"ok":true,"state":if step == 0 { remote_state } else { "restored" }}),
+                            )
+                        }
+                    } else {
+                        assert!(route.to_lowercase().contains("editmessagereplymarkup"));
+                        (
+                            "200 OK",
+                            serde_json::json!({"ok":true,"result":{"message_id":10,"date":1,"chat":{"id":123,"type":"private"},"text":"review"}}),
+                        )
+                    };
+                    let body = response.to_string();
+                    write!(socket,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                }
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let mut sink = TelegramSink::new(
+                "123:fake".into(),
+                "123".into(),
+                "-100123".into(),
+                dir.path().join("hanabi.db").to_str().unwrap(),
+                Some(GalleryClient::new(base.clone(), "fake".into()).unwrap()),
+            )
+            .unwrap();
+            let inner = Arc::get_mut(&mut sink.state).unwrap();
+            inner.bot = inner
+                .bot
+                .clone()
+                .set_api_url(reqwest::Url::parse(&base).unwrap());
+            let state = sink.state();
+            let path = dir.path().join("old.png");
+            image::RgbImage::new(4, 4).save(&path).unwrap();
+            let mut review = session();
+            review.old = vec![OldImage {
+                image_id: "pixiv:321#0".into(),
+                r2_key: "old.png".into(),
+                path: path.clone(),
+                message_id: 10,
+                deleted: true,
+            }];
+            let journal = DeleteUndo {
+                session_state: "pending".into(),
+                token: review.token,
+                index: 0,
+                decision_id: "test-decision".into(),
+                r2_key: "old.png".into(),
+                path,
+                targets: vec![Target {
+                    publication_id: "publication".into(),
+                    chat_id: -100123,
+                    message_id: 11,
+                }],
+                restored: if remote_state == "deleted" {
+                    vec![Restored {
+                        publication_id: "publication".into(),
+                        message_id: 12,
+                    }]
+                } else {
+                    vec![]
+                },
+                fingerprint: None,
+            };
+            let action = {
+                let mut db = state.db.lock().await;
+                db.execute("INSERT INTO image_review_sessions(token,payload,state) VALUES(?1,?2,'deleting')",rusqlite::params![review.token,serde_json::to_string(&review).unwrap()]).unwrap();
+                db.execute("INSERT INTO review_actions(action,token,item_meta,files,originals,acted_at) VALUES('image_delete',?1,?2,?3,?3,1)",rusqlite::params![review.token,serde_json::to_string(&journal).unwrap(),serde_json::to_string(&vec![&journal.path]).unwrap()]).unwrap();
+                let UndoClaim::Claimed(action) = claim_latest_undo(&mut db).unwrap() else {
+                    panic!("image deletion must be undoable")
+                };
+                action
+            };
+            let result = undo_delete(&state, &action).await;
+            server.join().unwrap();
+            let mut db = state.db.lock().await;
+            let (review, status) = load(&db, review.token).unwrap().unwrap();
+            assert_eq!(
+                result.is_err(),
+                reject,
+                "remote_state={remote_state}: {result:?}"
+            );
+            assert_eq!(review.old[0].deleted, reject);
+            assert_eq!(status, if reject { "deleting" } else { "pending" });
+            if reject {
+                restore_undo(&db, action.id).unwrap();
+                assert!(matches!(
+                    claim_latest_undo(&mut db).unwrap(),
+                    UndoClaim::Claimed(_)
+                ));
+            } else {
+                assert_eq!(finish_undo(&db, action.id).unwrap(), 1);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn visible_completed_cards_keep_their_undo_files_until_collected() {
         let dir = tempfile::tempdir().unwrap();

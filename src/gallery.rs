@@ -54,6 +54,7 @@ struct CatalogImage {
 
 #[derive(Debug, Clone)]
 pub(crate) struct GalleryWorkImage {
+    pub(crate) page_index: u32,
     pub(crate) r2_key: String,
     pub(crate) path: PathBuf,
 }
@@ -110,6 +111,28 @@ impl std::fmt::Debug for GalleryClient {
 }
 
 impl GalleryClient {
+    pub(crate) async fn review_image(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .client
+            .post(format!("{}/api/catalog/image-review", self.endpoint))
+            .bearer_auth(&self.token)
+            .json(request)
+            .send()
+            .await?;
+        let status = response.status();
+        let result: serde_json::Value = response.json().await?;
+        if !status.is_success() || result["ok"] != true {
+            anyhow::bail!(
+                "图库单图操作未完成（{status}）：{}",
+                result["error"].as_str().unwrap_or("响应无效")
+            );
+        }
+        Ok(result)
+    }
+
     pub fn new(endpoint: String, token: String) -> Result<Self> {
         let endpoint = endpoint.trim_end_matches('/').to_string();
         #[allow(deprecated)]
@@ -301,6 +324,7 @@ impl GalleryClient {
                     GalleryIngestError::permanent(format!("写入相似图审批原图失败: {error}"))
                 })?;
             downloaded.push(GalleryWorkImage {
+                page_index: image.page_index,
                 r2_key: image.r2_key,
                 path,
             });

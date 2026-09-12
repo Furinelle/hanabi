@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -15,6 +15,8 @@ use teloxide::types::{
 };
 use tokio::sync::Mutex;
 
+mod image_review;
+
 use crate::gallery::{GalleryClient, GalleryIngestError, GalleryPublication, GalleryPublishState};
 use crate::gallery_outbox::{GalleryOutbox, QueuedGalleryWork};
 use crate::image_dedup::{
@@ -25,12 +27,12 @@ use crate::image_dedup::{
 use crate::model::MediaItem;
 use crate::similar_review::{
     candidate_was_published, claim_manual_review as claim_manual_similar_review,
-    claim_review as claim_similar_review, delete_review as delete_similar_review,
-    finish_review as finish_similar_review, init_schema as init_similar_review_schema,
-    load_manual_review as load_manual_similar_review, load_review as load_similar_review,
-    mark_candidate_published, mark_manual_cleanup as mark_manual_similar_cleanup,
-    parse_callback as parse_similar_callback, register_review as register_similar_review,
-    remove_pending_candidate_reviews, restore_manual_review as restore_manual_similar_review,
+    claim_review as claim_similar_review, finish_review as finish_similar_review,
+    init_schema as init_similar_review_schema, load_manual_review as load_manual_similar_review,
+    load_review as load_similar_review, mark_candidate_published,
+    mark_manual_cleanup as mark_manual_similar_cleanup, parse_callback as parse_similar_callback,
+    register_review as register_similar_review, remove_pending_candidate_reviews,
+    restore_manual_review as restore_manual_similar_review,
     restore_review as restore_similar_review, review_messages as similar_review_messages,
     set_review_messages as set_similar_review_messages, work_prune_plan, SimilarDecision,
     SimilarReviewGroup, SimilarReviewImage, SimilarReviewPendingCandidate,
@@ -176,6 +178,9 @@ pub struct ReviewState {
     owner: i64,                 // 审批私聊数字 id;仅响应本人的命令/链接
     publish_channel: Recipient, // 批准后发布频道
     db: Mutex<rusqlite::Connection>,
+    // ponytail: serialize review mutations; use per-session locks if review throughput matters.
+    review_gate: Arc<Mutex<()>>,
+    queued_reviews: AtomicUsize,
     counter: AtomicU64,
     // 频道帖首条 msg_id → 待投递评论区的原图任务。
     pending_comments: Mutex<std::collections::HashMap<i32, CommentJob>>,
@@ -263,6 +268,7 @@ impl TelegramSink {
         .context("初始化 pending 表失败")?;
         init_image_dedup_schema(&conn).context("初始化图片去重表失败")?;
         init_similar_review_schema(&conn).context("初始化相似图审批表失败")?;
+        image_review::init_schema(&conn)?;
         // 兼容旧库:补列,已存在则忽略报错。
         let _ = conn.execute(
             "ALTER TABLE pending ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
@@ -326,7 +332,7 @@ impl TelegramSink {
         }
         // counter 从已有最大 token 续上,避免重启后 token 与旧记录冲突。
         let max_token: i64 = conn
-            .query_row("SELECT COALESCE(MAX(token), 0) FROM pending", [], |r| {
+            .query_row("SELECT COALESCE(MAX(token), 0) FROM (SELECT token FROM pending UNION ALL SELECT token FROM image_review_sessions UNION ALL SELECT token FROM review_actions UNION ALL SELECT token FROM similar_reviews)", [], |r| {
                 r.get(0)
             })
             .unwrap_or(0);
@@ -363,7 +369,9 @@ impl TelegramSink {
                 owner,
                 publish_channel: to_recipient(publish_channel_id),
                 db: Mutex::new(conn),
-                counter: AtomicU64::new(max_token as u64 + 1),
+                review_gate: Arc::new(Mutex::new(())),
+                queued_reviews: AtomicUsize::new(0),
+                counter: AtomicU64::new((max_token as u64 + 1).max(now_secs() as u64 * 1_000_000)),
                 pending_comments: Mutex::new(std::collections::HashMap::new()),
                 gallery,
                 gallery_outbox,
@@ -694,182 +702,7 @@ impl TelegramSink {
         fingerprints: &[ImageFingerprint],
         matches: &[SimilarImage],
     ) -> Result<()> {
-        let gallery = self
-            .state
-            .gallery
-            .as_ref()
-            .context("相似图审批需要已配置 Vitrine")?;
-        let candidate_token =
-            i64::try_from(self.state.next_token()).context("审批 token 超出范围")?;
-        let candidate_work_id = format!("{}:{}", item.source.as_str(), item.source_id);
-        let candidate_fingerprint = fingerprints
-            .first()
-            .map(|fingerprint| fingerprint.content_sha256.as_str())
-            .context("相似图候选缺少图片指纹")?;
-        let review_nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let review_root =
-            crate::util::pending_root().join(format!("hanabi_similar_{candidate_token}"));
-        let mut group = SimilarReviewGroup {
-            group_key: format!(
-                "pending:{candidate_work_id}:{candidate_fingerprint}:{candidate_token}:{review_nonce}"
-            ),
-            images: fingerprints
-                .iter()
-                .enumerate()
-                .map(|(index, fingerprint)| SimilarReviewImage {
-                    image_id: format!("{candidate_work_id}#{index}"),
-                    r2_key: String::new(),
-                    label: review_image_label(&candidate_work_id, index, fingerprint),
-                })
-                .collect(),
-            pending_candidate: Some(SimilarReviewPendingCandidate {
-                work_id: candidate_work_id.clone(),
-                pending_token: candidate_token,
-            }),
-        };
-        let mut existing_groups = Vec::<(String, Vec<PathBuf>)>::new();
-        let mut seen_work_ids = HashSet::new();
-        for matched in matches {
-            let work_id = format!(
-                "{}:{}",
-                matched.existing_work.source.as_str(),
-                matched.existing_work.source_id
-            );
-            if !seen_work_ids.insert(work_id.clone()) {
-                continue;
-            }
-            let paths = gallery
-                .download_work_images(
-                    &work_id,
-                    &review_root.join(format!("existing-{}", existing_groups.len())),
-                )
-                .await
-                .map_err(anyhow::Error::from)?;
-            for (index, media) in paths.iter().enumerate() {
-                group.images.push(SimilarReviewImage {
-                    image_id: format!("{work_id}#{index}"),
-                    r2_key: media.r2_key.clone(),
-                    label: format!("{work_id} p{index}"),
-                });
-            }
-            existing_groups.push((work_id, paths.into_iter().map(|media| media.path).collect()));
-        }
-        if existing_groups.is_empty() {
-            remove_dir_all_bg(review_root);
-            anyhow::bail!("相似图审批没有可读取的图库作品");
-        }
-
-        let review_token = {
-            let db = self.state.db.lock().await;
-            register_similar_review(&db, &group)?
-        };
-        let candidate_caption = format!("【相似图候选】\n{}", render_caption(item));
-        let mut review_ids = Vec::new();
-        let (prepared, candidate_ids) =
-            match send_similar_preview(&self.state, files, &candidate_caption).await {
-                Ok(value) => value,
-                Err(error) => {
-                    let db = self.state.db.lock().await;
-                    let _ = delete_similar_review(&db, review_token);
-                    remove_dir_all_bg(review_root);
-                    return Err(error);
-                }
-            };
-        review_ids.extend(candidate_ids);
-        for (work_id, paths) in &existing_groups {
-            match send_similar_preview(&self.state, paths, &format!("【图库作品】{work_id}")).await
-            {
-                Ok((_, ids)) => review_ids.extend(ids),
-                Err(error) => {
-                    cleanup_review_messages(&self.state, &review_ids).await;
-                    let db = self.state.db.lock().await;
-                    let _ = delete_similar_review(&db, review_token);
-                    remove_dir_all_bg(review_root);
-                    return Err(error);
-                }
-            }
-        }
-        let control = match tg_retry(|| {
-            self.state
-                .bot
-                .send_message(
-                    self.state.review_chat.clone(),
-                    similar_review_text(review_token, &group),
-                )
-                .reply_markup(similar_review_keyboard(review_token, &group))
-        })
-        .await
-        {
-            Ok(message) => message,
-            Err(error) => {
-                cleanup_review_messages(&self.state, &review_ids).await;
-                let db = self.state.db.lock().await;
-                let _ = delete_similar_review(&db, review_token);
-                remove_dir_all_bg(review_root);
-                return Err(error.into());
-            }
-        };
-        let mut all_review_ids = review_ids.clone();
-        all_review_ids.push(control.id);
-
-        let persisted = async {
-            let files_json = serde_json::to_string(
-                &prepared
-                    .iter()
-                    .map(|path| path.to_string_lossy().into_owned())
-                    .collect::<Vec<_>>(),
-            )?;
-            let originals_json = serde_json::to_string(
-                &files
-                    .iter()
-                    .map(|path| path.to_string_lossy().into_owned())
-                    .collect::<Vec<_>>(),
-            )?;
-            let review_message_ids: Vec<i32> = review_ids.iter().map(|id| id.0).collect();
-            let pending_message_ids: Vec<i32> = all_review_ids.iter().map(|id| id.0).collect();
-            let messages_json = serde_json::to_string(&review_message_ids)?;
-            let pending_messages_json = serde_json::to_string(&pending_message_ids)?;
-            let item_meta = serde_json::to_string(item)?;
-            let db = self.state.db.lock().await;
-            let tx = db.unchecked_transaction()?;
-            let updated = tx.execute(
-                "UPDATE similar_reviews SET media_message_ids=?2,control_message_id=?3
-                 WHERE token=?1 AND state='pending'",
-                rusqlite::params![review_token, messages_json, control.id.0],
-            )?;
-            if updated != 1 {
-                anyhow::bail!("相似图审批记录已失效");
-            }
-            tx.execute(
-                "INSERT INTO pending(token,files,caption,msg_ids,originals,created_at,state,is_r18,item_meta)
-                 VALUES(?1,?2,?3,?4,?5,?6,'similar',?7,?8)",
-                rusqlite::params![
-                    candidate_token,
-                    files_json,
-                    render_caption(item),
-                    pending_messages_json,
-                    originals_json,
-                    now_secs(),
-                    item.is_r18,
-                    item_meta,
-                ],
-            )?;
-            record_work(&tx, item, fingerprints, WorkStatus::Pending)?;
-            tx.commit()?;
-            Ok::<(), anyhow::Error>(())
-        }
-        .await;
-        remove_dir_all_bg(review_root);
-        if let Err(error) = persisted {
-            cleanup_review_messages(&self.state, &all_review_ids).await;
-            let db = self.state.db.lock().await;
-            let _ = delete_similar_review(&db, review_token);
-            return Err(error);
-        }
-        Ok(())
+        image_review::queue(&self.state, item, files, fingerprints, matches).await
     }
 
     async fn replace_published_work(&self, item: &MediaItem, old: &WorkSummary) -> Result<()> {
@@ -1082,6 +915,10 @@ fn complete_and_record_action(
         None => ("[]", "", "[]", false, "{}"),
     };
     let publication_json = encode_undo_publication(publication);
+    if image_review::complete(&tx, token, &publication_json)? {
+        tx.commit()?;
+        return Ok(Vec::new());
+    }
     tx.execute(
         "INSERT INTO review_actions(action,token,files,caption,originals,is_r18,item_meta,acted_at,state,publication)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'available',?9)",
@@ -1806,39 +1643,12 @@ async fn cleanup_review_messages(state: &Arc<ReviewState>, message_ids: &[Messag
     }
 }
 
-async fn send_similar_preview(
-    state: &Arc<ReviewState>,
-    files: &[PathBuf],
-    caption: &str,
-) -> Result<(Vec<PathBuf>, Vec<MessageId>)> {
-    if files.is_empty() {
-        anyhow::bail!("相似图审批没有可发送的图片");
-    }
-    let files_owned = files.to_vec();
-    let prepared = tokio::task::spawn_blocking(move || prepare_all(&files_owned)).await??;
-    let mut sent = Vec::new();
-    let mut publication = TelegramPublicationBuilder::default();
-    if let Err(error) = send_group(
-        &state.bot,
-        &state.review_chat,
-        &prepared,
-        caption,
-        false,
-        &mut sent,
-        &mut publication,
-        &mut || {},
-    )
-    .await
-    {
-        cleanup_review_messages(state, &sent).await;
-        return Err(error);
-    }
-    Ok((prepared, sent))
-}
-
 /// 启动清理:① 删超期未审 pending(消息+文件+记录);② 删持久待审目录中
 /// 不被任何 pending 引用的孤儿目录(多为旧版本/重启遗留)。
 async fn cleanup_stale(state: &Arc<ReviewState>) {
+    let Ok(_guard) = state.review_gate.try_lock() else {
+        return;
+    };
     // ⓪ 僵尸 publishing 兜底:DELETE/restore 因 DB 写失败未完成时,记录会永远停在
     // publishing(按钮恒回"已在发布中",TTL 清理又只认 pending)。超过 TTL+24h 的
     // publishing 不可能仍在途,恢复为原审批状态交给下面的正常清理/重试。
@@ -1888,7 +1698,7 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
     for files_json in stale_undo_files {
         if let Ok(files) = serde_json::from_str::<Vec<String>>(&files_json) {
             let paths: Vec<PathBuf> = files.into_iter().map(PathBuf::from).collect();
-            cleanup(&paths);
+            image_review::cleanup_unreferenced(state, &paths).await;
         }
     }
     // ① 超期 pending。
@@ -1938,6 +1748,7 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
     if !expired.is_empty() {
         tracing::info!(count = expired.len(), "清理超期 pending");
     }
+    image_review::collect_retired(state).await;
 
     // ② 孤儿临时目录。先把 files JSON 收集成 owned(释放 db 锁),再在锁外解析。
     let file_jsons: Vec<String> = {
@@ -2576,7 +2387,7 @@ async fn finish_claimed(
     }
     // 新动作覆盖旧的可撤销记录后，旧文件不再有恢复价值；事务提交后再清理。
     for paths in replaced_files {
-        cleanup(&paths);
+        image_review::cleanup_unreferenced(state, &paths).await;
     }
     // 当前动作的文件由 review_actions 持有，评论任务不得删掉可撤回目录。
     Ok(FinishOutcome {
@@ -2846,6 +2657,7 @@ async fn publish_all_claimed(
     claimed: Vec<(i64, PendingRow)>,
     archive: bool,
 ) {
+    let _guard = state.review_gate.lock().await;
     let total = claimed.len();
     let mut succeeded = 0usize;
     let mut archive_failed = 0usize;
@@ -2894,6 +2706,7 @@ pub async fn run_review_loop(
     }
     // 启动先清一次超期/孤儿(顺手清掉旧版本遗留的临时图)。
     cleanup_stale(&state).await;
+    tokio::spawn(image_review::migrate_pending(state.clone()));
     if let Err(e) = state
         .bot
         .set_my_commands(command_menu(state.gallery.is_some()))
@@ -3015,6 +2828,24 @@ async fn handle_command(
     let cmd = text.split_whitespace().next().unwrap_or("");
     let cmd = cmd.split('@').next().unwrap_or(cmd);
     if cmd == "/undo" {
+        let publishing = {
+            let db = state.db.lock().await;
+            db.query_row("SELECT EXISTS(SELECT 1 FROM pending WHERE state IN ('publishing','similar_publishing'))",[],|r|r.get::<_,bool>(0))?
+        };
+        if publishing || state.queued_reviews.load(Ordering::SeqCst) > 0 {
+            state
+                .bot
+                .send_message(msg.chat.id, "⏳ 已接收的审批正在处理，完成后再发 /undo")
+                .await?;
+            return Ok(());
+        }
+        let Ok(_guard) = state.review_gate.try_lock() else {
+            state
+                .bot
+                .send_message(msg.chat.id, "⏳ 审批操作正在处理，完成后再发 /undo")
+                .await?;
+            return Ok(());
+        };
         let claim = {
             let mut db = state.db.lock().await;
             claim_latest_undo(&mut db)?
@@ -3043,6 +2874,27 @@ async fn handle_command(
                     .await?;
             }
             UndoClaim::Claimed(action) => {
+                if action.action == "image_review" || action.action == "image_delete" {
+                    let result = if action.action == "image_delete" {
+                        image_review::undo_delete(state, &action).await
+                    } else {
+                        image_review::undo(state, &action).await
+                    };
+                    let db = state.db.lock().await;
+                    let reply = match result {
+                        Ok(()) => {
+                            finish_undo(&db, action.id)?;
+                            "↩️ 已撤销最近一次图片操作，审批状态已恢复".to_string()
+                        }
+                        Err(error) => {
+                            restore_undo(&db, action.id)?;
+                            format!("⚠️ 撤销未完成，记录已保留，可重试 /undo：{error}")
+                        }
+                    };
+                    drop(db);
+                    state.bot.send_message(msg.chat.id, reply).await?;
+                    return Ok(());
+                }
                 let action_id = action.id;
                 let action_kind = action.action.clone();
                 let publication = decode_undo_publication(&action.publication);
@@ -3120,6 +2972,20 @@ async fn handle_command(
         return Ok(());
     }
     if cmd == "/approve" || cmd == "/approve_archive" {
+        let needs_recovery = {
+            let db = state.db.lock().await;
+            image_review::needs_recovery(&db)?
+        };
+        if needs_recovery {
+            state
+                .bot
+                .send_message(
+                    msg.chat.id,
+                    "上一张旧图尚未恢复，请先 /undo；恢复记录已保留",
+                )
+                .await?;
+            return Ok(());
+        }
         let archive = cmd == "/approve_archive";
         if archive && state.gallery.is_none() {
             state
@@ -3264,8 +3130,19 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
         return Ok(());
     }
     let data = q.data.clone().unwrap_or_default();
+    if data.starts_with("image:") {
+        return image_review::handle(state, q, &data).await;
+    }
     if let Some((token, decision)) = parse_similar_callback(&data) {
-        return handle_similar_callback(state, q, token, decision).await;
+        let Ok(guard) = state.review_gate.clone().try_lock_owned() else {
+            state
+                .bot
+                .answer_callback_query(q.id)
+                .text("上一操作正在处理，请稍后再点")
+                .await?;
+            return Ok(());
+        };
+        return handle_similar_callback(state, q, token, decision, guard).await;
     }
     let (action, token_str) = data.split_once(':').unwrap_or(("", ""));
     let token: i64 = token_str.parse().unwrap_or(-1);
@@ -3327,6 +3204,22 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
     // /approve 也不选它,直到重启),此处兜底恢复为 pending。
     let state = state.clone();
     tokio::spawn(async move {
+        let _guard = state.review_gate.lock().await;
+        {
+            let db = state.db.lock().await;
+            if image_review::needs_recovery(&db).unwrap_or(true) {
+                let _ = restore_pending(&db, token);
+                drop(db);
+                let _ = state
+                    .bot
+                    .send_message(
+                        state.review_chat.clone(),
+                        "上一张旧图尚未恢复，请先 /undo；这条待审已保留",
+                    )
+                    .await;
+                return;
+            }
+        }
         let inner = tokio::spawn({
             let state = state.clone();
             async move { finish_claimed(&state, token, row, publish, archive, true).await }
@@ -3340,7 +3233,7 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
                         .bot
                         .send_message(
                             state.review_chat.clone(),
-                            "⚠️ 发布失败(可能限流),过会儿再点一次那条审批",
+                            "⚠️ 发布未完成，这条审批已保留，可以直接重试",
                         )
                         .await;
                 }
@@ -3395,20 +3288,10 @@ fn similar_confirm_keyboard(
     index: usize,
 ) -> InlineKeyboardMarkup {
     let post = &group.posts()[index - 1];
-    InlineKeyboardMarkup::new(vec![
-        vec![InlineKeyboardButton::callback(
-            format!(
-                "⚠️ 确认仅保留 {} 全组（{} 张）",
-                post.work_id,
-                post.image_indices.len()
-            ),
-            format!("similar:{token}:confirm:{index}"),
-        )],
-        vec![InlineKeyboardButton::callback(
-            "↩️ 返回",
-            format!("similar:{token}:cancel"),
-        )],
-    ])
+    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+        format!("🔁 重试清理，仅保留 {}", post.work_id),
+        format!("similar:{token}:confirm:{index}"),
+    )]])
 }
 
 fn similar_manual_cleanup_keyboard(token: i64, index: usize) -> InlineKeyboardMarkup {
@@ -3416,19 +3299,6 @@ fn similar_manual_cleanup_keyboard(token: i64, index: usize) -> InlineKeyboardMa
         "✅ 我已手动删除频道消息",
         format!("similar:{token}:manual:{index}"),
     )]])
-}
-
-fn similar_manual_confirm_keyboard(token: i64, index: usize) -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new(vec![
-        vec![InlineKeyboardButton::callback(
-            "⚠️ 确认全部链接均已删除",
-            format!("similar:{token}:manual-confirm:{index}"),
-        )],
-        vec![InlineKeyboardButton::callback(
-            "↩️ 返回",
-            format!("similar:{token}:manual-cancel:{index}"),
-        )],
-    ])
 }
 
 #[cfg(test)]
@@ -3727,7 +3597,39 @@ async fn handle_similar_callback(
     q: CallbackQuery,
     token: i64,
     decision: SimilarDecision,
+    guard: tokio::sync::OwnedMutexGuard<()>,
 ) -> Result<()> {
+    let legacy_pending = {
+        let db = state.db.lock().await;
+        load_similar_review(&db, token)?.is_some_and(|group| !group.group_key.starts_with("exact:"))
+    };
+    if legacy_pending {
+        state
+            .bot
+            .answer_callback_query(q.id)
+            .text("正在切换为逐张审批，请使用新卡片")
+            .await?;
+        let state = state.clone();
+        tokio::spawn(async move {
+            let _guard = guard;
+            if let Err(error) = image_review::migrate_legacy(&state, token).await {
+                let _ = state
+                    .bot
+                    .send_message(
+                        state.review_chat.clone(),
+                        format!("⚠️ 迁移审批未完成：{error}，旧记录已保留"),
+                    )
+                    .await;
+            }
+        });
+        return Ok(());
+    }
+    // Legacy recovery buttons keep working, but no longer ask the same question twice.
+    let decision = match decision {
+        SimilarDecision::SelectKeep(index) => SimilarDecision::ConfirmKeep(index),
+        SimilarDecision::ManualSelect(index) => SimilarDecision::ManualConfirm(index),
+        other => other,
+    };
     let callback_message = q
         .message
         .as_ref()
@@ -3755,7 +3657,7 @@ async fn handle_similar_callback(
                 return Ok(());
             }
             let keyboard = match decision {
-                SimilarDecision::ManualSelect(_) => similar_manual_confirm_keyboard(token, index),
+                SimilarDecision::ManualSelect(_) => similar_manual_cleanup_keyboard(token, index),
                 SimilarDecision::ManualCancel(_) => similar_manual_cleanup_keyboard(token, index),
                 _ => unreachable!(),
             };
@@ -3859,6 +3761,7 @@ async fn handle_similar_callback(
         .flatten();
     let state = state.clone();
     tokio::spawn(async move {
+        let _guard = guard;
         let mut manual_cleanup_targets = Vec::new();
         let result: Result<()> = async {
             if let (Some(candidate), Some(action)) = (
@@ -4170,21 +4073,12 @@ mod tests {
     }
 
     #[test]
-    fn manual_cleanup_buttons_require_a_second_confirmation() {
-        let initial = serde_json::to_value(similar_manual_cleanup_keyboard(80, 1)).unwrap();
+    fn manual_cleanup_is_one_click() {
+        let value = serde_json::to_value(similar_manual_cleanup_keyboard(80, 1)).unwrap();
+        assert_eq!(value["inline_keyboard"].as_array().unwrap().len(), 1);
         assert_eq!(
-            initial["inline_keyboard"][0][0]["callback_data"],
+            value["inline_keyboard"][0][0]["callback_data"],
             "similar:80:manual:1"
-        );
-
-        let confirm = serde_json::to_value(similar_manual_confirm_keyboard(80, 1)).unwrap();
-        assert_eq!(
-            confirm["inline_keyboard"][0][0]["callback_data"],
-            "similar:80:manual-confirm:1"
-        );
-        assert_eq!(
-            confirm["inline_keyboard"][1][0]["callback_data"],
-            "similar:80:manual-cancel:1"
         );
     }
 

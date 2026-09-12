@@ -308,7 +308,12 @@ impl Session {
             serde_json::to_string(&self.all_messages())?,
             serde_json::to_string(&originals)?,
             item.is_r18,
-            serde_json::to_string(&item)?,
+            // Gallery-only cards do not own a pending work's fingerprints or publication.
+            if self.originals.is_empty() {
+                "{}".into()
+            } else {
+                serde_json::to_string(&item)?
+            },
         ))
     }
 }
@@ -560,7 +565,7 @@ async fn apply_choice(
                 "⚠️ 频道已发，图库入库未完成；可 /undo 撤回".to_string()
             } else {
                 format!(
-                    "✅ 已处理：保留 {selected} 张，丢弃 {} 张。旧图保留。误点可 /undo。",
+                    "✅ 已处理：保留 {selected} 张，丢弃 {} 张。其余旧图保留。误点可 /undo。",
                     session.choices.len() - selected
                 )
             };
@@ -1413,6 +1418,9 @@ mod tests {
                 message_id: 10,
                 deleted: false,
             }];
+            if gallery_only {
+                assert_eq!(review.row(false).unwrap().5, "{}");
+            }
             {
                 let db = state.db.lock().await;
                 db.execute("INSERT OR REPLACE INTO image_review_sessions(token,payload,state) VALUES(?1,?2,'decided')",rusqlite::params![review.token,serde_json::to_string(&review).unwrap()]).unwrap();

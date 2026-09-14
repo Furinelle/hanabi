@@ -300,8 +300,11 @@ async fn main() -> Result<()> {
                         if err_text.chars().count() > 300 {
                             err_text = err_text.chars().take(300).collect::<String>() + "…";
                         }
-                        sink.edit_review_text(notice_id, &format!("⚠️ 处理失败: {err_text}"))
-                            .await;
+                        sink.edit_review_text(
+                            notice_id,
+                            &failure_notice(&format!("⚠️ 处理失败: {err_text}"), &url),
+                        )
+                        .await;
                     }
                 });
                 false
@@ -479,6 +482,10 @@ fn douyin_download_complete(downloaded: usize, failed: usize) -> bool {
     downloaded > 0 && failed == 0
 }
 
+fn failure_notice(message: &str, original_url: &str) -> String {
+    format!("{message}\n原链接: {original_url}")
+}
+
 /// 抖音作者主页属于多作品链接：逐条下载后进入审批，与 Pixiv/X 主页一致。
 async fn handle_douyin_user(
     job: hanabi::sink::telegram::LinkJob,
@@ -579,7 +586,7 @@ async fn handle_douyin(
                 sink.delete_review_messages(&[job.user_msg_id]).await;
                 sink.edit_review_text(
                     job.notice_msg_id,
-                    "ℹ️ 抖音作者主页解析失败(可能需刷新 Cookie)",
+                    &failure_notice("ℹ️ 抖音作者主页解析失败(可能需刷新 Cookie)", &job.url),
                 )
                 .await;
                 return Ok(());
@@ -657,15 +664,15 @@ async fn handle_douyin(
                 tracing::warn!(error = %note_error, "抖音作品解析失败");
                 sink.delete_review_messages(&[job.user_msg_id]).await;
                 let no_images = format!("{note_error:#}").contains("没有可发布的静态图片");
-                sink.edit_review_text(
-                    job.notice_msg_id,
+                let text = failure_notice(
                     if no_images {
                         "⚠️ 抖音作品没有可发布图片,未发布"
                     } else {
                         "ℹ️ 抖音解析失败(可能 Cookie 失效或触发风控)"
                     },
-                )
-                .await;
+                    &job.url,
+                );
+                sink.edit_review_text(job.notice_msg_id, &text).await;
                 return Ok(());
             }
             // 作者短链若预解析失败,再判一次主页桥。
@@ -685,7 +692,7 @@ async fn handle_douyin(
                     sink.delete_review_messages(&[job.user_msg_id]).await;
                     sink.edit_review_text(
                         job.notice_msg_id,
-                        "ℹ️ 抖音解析失败(可能 Cookie 失效或触发风控)",
+                        &failure_notice("ℹ️ 抖音解析失败(可能 Cookie 失效或触发风控)", &job.url),
                     )
                     .await;
                 }
@@ -697,7 +704,7 @@ async fn handle_douyin(
 
 #[cfg(test)]
 mod tests {
-    use super::{douyin_download_complete, secs_until_next_slot};
+    use super::{douyin_download_complete, failure_notice, secs_until_next_slot};
 
     #[test]
     fn slot_aligns_to_interval_in_local_tz() {
@@ -716,5 +723,13 @@ mod tests {
         assert!(!douyin_download_complete(3, 1));
         assert!(!douyin_download_complete(0, 4));
         assert!(!douyin_download_complete(0, 0));
+    }
+
+    #[test]
+    fn failure_notice_keeps_the_original_link() {
+        assert_eq!(
+            failure_notice("ℹ️ 解析失败", "https://v.douyin.com/original/"),
+            "ℹ️ 解析失败\n原链接: https://v.douyin.com/original/"
+        );
     }
 }

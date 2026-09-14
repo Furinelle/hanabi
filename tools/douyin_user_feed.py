@@ -123,6 +123,18 @@ def _persist_browser_cookies(cookies: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def _is_douyin_domain(host: str | None) -> bool:
+    if not host:
+        return False
+    h = host.lower()
+    return (
+        h == "douyin.com"
+        or h.endswith(".douyin.com")
+        or h == "iesdouyin.com"
+        or h.endswith(".iesdouyin.com")
+    )
+
+
 def _aweme_id(item: Any) -> str:
     if not isinstance(item, dict):
         return ""
@@ -466,14 +478,14 @@ async def _browser_detail(
                     if method == "Network.responseReceived":
                         response = params.get("response", {})
                         parsed = urlsplit(str(response.get("url", "")))
-                        if parsed.hostname in {"www.douyin.com", "iesdouyin.com"} and parsed.path.startswith(
+                        if _is_douyin_domain(parsed.hostname) and parsed.path.startswith(
                             "/aweme/"
                         ):
                             response_counts[parsed.path] = (
                                 response_counts.get(parsed.path, 0) + 1
                             )
                         if (
-                            parsed.hostname in {"www.douyin.com", "iesdouyin.com"}
+                            _is_douyin_domain(parsed.hostname)
                             and parsed.path
                             in {
                                 "/aweme/v1/web/aweme/detail/",
@@ -523,7 +535,7 @@ async def _browser_detail(
                 blocked = await command(
                     "Runtime.evaluate",
                     {
-                        "expression": "Boolean(document.body && /验证码|接收短信验证码|访问频繁/.test(document.body.innerText))",
+                        "expression": "Boolean(document.querySelector('#captcha_container, .captcha-verify-container, .verify-bar-close, [class*=\"captcha_verify\"]') || (document.body && /请完成安全验证|拖动滑块完成拼图|点选文字|请在下方按顺序点击|访问太频繁/.test(document.body.innerText)))",
                         "returnByValue": True,
                     },
                     target_session,
@@ -688,7 +700,7 @@ async def _browser_feed(
                         response = params.get("response", {})
                         parsed = urlsplit(str(response.get("url", "")))
                         if (
-                            parsed.hostname in {"www.douyin.com", "iesdouyin.com"}
+                            _is_douyin_domain(parsed.hostname)
                             and "/aweme/v1/web/aweme/post/" in parsed.path
                             and int(response.get("status", 0)) == 200
                         ):
@@ -739,7 +751,7 @@ async def _browser_feed(
                     blocked = await command(
                         "Runtime.evaluate",
                         {
-                            "expression": "Boolean(document.body && /验证码|接收短信验证码|访问频繁/.test(document.body.innerText))",
+                            "expression": "Boolean(document.querySelector('#captcha_container, .captcha-verify-container, .verify-bar-close, [class*=\"captcha_verify\"]') || (document.body && /请完成安全验证|拖动滑块完成拼图|点选文字|请在下方按顺序点击|访问太频繁/.test(document.body.innerText)))",
                             "returnByValue": True,
                         },
                         target_session,
@@ -904,7 +916,7 @@ async def _run(request: dict[str, Any]) -> dict[str, Any]:
                         _append_unique(all_items, seen, captured)
                         restricted = False
                 except Exception as exc:
-                    print(f"douyin cdp browser feed failed: {exc}", file=sys.stderr)
+                    print(f"douyin cdp browser feed failed: {type(exc).__name__}: {exc}", file=sys.stderr)
             elif browser_enabled:
                 ids = await client.collect_user_post_ids_via_browser(
                     sec_user_id,

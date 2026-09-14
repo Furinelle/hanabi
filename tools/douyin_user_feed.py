@@ -263,13 +263,20 @@ async def _browser_detail(
                 wanted_requests: set[str] = set()
                 response_counts: dict[str, int] = {}
                 deadline = time.monotonic() + 45
+                reload_at = time.monotonic() + 18
+                reloaded = False
                 while time.monotonic() < deadline:
+                    if not reloaded and time.monotonic() >= reload_at:
+                        await command("Page.reload", session_id=target_session)
+                        reloaded = True
+                    wait_until = deadline if reloaded else min(deadline, reload_at)
                     try:
                         event = await asyncio.wait_for(
-                            events.get(), max(0.1, deadline - time.monotonic())
+                            events.get(),
+                            max(0.1, wait_until - time.monotonic()),
                         )
                     except TimeoutError:
-                        break
+                        continue
                     if event.get("sessionId") != target_session:
                         continue
                     method = event["method"]

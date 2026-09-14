@@ -158,6 +158,151 @@ def _browser_aweme(data: Any, aweme_id: str) -> dict[str, Any] | None:
     )
 
 
+def extract_aweme_from_html(html: str, target_id: str) -> dict[str, Any] | None:
+    if not html:
+        return None
+
+    # 1. window._ROUTER_DATA
+    router_m = re.search(r"window\._ROUTER_DATA\s*=\s*(\{.*?\});\s*</script>", html, re.DOTALL)
+    if router_m:
+        try:
+            data = json.loads(router_m.group(1))
+            item = _browser_aweme(data, target_id)
+            if item:
+                return item
+        except Exception:
+            pass
+
+    # 2. window.SSR_RENDER_DATA
+    ssr_m = re.search(r"window\.SSR_RENDER_DATA\s*=\s*(\{.*?\});\s*</script>", html, re.DOTALL)
+    if ssr_m:
+        try:
+            data = json.loads(ssr_m.group(1))
+            item = _browser_aweme(data, target_id)
+            if item:
+                return item
+        except Exception:
+            pass
+
+    # 3. self.__pace_f.push
+    pushes = re.findall(r"self\.__pace_f\.push\((.*?)\)</script>", html, re.DOTALL)
+    for p in pushes:
+        try:
+            val = json.loads(p)
+            if isinstance(val, list) and len(val) >= 2 and isinstance(val[1], str) and target_id in val[1]:
+                payload = val[1]
+                colon = payload.find(":")
+                if colon != -1:
+                    raw_json = payload[colon + 1 :]
+                    parsed = json.loads(raw_json)
+
+                    def find_in_tree(node: Any) -> dict[str, Any] | None:
+                        if isinstance(node, dict):
+                            if str(node.get("awemeId") or node.get("aweme_id") or "") == target_id:
+                                return node
+                            for v in node.values():
+                                res = find_in_tree(v)
+                                if res:
+                                    return res
+                        elif isinstance(node, list):
+                            for v in node:
+                                res = find_in_tree(v)
+                                if res:
+                                    return res
+                        return None
+
+                    node = find_in_tree(parsed)
+                    if node:
+                        aweme = node.get("aweme") or {}
+                        detail = aweme.get("detail") or node
+                        author_info = (
+                            detail.get("authorInfo")
+                            or detail.get("author")
+                            or node.get("accountInfo")
+                            or {}
+                        )
+                        raw_images = detail.get("images") or detail.get("image_list") or []
+                        images = []
+                        for img in raw_images:
+                            if not isinstance(img, dict):
+                                continue
+                            url_list = img.get("urlList") or img.get("url_list") or []
+                            download_url_list = (
+                                img.get("downloadUrlList") or img.get("download_url_list") or []
+                            )
+                            images.append({
+                                "width": img.get("width"),
+                                "height": img.get("height"),
+                                "url_list": url_list,
+                                "urlList": url_list,
+                                "download_url_list": download_url_list,
+                                "downloadUrlList": download_url_list,
+                            })
+                        sec_uid = author_info.get("secUid") or author_info.get("sec_uid") or ""
+                        nickname = author_info.get("nickname") or ""
+                        res_dict: dict[str, Any] = {
+                            "aweme_id": target_id,
+                            "awemeId": target_id,
+                            "desc": detail.get("desc", ""),
+                            "author": {
+                                "nickname": nickname,
+                                "sec_uid": sec_uid,
+                                "secUid": sec_uid,
+                            },
+                            "authorInfo": {
+                                "nickname": nickname,
+                                "sec_uid": sec_uid,
+                                "secUid": sec_uid,
+                            },
+                            "images": images,
+                        }
+                        if detail.get("video"):
+                            res_dict["video"] = detail["video"]
+                        return res_dict
+        except Exception:
+            continue
+    return None
+
+
+async def _fetch_and_extract_html_detail(
+    client: Any,
+    aweme_id: str,
+    resolved_url: str,
+) -> dict[str, Any] | None:
+    import aiohttp
+
+    session = getattr(client, "_session", None) or getattr(client, "session", None)
+    headers = dict(getattr(client, "headers", {}))
+    headers["Accept"] = (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+    )
+    targets = [f"https://www.douyin.com/note/{aweme_id}"]
+    if resolved_url and resolved_url not in targets:
+        targets.append(resolved_url)
+
+    close_session = False
+    if session is None:
+        session = aiohttp.ClientSession()
+        close_session = True
+
+    try:
+        for url in targets:
+            try:
+                timeout = aiohttp.ClientTimeout(total=10)
+                async with session.get(url, headers=headers, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        html = await resp.text()
+                        item = extract_aweme_from_html(html, aweme_id)
+                        if item:
+                            return item
+            except Exception as exc:
+                print(f"douyin direct html get failed url={url}: {exc}", file=sys.stderr)
+    finally:
+        if close_session:
+            await session.close()
+    return None
+
+
 async def _browser_detail(
     cdp_url: str,
     aweme_id: str,
@@ -176,7 +321,10 @@ async def _browser_detail(
                 async for message in ws:
                     if message.type != aiohttp.WSMsgType.TEXT:
                         continue
-                    value = json.loads(message.data)
+                    try:
+                        value = json.loads(message.data)
+                    except Exception:
+                        continue
                     if "id" in value:
                         future = pending.pop(value["id"], None)
                         if future and not future.done():
@@ -262,18 +410,52 @@ async def _browser_detail(
 
                 wanted_requests: set[str] = set()
                 response_counts: dict[str, int] = {}
-                deadline = time.monotonic() + 45
-                reload_at = time.monotonic() + 18
+                deadline = time.monotonic() + 30
+                reload_at = time.monotonic() + 15
                 reloaded = False
+                last_html_eval = 0.0
+
                 while time.monotonic() < deadline:
-                    if not reloaded and time.monotonic() >= reload_at:
+                    now = time.monotonic()
+                    if not reloaded and now >= reload_at:
                         await command("Page.reload", session_id=target_session)
                         reloaded = True
                     wait_until = deadline if reloaded else min(deadline, reload_at)
+
+                    # Periodically check outerHTML for SSR render data
+                    if now - last_html_eval >= 1.5:
+                        last_html_eval = now
+                        with contextlib.suppress(Exception):
+                            eval_res = await command(
+                                "Runtime.evaluate",
+                                {"expression": "document.documentElement.outerHTML"},
+                                target_session,
+                            )
+                            outer_html = eval_res.get("result", {}).get("value") or ""
+                            item = extract_aweme_from_html(outer_html, aweme_id)
+                            if item:
+                                refreshed = await command(
+                                    "Network.getAllCookies", session_id=target_session
+                                )
+                                try:
+                                    _persist_browser_cookies(
+                                        {
+                                            cookie["name"]: cookie["value"]
+                                            for cookie in refreshed.get("cookies", [])
+                                            if cookie.get("name") and cookie.get("value")
+                                        }
+                                    )
+                                except OSError as exc:
+                                    print(
+                                        f"douyin browser cookie persistence skipped: {exc}",
+                                        file=sys.stderr,
+                                    )
+                                return item
+
                     try:
                         event = await asyncio.wait_for(
                             events.get(),
-                            max(0.1, wait_until - time.monotonic()),
+                            max(0.1, min(1.0, wait_until - time.monotonic())),
                         )
                     except TimeoutError:
                         continue
@@ -284,14 +466,14 @@ async def _browser_detail(
                     if method == "Network.responseReceived":
                         response = params.get("response", {})
                         parsed = urlsplit(str(response.get("url", "")))
-                        if parsed.hostname == "www.douyin.com" and parsed.path.startswith(
+                        if parsed.hostname in {"www.douyin.com", "iesdouyin.com"} and parsed.path.startswith(
                             "/aweme/"
                         ):
                             response_counts[parsed.path] = (
                                 response_counts.get(parsed.path, 0) + 1
                             )
                         if (
-                            parsed.hostname == "www.douyin.com"
+                            parsed.hostname in {"www.douyin.com", "iesdouyin.com"}
                             and parsed.path
                             in {
                                 "/aweme/v1/web/aweme/detail/",
@@ -311,26 +493,32 @@ async def _browser_detail(
                         )
                         raw = body.get("body", "")
                         if body.get("base64Encoded"):
-                            raw = base64.b64decode(raw).decode("utf-8")
-                        item = _browser_aweme(json.loads(raw), aweme_id)
-                        if item:
-                            refreshed = await command(
-                                "Network.getAllCookies", session_id=target_session
-                            )
-                            try:
-                                _persist_browser_cookies(
-                                    {
-                                        cookie["name"]: cookie["value"]
-                                        for cookie in refreshed.get("cookies", [])
-                                        if cookie.get("name") and cookie.get("value")
-                                    }
+                            with contextlib.suppress(Exception):
+                                raw = base64.b64decode(raw).decode("utf-8")
+                        try:
+                            parsed_json = json.loads(raw)
+                        except Exception:
+                            parsed_json = None
+                        if parsed_json:
+                            item = _browser_aweme(parsed_json, aweme_id)
+                            if item:
+                                refreshed = await command(
+                                    "Network.getAllCookies", session_id=target_session
                                 )
-                            except OSError as exc:
-                                print(
-                                    f"douyin browser cookie persistence skipped: {exc}",
-                                    file=sys.stderr,
-                                )
-                            return item
+                                try:
+                                    _persist_browser_cookies(
+                                        {
+                                            cookie["name"]: cookie["value"]
+                                            for cookie in refreshed.get("cookies", [])
+                                            if cookie.get("name") and cookie.get("value")
+                                        }
+                                    )
+                                except OSError as exc:
+                                    print(
+                                        f"douyin browser cookie persistence skipped: {exc}",
+                                        file=sys.stderr,
+                                    )
+                                return item
 
                 blocked = await command(
                     "Runtime.evaluate",
@@ -344,6 +532,222 @@ async def _browser_detail(
                     raise RuntimeError("Oracle 抖音浏览器需要人工验证")
                 paths = ",".join(sorted(response_counts)) or "none"
                 raise RuntimeError(f"Oracle 抖音浏览器未返回目标作品 api={paths}")
+            finally:
+                if target_id:
+                    with contextlib.suppress(Exception):
+                        await command("Target.closeTarget", {"targetId": target_id})
+                if browser_context_id:
+                    with contextlib.suppress(Exception):
+                        await command(
+                            "Target.disposeBrowserContext",
+                            {"browserContextId": browser_context_id},
+                        )
+                reader.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await reader
+
+
+async def _browser_feed(
+    cdp_url: str,
+    sec_user_id: str,
+    cookies: dict[str, Any],
+    user_agent: str,
+    max_pages: int = 3,
+) -> list[dict[str, Any]]:
+    import aiohttp
+
+    pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
+    events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    next_id = 0
+
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(cdp_url, max_msg_size=32 * 1024 * 1024) as ws:
+            async def read_messages() -> None:
+                async for message in ws:
+                    if message.type != aiohttp.WSMsgType.TEXT:
+                        continue
+                    try:
+                        value = json.loads(message.data)
+                    except Exception:
+                        continue
+                    if "id" in value:
+                        future = pending.pop(value["id"], None)
+                        if future and not future.done():
+                            future.set_result(value)
+                    elif "method" in value:
+                        await events.put(value)
+
+            reader = asyncio.create_task(read_messages())
+
+            async def command(
+                method: str,
+                params: dict[str, Any] | None = None,
+                session_id: str | None = None,
+            ) -> dict[str, Any]:
+                nonlocal next_id
+                next_id += 1
+                message: dict[str, Any] = {
+                    "id": next_id,
+                    "method": method,
+                    "params": params or {},
+                }
+                if session_id:
+                    message["sessionId"] = session_id
+                future = asyncio.get_running_loop().create_future()
+                pending[next_id] = future
+                await ws.send_json(message)
+                response = await asyncio.wait_for(future, 15)
+                if "error" in response:
+                    raise RuntimeError(
+                        f"CDP {method} 失败: {response['error'].get('message', 'unknown')}"
+                    )
+                return response.get("result", {})
+
+            browser_context_id = ""
+            target_id = ""
+            try:
+                browser_context_id = (
+                    await command("Target.createBrowserContext")
+                )["browserContextId"]
+                target_id = (
+                    await command(
+                        "Target.createTarget",
+                        {"url": "about:blank", "browserContextId": browser_context_id},
+                    )
+                )["targetId"]
+                target_session = (
+                    await command(
+                        "Target.attachToTarget",
+                        {"targetId": target_id, "flatten": True},
+                    )
+                )["sessionId"]
+                await command("Network.enable", session_id=target_session)
+                await command("Page.enable", session_id=target_session)
+                await command(
+                    "Emulation.setUserAgentOverride",
+                    {"userAgent": user_agent, "acceptLanguage": "zh-CN,zh;q=0.9"},
+                    target_session,
+                )
+                await command(
+                    "Network.setCookies",
+                    {
+                        "cookies": [
+                            {
+                                "name": name,
+                                "value": value,
+                                "domain": ".douyin.com",
+                                "path": "/",
+                            }
+                            for name, value in cookies.items()
+                            if isinstance(name, str)
+                            and isinstance(value, str)
+                            and name
+                            and value
+                        ]
+                    },
+                    target_session,
+                )
+                await command(
+                    "Page.navigate",
+                    {"url": f"https://www.douyin.com/user/{sec_user_id}"},
+                    target_session,
+                )
+
+                wanted_requests: set[str] = set()
+                items: list[dict[str, Any]] = []
+                seen_ids: set[str] = set()
+                deadline = time.monotonic() + 30
+                last_scroll = time.monotonic()
+                pages_done = 0
+
+                while time.monotonic() < deadline:
+                    try:
+                        event = await asyncio.wait_for(
+                            events.get(),
+                            0.5,
+                        )
+                    except TimeoutError:
+                        if items and pages_done >= max_pages:
+                            break
+                        if items and time.monotonic() - last_scroll > 4:
+                            if pages_done < max_pages:
+                                await command(
+                                    "Runtime.evaluate",
+                                    {"expression": "window.scrollTo(0, document.body.scrollHeight)"},
+                                    target_session,
+                                )
+                                last_scroll = time.monotonic()
+                                pages_done += 1
+                        continue
+
+                    if event.get("sessionId") != target_session:
+                        continue
+                    method = event["method"]
+                    params = event.get("params", {})
+                    if method == "Network.responseReceived":
+                        response = params.get("response", {})
+                        parsed = urlsplit(str(response.get("url", "")))
+                        if (
+                            parsed.hostname in {"www.douyin.com", "iesdouyin.com"}
+                            and "/aweme/v1/web/aweme/post/" in parsed.path
+                            and int(response.get("status", 0)) == 200
+                        ):
+                            wanted_requests.add(str(params.get("requestId", "")))
+                    elif (
+                        method == "Network.loadingFinished"
+                        and str(params.get("requestId", "")) in wanted_requests
+                    ):
+                        body = await command(
+                            "Network.getResponseBody",
+                            {"requestId": params["requestId"]},
+                            target_session,
+                        )
+                        raw = body.get("body", "")
+                        if body.get("base64Encoded"):
+                            with contextlib.suppress(Exception):
+                                raw = base64.b64decode(raw).decode("utf-8")
+                        try:
+                            data = json.loads(raw)
+                        except Exception:
+                            data = None
+                        if isinstance(data, dict):
+                            aweme_list = data.get("aweme_list") or data.get("cards") or []
+                            for it in aweme_list:
+                                if isinstance(it, dict):
+                                    aid = _aweme_id(it)
+                                    if aid and aid not in seen_ids:
+                                        seen_ids.add(aid)
+                                        items.append(it)
+                            pages_done += 1
+                            if pages_done >= max_pages:
+                                break
+
+                # Refresh cookies if any
+                with contextlib.suppress(Exception):
+                    refreshed = await command(
+                        "Network.getAllCookies", session_id=target_session
+                    )
+                    _persist_browser_cookies(
+                        {
+                            cookie["name"]: cookie["value"]
+                            for cookie in refreshed.get("cookies", [])
+                            if cookie.get("name") and cookie.get("value")
+                        }
+                    )
+
+                if not items:
+                    blocked = await command(
+                        "Runtime.evaluate",
+                        {
+                            "expression": "Boolean(document.body && /验证码|接收短信验证码|访问频繁/.test(document.body.innerText))",
+                            "returnByValue": True,
+                        },
+                        target_session,
+                    )
+                    if blocked.get("result", {}).get("value"):
+                        raise RuntimeError("Oracle 抖音浏览器需要人工验证")
+
+                return items
             finally:
                 if target_id:
                     with contextlib.suppress(Exception):
@@ -405,12 +809,24 @@ async def _run(request: dict[str, Any]) -> dict[str, Any]:
             aweme_id = match.group(1)
             cdp_url = os.environ.get("HANABI_DOUYIN_CDP_URL", "").strip()
             browser_used = False
+
+            # 1. Fast-path: Direct HTTP GET note page and extract Pace SSR / window._ROUTER_DATA
+            item = None
             try:
-                item = await client.get_video_detail(aweme_id)
-            except Exception:
-                if not cdp_url:
-                    raise
-                item = None
+                item = await _fetch_and_extract_html_detail(
+                    client, aweme_id, resolved_url
+                )
+            except Exception as exc:
+                print(f"douyin direct html detail extract failed: {exc}", file=sys.stderr)
+
+            # 2. Try upstream client.get_video_detail
+            if not isinstance(item, dict) or _aweme_id(item) != aweme_id:
+                try:
+                    item = await client.get_video_detail(aweme_id)
+                except Exception:
+                    item = None
+
+            # 3. Fallback to CDP browser
             if (
                 (not isinstance(item, dict) or _aweme_id(item) != aweme_id)
                 and cdp_url
@@ -422,6 +838,7 @@ async def _run(request: dict[str, Any]) -> dict[str, Any]:
                     str(getattr(client, "headers", {}).get("User-Agent", "")),
                 )
                 browser_used = True
+
             if not isinstance(item, dict) or _aweme_id(item) != aweme_id:
                 raise RuntimeError("作品详情接口返回空数据，可能是 Cookie/签名失效或触发验证")
             return {
@@ -447,7 +864,12 @@ async def _run(request: dict[str, Any]) -> dict[str, Any]:
 
         cursor = 0
         for _ in range(max_pages):
-            page = await client.get_user_post(sec_user_id, max_cursor=cursor, count=20)
+            try:
+                page = await client.get_user_post(sec_user_id, max_cursor=cursor, count=20)
+            except Exception as exc:
+                print(f"douyin direct get_user_post error: {exc}", file=sys.stderr)
+                restricted = True
+                break
             pages_fetched += 1
             page_items = page.get("items") or page.get("aweme_list") or []
             if not isinstance(page_items, list) or not page_items:
@@ -466,54 +888,73 @@ async def _run(request: dict[str, Any]) -> dict[str, Any]:
                 break
             cursor = next_cursor
 
-        if restricted and browser_enabled:
+        cdp_url = os.environ.get("HANABI_DOUYIN_CDP_URL", "").strip()
+        if (restricted or not all_items) and (browser_enabled or cdp_url):
             browser_used = True
-            ids = await client.collect_user_post_ids_via_browser(
-                sec_user_id,
-                expected_count=expected_count,
-                headless=browser_headless,
-            )
-            captured = client.pop_browser_post_aweme_items()
-            for aweme_id in ids:
-                if aweme_id in seen or aweme_id in known_ids:
-                    continue
-                item = captured.get(aweme_id)
-                # post 接口在 aid=6383 下会返回图文项；DOM 额外发现但没有接口
-                # payload 的 id 多为纯视频，Hanabi 本来就跳过，不逐条请求 detail。
-                if isinstance(item, dict):
-                    _append_unique(all_items, seen, [item])
-            if ids:
-                restricted = False
-            else:
-                # 即使页面 DOM/接口拦截没有拿到 id，浏览器访问也可能已经刷新 ttwid、
-                # s_v_web_id 等匿名会话 Cookie；douyin-downloader 会把这些 Cookie
-                # 同步回 API client。立刻用新会话再跑一次签名接口。
-                cursor = 0
-                for _ in range(max_pages):
-                    page = await client.get_user_post(
-                        sec_user_id, max_cursor=cursor, count=20
+            if cdp_url:
+                try:
+                    captured = await _browser_feed(
+                        cdp_url,
+                        sec_user_id,
+                        cookies,
+                        str(getattr(client, "headers", {}).get("User-Agent", "")),
+                        max_pages=max_pages,
                     )
-                    pages_fetched += 1
-                    page_items = page.get("items") or page.get("aweme_list") or []
-                    if not isinstance(page_items, list) or not page_items:
-                        break
-                    _append_unique(all_items, seen, page_items)
-                    if not bool(page.get("has_more")):
+                    if captured:
+                        _append_unique(all_items, seen, captured)
                         restricted = False
-                        break
-                    try:
-                        next_cursor = int(page.get("max_cursor") or 0)
-                    except (TypeError, ValueError):
-                        next_cursor = 0
-                    if next_cursor == cursor:
-                        break
-                    cursor = next_cursor
-                if all_items:
+                except Exception as exc:
+                    print(f"douyin cdp browser feed failed: {exc}", file=sys.stderr)
+            elif browser_enabled:
+                ids = await client.collect_user_post_ids_via_browser(
+                    sec_user_id,
+                    expected_count=expected_count,
+                    headless=browser_headless,
+                )
+                captured = client.pop_browser_post_aweme_items()
+                for aweme_id in ids:
+                    if aweme_id in seen or aweme_id in known_ids:
+                        continue
+                    item = captured.get(aweme_id)
+                    # post 接口在 aid=6383 下会返回图文项；DOM 额外发现但没有接口
+                    # payload 的 id 多为纯视频，Hanabi 本来就跳过，不逐条请求 detail。
+                    if isinstance(item, dict):
+                        _append_unique(all_items, seen, [item])
+                if ids:
                     restricted = False
-            _persist_browser_cookies(client.cookies)
+                else:
+                    # 即使页面 DOM/接口拦截没有拿到 id，浏览器访问也可能已经刷新 ttwid、
+                    # s_v_web_id 等匿名会话 Cookie；douyin-downloader 会把这些 Cookie
+                    # 同步回 API client。立刻用新会话再跑一次签名接口。
+                    cursor = 0
+                    for _ in range(max_pages):
+                        try:
+                            page = await client.get_user_post(
+                                sec_user_id, max_cursor=cursor, count=20
+                            )
+                        except Exception:
+                            break
+                        pages_fetched += 1
+                        page_items = page.get("items") or page.get("aweme_list") or []
+                        if not isinstance(page_items, list) or not page_items:
+                            break
+                        _append_unique(all_items, seen, page_items)
+                        if not bool(page.get("has_more")):
+                            restricted = False
+                            break
+                        try:
+                            next_cursor = int(page.get("max_cursor") or 0)
+                        except (TypeError, ValueError):
+                            next_cursor = 0
+                        if next_cursor == cursor:
+                            break
+                        cursor = next_cursor
+                    if all_items:
+                        restricted = False
+                _persist_browser_cookies(client.cookies)
 
         if not all_items and (restricted or expected_count > 0):
-            suffix = "；Playwright 兜底没有取得作品" if browser_used else ""
+            suffix = "；浏览器兜底没有取得作品" if browser_used else ""
             raise RuntimeError(
                 "作者作品接口返回空列表，可能是 Cookie/签名失效或触发验证" + suffix
             )

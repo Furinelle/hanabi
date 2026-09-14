@@ -199,7 +199,12 @@ fn ranked_image_urls(item: &Value) -> Vec<String> {
     if let Some(download) = item.get("download_addr") {
         add(Some(download), download, 5);
     }
-    add(item.get("download_url_list"), item, 6);
+    add(
+        item.get("download_url_list")
+            .or_else(|| item.get("downloadUrlList")),
+        item,
+        6,
+    );
     if let Some(watermark) = item.get("owner_watermark_image") {
         add(Some(watermark), watermark, 7);
     }
@@ -227,11 +232,14 @@ fn gallery_items(item: &Value) -> Option<&Vec<Value>> {
 
 fn parse_item(item: &Value, origin: &str, image_policy: ImagePolicy) -> Option<MediaItem> {
     // aweme_id 可能是数字或字符串。
-    let aweme_id = item.get("aweme_id").and_then(|v| {
-        v.as_str()
-            .map(String::from)
-            .or_else(|| v.as_u64().map(|n| n.to_string()))
-    })?;
+    let aweme_id = item
+        .get("aweme_id")
+        .or_else(|| item.get("awemeId"))
+        .and_then(|v| {
+            v.as_str()
+                .map(String::from)
+                .or_else(|| v.as_u64().map(|n| n.to_string()))
+        })?;
     // 只接受纯数字 id:该值会拼进临时目录路径(hanabi_douyin_<id>),后续还会对
     // 该路径 remove_dir_all;页面数据不可信,含 `/`、`..` 会造成路径穿越。
     if aweme_id.is_empty() || !aweme_id.bytes().all(|b| b.is_ascii_digit()) {
@@ -279,7 +287,7 @@ fn parse_item(item: &Value, origin: &str, image_policy: ImagePolicy) -> Option<M
         .unwrap_or("")
         .to_string();
     let sec_uid = author
-        .and_then(|a| a.get("sec_uid"))
+        .and_then(|a| a.get("sec_uid").or_else(|| a.get("secUid")))
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
@@ -1400,5 +1408,34 @@ json.dump({
     #[test]
     fn parse_note_none_on_garbage() {
         assert!(parse_note("<html>no router data</html>", "manual").is_none());
+    }
+
+    #[test]
+    fn parse_item_supports_camel_case_fields() {
+        let json = serde_json::json!({
+            "awemeId": "7685201544367390961",
+            "desc": "测试标题 #标签1",
+            "authorInfo": {
+                "nickname": "测试作者",
+                "secUid": "MS4wLjABAAAAtest"
+            },
+            "images": [
+                {
+                    "width": 1080,
+                    "height": 1920,
+                    "downloadUrlList": ["https://example.com/dl.jpg"],
+                    "urlList": ["https://example.com/view.jpg"]
+                }
+            ]
+        });
+        let item = parse_user_aweme(&json, "test_source").expect("parse_user_aweme should succeed");
+        assert_eq!(item.source_id, "7685201544367390961");
+        assert_eq!(item.author.name, "测试作者");
+        assert_eq!(item.author.url, "https://www.douyin.com/user/MS4wLjABAAAAtest");
+        assert_eq!(item.title.as_deref(), Some("测试标题"));
+        assert_eq!(item.tags, vec!["标签1".to_string()]);
+        assert_eq!(item.images.len(), 1);
+        assert_eq!(item.images[0].url, "https://example.com/view.jpg");
+        assert_eq!(item.images[0].fallback_urls, vec!["https://example.com/dl.jpg".to_string()]);
     }
 }

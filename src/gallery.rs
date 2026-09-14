@@ -274,9 +274,9 @@ impl GalleryClient {
             offset += count;
         }
         if images.is_empty() {
-            return Err(GalleryIngestError::permanent(format!(
-                "Vitrine 未找到作品: {work_id}"
-            )));
+            // A published fingerprint may belong to a Telegram-only or removed work.
+            // Only a successful, validated empty catalog means there is nothing to download.
+            return Ok(Vec::new());
         }
         images.sort_by_key(|image| image.page_index);
         let destination = destination.to_path_buf();
@@ -809,6 +809,44 @@ mod tests {
         assert!(url
             .query_pairs()
             .any(|(key, value)| key == "work_id" && value == "pixiv:123"));
+    }
+
+    #[tokio::test]
+    async fn download_work_images_only_accepts_valid_empty_catalog_as_missing() {
+        for (status, body, missing) in [
+            (200, r#"{"ok":true,"images":[]}"#, true),
+            (200, r#"{"ok":false,"images":[]}"#, false),
+            (200, r#"{"ok":true}"#, false),
+            (
+                200,
+                r#"{"ok":true,"images":[{"work_id":"x:other","page_index":0,"r2_key":"a.jpg","content_type":"image/jpeg"}]}"#,
+                false,
+            ),
+            (401, r#"{"ok":true,"images":[]}"#, false),
+            (500, r#"{"ok":true,"images":[]}"#, false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                assert!(stream.read(&mut [0_u8; 4096]).unwrap() > 0);
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
+            let root = tempfile::tempdir().unwrap();
+            let destination = root.path().join("download");
+            let client =
+                GalleryClient::new(format!("http://{address}"), "test-token".into()).unwrap();
+            let result = client
+                .download_work_images("x:2093720915876204773", &destination)
+                .await;
+            if missing {
+                assert!(result.unwrap().is_empty());
+            } else {
+                assert!(result.is_err(), "{status}: {body}");
+            }
+            assert!(!destination.exists());
+            server.join().unwrap();
+        }
     }
 
     #[tokio::test]

@@ -304,6 +304,9 @@ async fn queue_inner(
             let downloaded = gallery
                 .download_work_images(&work_id, &root.join("download"))
                 .await?;
+            if downloaded.is_empty() {
+                tracing::warn!(%work_id, "相似作品已不在图库，保留发布指纹并继续候选审批");
+            }
             for image in downloaded {
                 let dest = root.join(format!(
                     "old-{}.{}",
@@ -1798,7 +1801,7 @@ mod tests {
 
     #[tokio::test]
     async fn gallery_deletion_survives_missing_or_failed_telegram_and_remains_undoable() {
-        use std::io::{BufRead, Read, Write};
+        use std::io::Write;
         for scenario in [
             "telegram_failure",
             "missing_targets",
@@ -1832,26 +1835,8 @@ mod tests {
                         }
                         Err(error) => panic!("{error}"),
                     };
-                    socket
-                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                        .unwrap();
-                    let mut reader = std::io::BufReader::new(&mut socket);
-                    let mut route = String::new();
-                    reader.read_line(&mut route).unwrap();
+                    let (route, body) = read_mock_request(&mut socket);
                     let route = route.to_lowercase();
-                    let mut length = 0;
-                    loop {
-                        let mut line = String::new();
-                        reader.read_line(&mut line).unwrap();
-                        if line == "\r\n" {
-                            break;
-                        }
-                        if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
-                            length = value.trim().parse().unwrap();
-                        }
-                    }
-                    let mut body = vec![0; length];
-                    reader.read_exact(&mut body).unwrap();
                     let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
                     server_calls
                         .lock()
@@ -2277,14 +2262,80 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn publish_selected_pages_then_undo_restores_the_unfiltered_review() {
-        use std::io::{Read, Write};
+    fn read_mock_request(socket: &mut std::net::TcpStream) -> (String, Vec<u8>) {
+        use std::io::Read;
+
+        socket.set_nonblocking(false).unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut raw = Vec::new();
+        let mut buf = [0; 8192];
+        let end = loop {
+            let count = socket.read(&mut buf).unwrap();
+            assert!(count > 0);
+            raw.extend_from_slice(&buf[..count]);
+            if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let header = String::from_utf8_lossy(&raw[..end]);
+        let route = header.lines().next().unwrap().to_string();
+        let length = header
+            .lines()
+            .find_map(|line| {
+                line.to_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        let chunked = header.to_lowercase().contains("transfer-encoding: chunked");
+        while raw.len() < end + length || (chunked && !raw[end..].ends_with(b"0\r\n\r\n")) {
+            let count = socket.read(&mut buf).unwrap_or_else(|error| {
+                panic!(
+                    "mock request {route}: {error}; received={} header={end} content={length} chunked={chunked}",
+                    raw.len()
+                )
+            });
+            if count == 0 {
+                break;
+            }
+            raw.extend_from_slice(&buf[..count]);
+        }
+        let mut body = raw[end..].to_vec();
+        if chunked {
+            body.clear();
+            let mut chunks = &raw[end..];
+            loop {
+                let end = chunks.windows(2).position(|w| w == b"\r\n").unwrap();
+                let length =
+                    usize::from_str_radix(std::str::from_utf8(&chunks[..end]).unwrap(), 16)
+                        .unwrap();
+                if length == 0 {
+                    break;
+                }
+                chunks = &chunks[end + 2..];
+                body.extend_from_slice(&chunks[..length]);
+                chunks = &chunks[length + 2..];
+            }
+        }
+        (route, body)
+    }
+
+    type ReviewMockCalls = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
+    fn review_mock() -> (
+        String,
+        Arc<std::sync::atomic::AtomicBool>,
+        ReviewMockCalls,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<(String, Vec<u8>)>::new()));
         let server_stop = stop.clone();
         let server_calls = calls.clone();
         let server = std::thread::spawn(move || {
@@ -2297,22 +2348,8 @@ mod tests {
                     }
                     Err(error) => panic!("{error}"),
                 };
-                socket.set_nonblocking(false).unwrap();
-                socket
-                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                    .unwrap();
-                let mut raw = Vec::new();
-                let mut buf = [0; 8192];
-                let end = loop {
-                    let count = socket.read(&mut buf).unwrap();
-                    assert!(count > 0);
-                    raw.extend_from_slice(&buf[..count]);
-                    if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
-                        break end + 4;
-                    }
-                };
-                let header = String::from_utf8_lossy(&raw[..end]);
-                let route = header
+                let (request_line, body) = read_mock_request(&mut socket);
+                let route = request_line
                     .lines()
                     .next()
                     .unwrap()
@@ -2320,24 +2357,10 @@ mod tests {
                     .nth(1)
                     .unwrap()
                     .to_string();
-                let length = header
-                    .lines()
-                    .find_map(|line| {
-                        line.to_lowercase()
-                            .strip_prefix("content-length:")
-                            .and_then(|v| v.trim().parse::<usize>().ok())
-                    })
-                    .unwrap_or(0);
-                let chunked = header.to_lowercase().contains("transfer-encoding: chunked");
-                while raw.len() < end + length || (chunked && !raw[end..].ends_with(b"0\r\n\r\n")) {
-                    let count = socket.read(&mut buf).unwrap_or_else(|e| panic!("mock request {route}: {e}; received={} header={end} content={length} chunked={chunked}",raw.len()));
-                    if count == 0 {
-                        break;
-                    }
-                    raw.extend_from_slice(&buf[..count]);
-                }
-                server_calls.lock().unwrap().push(route.clone());
-                let result = if route.starts_with("/api/") {
+                server_calls.lock().unwrap().push((route.clone(), body));
+                let result = if route.starts_with("/api/catalog?") {
+                    serde_json::json!({"ok":true,"images":[]})
+                } else if route.starts_with("/api/") {
                     serde_json::json!({"ok":true})
                 } else if route.ends_with("DeleteMessage")
                     || route.ends_with("deleteMessage")
@@ -2351,6 +2374,95 @@ mod tests {
                 write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
             }
         });
+        (base, stop, calls, server)
+    }
+
+    #[tokio::test]
+    async fn missing_gallery_match_preserves_all_candidates_without_publishing() {
+        let (base, stop, calls, server) = review_mock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = TelegramSink::new(
+            "123:fake".into(),
+            "123".into(),
+            "-100123".into(),
+            dir.path().join("hanabi.db").to_str().unwrap(),
+            Some(GalleryClient::new(base.clone(), "fake".into()).unwrap()),
+        )
+        .unwrap();
+        let inner = Arc::get_mut(&mut sink.state).unwrap();
+        inner.bot = inner
+            .bot
+            .clone()
+            .set_api_url(reqwest::Url::parse(&base).unwrap());
+        let mut item = session().item;
+        item.origin = "manual".into();
+        let files: Vec<_> = (0..3)
+            .map(|index| {
+                let path = dir.path().join(format!("candidate-{index}.png"));
+                image::RgbImage::from_fn(32, 32, |x, y| {
+                    image::Rgb([(x * 7) as u8, (y * 7) as u8, 80 + index * 20])
+                })
+                .save(&path)
+                .unwrap();
+                path
+            })
+            .collect();
+        let mut old = item.clone();
+        old.source_id = "missing-old-work".into();
+        let fingerprint = inspect_image(&files[0]).unwrap();
+        {
+            let db = sink.state.db.lock().await;
+            record_work(&db, &old, &[fingerprint], WorkStatus::Published).unwrap();
+        }
+        let result = sink.publish_direct(&item, &files).await;
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        assert_eq!(result.unwrap().outcome, PublishOutcome::DeferredReview);
+        let db = sink.state.db.lock().await;
+        let token = db
+            .query_row("SELECT token FROM image_review_sessions", [], |r| r.get(0))
+            .unwrap();
+        let (review, status) = load(&db, token).unwrap().unwrap();
+        assert_eq!(status, "pending");
+        assert_eq!(review.choices, vec![None; 3]);
+        assert_eq!(review.messages.len(), 3);
+        assert!(review.old.is_empty());
+        assert_eq!(review.originals.len(), 3);
+        assert!(review.originals.iter().all(|path| path.is_file()));
+        assert!(review.prepared.iter().all(|path| path.is_file()));
+        let row = db.query_row(
+            "SELECT files, caption, msg_ids, originals, is_r18, item_meta FROM pending WHERE token=?1 AND state='similar'",
+            [token],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        ).unwrap();
+        assert_eq!(decode_pending(row).unwrap().originals, review.originals);
+        let counts: (usize, usize) = db
+            .query_row(
+                "SELECT sum(status='pending'), sum(status='published') FROM image_fingerprints",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            counts,
+            (3, 1),
+            "keep candidate and published duplicate protection"
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 4);
+        assert!(calls[0].0.starts_with("/api/catalog?"));
+        for (route, body) in &calls[1..] {
+            assert!(route.to_lowercase().ends_with("sendphoto"));
+            let body = String::from_utf8_lossy(body);
+            assert!(body.contains("name=\"chat_id\"\r\n\r\n123\r\n"));
+            assert!(!body.contains("-100123"), "must not publish to the channel");
+        }
+        std::fs::remove_dir_all(review.originals[0].parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn publish_selected_pages_then_undo_restores_the_unfiltered_review() {
+        let (base, stop, calls, server) = review_mock();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("hanabi.db");
         let mut sink = TelegramSink::new(
@@ -2422,7 +2534,12 @@ mod tests {
         assert_eq!(status, "pending");
         assert_eq!(restored.choices, vec![Some(true), None]);
         assert!(restored.originals.iter().all(|p| p.is_file()));
-        let paths = calls.lock().unwrap().clone();
+        let paths: Vec<_> = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(route, _)| route.clone())
+            .collect();
         assert_eq!(
             paths
                 .iter()

@@ -49,6 +49,8 @@
 export HANABI_DOUYIN_COOKIE='ttwid=...; msToken=...; passport_csrf_token=...'
 # 或
 export HANABI_DOUYIN_COOKIE_FILE=/root/hanabi/.douyin-cookies.json
+# 可选：详情 API 风控时复用内网 CDP 浏览器（禁止暴露到公网）
+export HANABI_DOUYIN_CDP_URL='ws://browser:3000'
 ```
 
 非 Docker 安装桥接依赖：
@@ -81,7 +83,7 @@ python_command = ".venv/bin/python"
 helper_path = "tools/douyin_user_feed.py"
 max_pages = 3                 # 每页 20 条
 cookie_file = ".douyin-cookies.json" # 仅路径；Cookie 文件 chmod 600 且不提交
-browser_fallback = false      # API 翻页受限时可启用 Playwright 兜底
+browser_fallback = false      # 作者 feed 翻页受限时可启用本机 Playwright 兜底
 browser_headless = false
 
 # 可选：X 图片下载画质。download 阶段以 -o extractor.twitter.size=orig 追加；

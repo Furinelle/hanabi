@@ -24,5 +24,7 @@ jobs:
         run: cargo fmt --check
       - name: Test
         run: cargo test --all-targets
+      - name: Check Python bridge
+        run: python3 -m unittest tests/test_douyin_user_feed.py && python3 -m py_compile tools/douyin_user_feed.py
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings

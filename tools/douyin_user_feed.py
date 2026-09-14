@@ -10,14 +10,18 @@ HANABI_DOUYIN_COOKIE or HANABI_DOUYIN_COOKIE_FILE and never echoed.
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
 import importlib.util
 import json
 import logging
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 def _load_upstream():
@@ -137,6 +141,217 @@ def _append_unique(items: list[dict[str, Any]], seen: set[str], values: Any) -> 
             items.append(item)
 
 
+def _browser_aweme(data: Any, aweme_id: str) -> dict[str, Any] | None:
+    if not isinstance(data, dict):
+        return None
+    values: list[Any] = []
+    for key in ("aweme_detail", "aweme_list", "aweme_details", "item_list"):
+        value = data.get(key)
+        values.extend(value if isinstance(value, list) else [value])
+    return next(
+        (
+            item
+            for item in values
+            if isinstance(item, dict) and _aweme_id(item) == aweme_id
+        ),
+        None,
+    )
+
+
+async def _browser_detail(
+    cdp_url: str,
+    aweme_id: str,
+    cookies: dict[str, Any],
+    user_agent: str,
+) -> dict[str, Any]:
+    import aiohttp
+
+    pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
+    events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    next_id = 0
+
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(cdp_url, max_msg_size=32 * 1024 * 1024) as ws:
+            async def read_messages() -> None:
+                async for message in ws:
+                    if message.type != aiohttp.WSMsgType.TEXT:
+                        continue
+                    value = json.loads(message.data)
+                    if "id" in value:
+                        future = pending.pop(value["id"], None)
+                        if future and not future.done():
+                            future.set_result(value)
+                    elif "method" in value:
+                        await events.put(value)
+
+            reader = asyncio.create_task(read_messages())
+
+            async def command(
+                method: str,
+                params: dict[str, Any] | None = None,
+                session_id: str | None = None,
+            ) -> dict[str, Any]:
+                nonlocal next_id
+                next_id += 1
+                message: dict[str, Any] = {
+                    "id": next_id,
+                    "method": method,
+                    "params": params or {},
+                }
+                if session_id:
+                    message["sessionId"] = session_id
+                future = asyncio.get_running_loop().create_future()
+                pending[next_id] = future
+                await ws.send_json(message)
+                response = await asyncio.wait_for(future, 15)
+                if "error" in response:
+                    raise RuntimeError(
+                        f"CDP {method} 失败: {response['error'].get('message', 'unknown')}"
+                    )
+                return response.get("result", {})
+
+            browser_context_id = ""
+            target_id = ""
+            try:
+                browser_context_id = (
+                    await command("Target.createBrowserContext")
+                )["browserContextId"]
+                target_id = (
+                    await command(
+                        "Target.createTarget",
+                        {"url": "about:blank", "browserContextId": browser_context_id},
+                    )
+                )["targetId"]
+                target_session = (
+                    await command(
+                        "Target.attachToTarget",
+                        {"targetId": target_id, "flatten": True},
+                    )
+                )["sessionId"]
+                await command("Network.enable", session_id=target_session)
+                await command("Page.enable", session_id=target_session)
+                await command(
+                    "Emulation.setUserAgentOverride",
+                    {"userAgent": user_agent, "acceptLanguage": "zh-CN,zh;q=0.9"},
+                    target_session,
+                )
+                await command(
+                    "Network.setCookies",
+                    {
+                        "cookies": [
+                            {
+                                "name": name,
+                                "value": value,
+                                "domain": ".douyin.com",
+                                "path": "/",
+                            }
+                            for name, value in cookies.items()
+                            if isinstance(name, str)
+                            and isinstance(value, str)
+                            and name
+                            and value
+                        ]
+                    },
+                    target_session,
+                )
+                await command(
+                    "Page.navigate",
+                    {"url": f"https://www.douyin.com/note/{aweme_id}"},
+                    target_session,
+                )
+
+                wanted_requests: set[str] = set()
+                response_counts: dict[str, int] = {}
+                deadline = time.monotonic() + 45
+                while time.monotonic() < deadline:
+                    try:
+                        event = await asyncio.wait_for(
+                            events.get(), max(0.1, deadline - time.monotonic())
+                        )
+                    except TimeoutError:
+                        break
+                    if event.get("sessionId") != target_session:
+                        continue
+                    method = event["method"]
+                    params = event.get("params", {})
+                    if method == "Network.responseReceived":
+                        response = params.get("response", {})
+                        parsed = urlsplit(str(response.get("url", "")))
+                        if parsed.hostname == "www.douyin.com" and parsed.path.startswith(
+                            "/aweme/"
+                        ):
+                            response_counts[parsed.path] = (
+                                response_counts.get(parsed.path, 0) + 1
+                            )
+                        if (
+                            parsed.hostname == "www.douyin.com"
+                            and parsed.path
+                            in {
+                                "/aweme/v1/web/aweme/detail/",
+                                "/aweme/v1/web/aweme/post/",
+                            }
+                            and int(response.get("status", 0)) == 200
+                        ):
+                            wanted_requests.add(str(params.get("requestId", "")))
+                    elif (
+                        method == "Network.loadingFinished"
+                        and str(params.get("requestId", "")) in wanted_requests
+                    ):
+                        body = await command(
+                            "Network.getResponseBody",
+                            {"requestId": params["requestId"]},
+                            target_session,
+                        )
+                        raw = body.get("body", "")
+                        if body.get("base64Encoded"):
+                            raw = base64.b64decode(raw).decode("utf-8")
+                        item = _browser_aweme(json.loads(raw), aweme_id)
+                        if item:
+                            refreshed = await command(
+                                "Network.getAllCookies", session_id=target_session
+                            )
+                            try:
+                                _persist_browser_cookies(
+                                    {
+                                        cookie["name"]: cookie["value"]
+                                        for cookie in refreshed.get("cookies", [])
+                                        if cookie.get("name") and cookie.get("value")
+                                    }
+                                )
+                            except OSError as exc:
+                                print(
+                                    f"douyin browser cookie persistence skipped: {exc}",
+                                    file=sys.stderr,
+                                )
+                            return item
+
+                blocked = await command(
+                    "Runtime.evaluate",
+                    {
+                        "expression": "Boolean(document.body && /验证码|接收短信验证码|访问频繁/.test(document.body.innerText))",
+                        "returnByValue": True,
+                    },
+                    target_session,
+                )
+                if blocked.get("result", {}).get("value"):
+                    raise RuntimeError("Oracle 抖音浏览器需要人工验证")
+                paths = ",".join(sorted(response_counts)) or "none"
+                raise RuntimeError(f"Oracle 抖音浏览器未返回目标作品 api={paths}")
+            finally:
+                if target_id:
+                    with contextlib.suppress(Exception):
+                        await command("Target.closeTarget", {"targetId": target_id})
+                if browser_context_id:
+                    with contextlib.suppress(Exception):
+                        await command(
+                            "Target.disposeBrowserContext",
+                            {"browserContextId": browser_context_id},
+                        )
+                reader.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await reader
+
+
 async def _run(request: dict[str, Any]) -> dict[str, Any]:
     (
         DouyinAPIClient,
@@ -181,12 +396,31 @@ async def _run(request: dict[str, Any]) -> dict[str, Any]:
                     f"链接没有解析为作品页: {resolved_url.split('?', 1)[0]}"
                 )
             aweme_id = match.group(1)
-            item = await client.get_video_detail(aweme_id)
+            cdp_url = os.environ.get("HANABI_DOUYIN_CDP_URL", "").strip()
+            browser_used = False
+            try:
+                item = await client.get_video_detail(aweme_id)
+            except Exception:
+                if not cdp_url:
+                    raise
+                item = None
+            if (
+                (not isinstance(item, dict) or _aweme_id(item) != aweme_id)
+                and cdp_url
+            ):
+                item = await _browser_detail(
+                    cdp_url,
+                    aweme_id,
+                    cookies,
+                    str(getattr(client, "headers", {}).get("User-Agent", "")),
+                )
+                browser_used = True
             if not isinstance(item, dict) or _aweme_id(item) != aweme_id:
                 raise RuntimeError("作品详情接口返回空数据，可能是 Cookie/签名失效或触发验证")
             return {
                 "resolved_url": resolved_url.split("?", 1)[0],
                 "item": item,
+                "browser_fallback_used": browser_used,
             }
 
         match = re.search(r"/user/([A-Za-z0-9_-]+)", resolved_url)

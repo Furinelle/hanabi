@@ -114,6 +114,7 @@ async fn main() -> Result<()> {
                         imported = summary.imported,
                         unchanged = summary.unchanged,
                         failed = summary.failed,
+                        pushed = summary.pushed,
                         "Vitrine 图片指纹同步完成"
                     ),
                     Err(error) => tracing::warn!(error = %error, "Vitrine 图片指纹同步失败"),

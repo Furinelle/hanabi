@@ -1431,11 +1431,17 @@ json.dump({
         let item = parse_user_aweme(&json, "test_source").expect("parse_user_aweme should succeed");
         assert_eq!(item.source_id, "7685201544367390961");
         assert_eq!(item.author.name, "测试作者");
-        assert_eq!(item.author.url, "https://www.douyin.com/user/MS4wLjABAAAAtest");
+        assert_eq!(
+            item.author.url,
+            "https://www.douyin.com/user/MS4wLjABAAAAtest"
+        );
         assert_eq!(item.title.as_deref(), Some("测试标题"));
         assert_eq!(item.tags, vec!["标签1".to_string()]);
         assert_eq!(item.images.len(), 1);
         assert_eq!(item.images[0].url, "https://example.com/view.jpg");
-        assert_eq!(item.images[0].fallback_urls, vec!["https://example.com/dl.jpg".to_string()]);
+        assert_eq!(
+            item.images[0].fallback_urls,
+            vec!["https://example.com/dl.jpg".to_string()]
+        );
     }
 }

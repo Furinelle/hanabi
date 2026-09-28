@@ -2,8 +2,8 @@ use std::cmp::Ordering;
 use std::path::Path;
 
 use hanabi::image_dedup::{
-    classify_similarity, evaluate_work, init_schema, inspect_image, mark_work_status, record_work,
-    remove_work, render_review_notice, ExactAction, MatchKind, WorkStatus,
+    classify_similarity, init_schema, inspect_image, mark_work_status, record_work, remove_work,
+    MatchKind, WorkStatus,
 };
 use hanabi::model::{Author, ImageRef, MediaItem, SourceKind};
 use image::{ImageBuffer, Rgb, RgbImage};
@@ -133,232 +133,38 @@ fn unrelated_images_are_not_marked_similar() {
 }
 
 #[test]
-fn catalog_replaces_pending_or_published_lower_quality_history() {
+fn fingerprint_history_can_be_recorded_published_and_removed() {
     let dir = tempfile::tempdir().unwrap();
-    let small_path = dir.path().join("small.png");
-    let large_path = dir.path().join("large.png");
-    save_png(&small_path, &patterned(320, 240));
-    save_png(&large_path, &patterned(1280, 960));
-    let small = inspect_image(&small_path).unwrap();
-    let large = inspect_image(&large_path).unwrap();
+    let path = dir.path().join("image.png");
+    save_png(&path, &patterned(320, 240));
+    let fingerprint = inspect_image(&path).unwrap();
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     init_schema(&conn).unwrap();
+    let work = item(SourceKind::Pixiv, "p1", "作品");
 
-    let pixiv = item(SourceKind::Pixiv, "p1", "低清版");
-    let x = item(SourceKind::X, "x1", "高清版");
-    record_work(
-        &conn,
-        &pixiv,
-        std::slice::from_ref(&small),
-        WorkStatus::Pending,
-    )
-    .unwrap();
+    record_work(&conn, &work, &[fingerprint], WorkStatus::Pending).unwrap();
+    let status: String = conn
+        .query_row("SELECT status FROM image_fingerprints", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(status, "pending");
 
-    let pending = evaluate_work(&conn, &x, std::slice::from_ref(&large)).unwrap();
-    assert!(matches!(
-        pending.exact_action,
-        ExactAction::ReplacePending(ref old) if old.source_id == "p1"
-    ));
+    mark_work_status(&conn, &work, WorkStatus::Published).unwrap();
+    let status: String = conn
+        .query_row("SELECT status FROM image_fingerprints", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(status, "published");
 
-    mark_work_status(&conn, &pixiv, WorkStatus::Published).unwrap();
-    let published = evaluate_work(&conn, &x, std::slice::from_ref(&large)).unwrap();
-    assert!(matches!(
-        published.exact_action,
-        ExactAction::ReplacePublished(ref old) if old.status == WorkStatus::Published
-    ));
-
-    remove_work(&conn, &pixiv).unwrap();
-    assert!(matches!(
-        evaluate_work(&conn, &x, &[large]).unwrap().exact_action,
-        ExactAction::None
-    ));
-}
-
-#[test]
-fn similar_notice_contains_both_sources_resolution_and_file_size() {
-    let dir = tempfile::tempdir().unwrap();
-    let original_path = dir.path().join("original.png");
-    let edited_path = dir.path().join("edited.png");
-    let original = patterned(640, 480);
-    let mut edited = original.clone();
-    for y in 200..260 {
-        for x in 280..360 {
-            edited.put_pixel(x, y, Rgb([255, 255, 255]));
-        }
-    }
-    save_png(&original_path, &original);
-    save_png(&edited_path, &edited);
-    let original = inspect_image(&original_path).unwrap();
-    let edited = inspect_image(&edited_path).unwrap();
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    init_schema(&conn).unwrap();
-    let pixiv = item(SourceKind::Pixiv, "p2", "原图");
-    let douyin = item(SourceKind::Douyin, "d2", "改图");
-    record_work(
-        &conn,
-        &pixiv,
-        std::slice::from_ref(&original),
-        WorkStatus::Published,
-    )
-    .unwrap();
-
-    let evaluation = evaluate_work(&conn, &douyin, &[edited]).unwrap();
-    assert!(matches!(evaluation.exact_action, ExactAction::None));
-    assert_eq!(evaluation.similar.len(), 1);
-    let notice = render_review_notice(&evaluation.similar);
-    assert!(notice.contains("相似图片"));
-    assert!(notice.contains("当前 640×480"));
-    assert!(notice.contains("Pixiv p2"));
-    assert!(notice.contains("640×480"));
-    assert!(notice.contains("KiB"));
-}
-
-#[test]
-fn partial_strict_duplicate_requires_a_whole_work_review() {
-    let dir = tempfile::tempdir().unwrap();
-    let duplicate_path = dir.path().join("duplicate.png");
-    let unique_path = dir.path().join("unique.png");
-    save_png(&duplicate_path, &patterned(640, 480));
-    let unique = ImageBuffer::from_fn(640, 480, |x, y| {
-        Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8])
-    });
-    save_png(&unique_path, &unique);
-    let duplicate = inspect_image(&duplicate_path).unwrap();
-    let unique = inspect_image(&unique_path).unwrap();
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    init_schema(&conn).unwrap();
-    let old = item(SourceKind::Pixiv, "p3", "已收录");
-    let mut mixed = item(SourceKind::X, "x3", "两张图");
-    mixed.page_count = 2;
-    mixed.images.push(ImageRef {
-        url: "https://example.test/x3-2.png".into(),
-        referer: None,
-        fallback_urls: vec![],
-    });
-    record_work(
-        &conn,
-        &old,
-        std::slice::from_ref(&duplicate),
-        WorkStatus::Published,
-    )
-    .unwrap();
-
-    let evaluation = evaluate_work(&conn, &mixed, &[duplicate, unique]).unwrap();
-    assert!(matches!(evaluation.exact_action, ExactAction::None));
-    assert_eq!(evaluation.similar.len(), 1);
-    assert_eq!(evaluation.similar[0].existing_work.source_id, "p3");
-}
-
-#[test]
-fn lower_quality_strict_duplicate_still_keeps_published_history() {
-    let dir = tempfile::tempdir().unwrap();
-    let small_path = dir.path().join("small.png");
-    let large_path = dir.path().join("large.png");
-    save_png(&small_path, &patterned(320, 240));
-    save_png(&large_path, &patterned(1280, 960));
-    let small = inspect_image(&small_path).unwrap();
-    let large = inspect_image(&large_path).unwrap();
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    init_schema(&conn).unwrap();
-
-    let old = item(SourceKind::X, "x9", "高清已发布");
-    let current = item(SourceKind::Pixiv, "p9", "低清重发");
-    record_work(
-        &conn,
-        &old,
-        std::slice::from_ref(&large),
-        WorkStatus::Published,
-    )
-    .unwrap();
-
-    let evaluation = evaluate_work(&conn, &current, &[small]).unwrap();
-    assert!(matches!(
-        evaluation.exact_action,
-        ExactAction::SkipCurrent(ref old) if old.status == WorkStatus::Published
-    ));
-}
-
-#[test]
-fn same_post_images_are_never_compared_with_each_other() {
-    let dir = tempfile::tempdir().unwrap();
-    let image_path = dir.path().join("same.png");
-    save_png(&image_path, &patterned(640, 480));
-    let fingerprint = inspect_image(&image_path).unwrap();
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    init_schema(&conn).unwrap();
-    let mut current = item(SourceKind::Pixiv, "p4", "同帖差分图");
-    current.page_count = 2;
-    current.images.push(ImageRef {
-        url: "https://example.test/p4-2.png".into(),
-        referer: None,
-        fallback_urls: vec![],
-    });
-
-    let evaluation = evaluate_work(&conn, &current, &[fingerprint.clone(), fingerprint]).unwrap();
-
-    assert!(matches!(evaluation.exact_action, ExactAction::None));
-    assert!(evaluation.similar.is_empty());
-}
-
-#[test]
-fn same_platform_different_posts_are_still_deduplicated() {
-    let dir = tempfile::tempdir().unwrap();
-    let image_path = dir.path().join("same.png");
-    save_png(&image_path, &patterned(640, 480));
-    let fingerprint = inspect_image(&image_path).unwrap();
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    init_schema(&conn).unwrap();
-    let old = item(SourceKind::Pixiv, "p5", "已收录");
-    let current = item(SourceKind::Pixiv, "p6", "另一帖");
-    record_work(
-        &conn,
-        &old,
-        std::slice::from_ref(&fingerprint),
-        WorkStatus::Published,
-    )
-    .unwrap();
-
-    let evaluation = evaluate_work(&conn, &current, &[fingerprint]).unwrap();
-
-    assert!(matches!(
-        evaluation.exact_action,
-        ExactAction::SkipCurrent(ref work) if work.source_id == "p5"
-    ));
-}
-
-#[test]
-fn same_platform_different_posts_still_request_similar_review() {
-    let dir = tempfile::tempdir().unwrap();
-    let original_path = dir.path().join("original.png");
-    let edited_path = dir.path().join("edited.png");
-    let original = patterned(640, 480);
-    let mut edited = original.clone();
-    for y in 200..260 {
-        for x in 280..360 {
-            edited.put_pixel(x, y, Rgb([255, 255, 255]));
-        }
-    }
-    save_png(&original_path, &original);
-    save_png(&edited_path, &edited);
-    let original = inspect_image(&original_path).unwrap();
-    let edited = inspect_image(&edited_path).unwrap();
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    init_schema(&conn).unwrap();
-    let old = item(SourceKind::X, "x7", "已收录");
-    let current = item(SourceKind::X, "x8", "同平台另一帖");
-    record_work(
-        &conn,
-        &old,
-        std::slice::from_ref(&original),
-        WorkStatus::Published,
-    )
-    .unwrap();
-
-    let evaluation = evaluate_work(&conn, &current, &[edited]).unwrap();
-
-    assert!(matches!(evaluation.exact_action, ExactAction::None));
-    assert_eq!(evaluation.similar.len(), 1);
-    assert_eq!(evaluation.similar[0].existing_work.source_id, "x7");
+    remove_work(&conn, &work).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM image_fingerprints", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
 }
 
 #[test]
@@ -376,23 +182,6 @@ fn solid_colors_and_jpeg_noise_do_not_match_but_small_details_survive() {
             classify_similarity(&fingerprint, &fingerprint),
             MatchKind::Different
         );
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        record_work(
-            &conn,
-            &item(SourceKind::X, "solid", "solid"),
-            std::slice::from_ref(&fingerprint),
-            WorkStatus::Published,
-        )
-        .unwrap();
-        let result = evaluate_work(
-            &conn,
-            &item(SourceKind::Pixiv, "other", "other"),
-            &[fingerprint],
-        )
-        .unwrap();
-        assert!(result.similar.is_empty());
-        assert!(matches!(result.exact_action, ExactAction::None));
     }
     let path = dir.path().join("noise.png");
     let mut noisy = ImageBuffer::from_fn(100, 100, |x, y| Rgb([(x % 3) as u8, (y % 6) as u8, 0]));

@@ -1,5 +1,6 @@
 use hanabi::gallery_sync::{
-    catalog_media_url, import_catalog_image, needs_catalog_image, CatalogImageRecord,
+    catalog_media_url, fingerprint_upload_json, import_catalog_image, needs_catalog_image,
+    CatalogImageRecord,
 };
 use hanabi::image_dedup::{init_schema, ImageFingerprint, RegionFingerprint};
 use hanabi::model::SourceKind;
@@ -85,6 +86,14 @@ fn changed_catalog_image_updates_one_page_without_deleting_siblings() {
         .collect::<rusqlite::Result<_>>()
         .unwrap();
     assert_eq!(rows, vec![(0, "sha-c".into()), (1, "sha-b".into())]);
+}
+
+#[test]
+fn fingerprint_upload_uses_hex_hashes() {
+    let body = fingerprint_upload_json("pixiv/1.jpg", &fingerprint("sha-a"));
+    assert_eq!(body["r2_key"], "pixiv/1.jpg");
+    assert_eq!(body["average_hash"], "0000000000000001");
+    assert_eq!(body["regions"][0]["difference_hash"], "0000000000000004");
 }
 
 #[test]

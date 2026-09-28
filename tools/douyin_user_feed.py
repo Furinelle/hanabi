@@ -100,9 +100,28 @@ def _cookie_header() -> str:
         value = json.loads(raw)
     except json.JSONDecodeError:
         return raw
-    if not isinstance(value, dict):
-        raise RuntimeError("Cookie 文件 JSON 必须是 name -> value 对象")
-    return "; ".join(f"{key}={val}" for key, val in value.items())
+    if isinstance(value, dict):
+        # Playwright storage_state 格式: {"cookies": [...], "origins": [...]}
+        if "cookies" in value and isinstance(value["cookies"], list):
+            items = {
+                str(item["name"]): str(item["value"])
+                for item in value["cookies"]
+                if isinstance(item, dict) and "name" in item and "value" in item
+            }
+            return "; ".join(f"{k}={v}" for k, v in items.items())
+        return "; ".join(f"{key}={val}" for key, val in value.items())
+    if isinstance(value, list):
+        # Cookie-Editor / EditThisCookie 格式: [{"name": "...", "value": "..."}, ...]
+        items = {
+            str(item["name"]): str(item["value"])
+            for item in value
+            if isinstance(item, dict) and "name" in item and "value" in item
+        }
+        if items:
+            return "; ".join(f"{k}={v}" for k, v in items.items())
+    raise RuntimeError(
+        "Cookie 文件 JSON 必须是 name -> value 对象、cookie 列表或原始 Cookie 字符串"
+    )
 
 
 def _persist_browser_cookies(cookies: dict[str, Any]) -> None:
@@ -111,10 +130,19 @@ def _persist_browser_cookies(cookies: dict[str, Any]) -> None:
     if not cookie_file or not cookies:
         return
     path = Path(cookie_file).expanduser()
+    existing: dict[str, Any] = {}
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                existing = raw
+        except Exception:
+            pass
+    merged = {**existing, **cookies}
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp")
     tmp.write_text(
-        json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     try:
         os.chmod(tmp, 0o600)

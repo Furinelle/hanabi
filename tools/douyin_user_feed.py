@@ -995,16 +995,20 @@ async def _run(request: dict[str, Any]) -> dict[str, Any]:
             browser_used = True
             if cdp_url:
                 try:
-                    captured = await _browser_feed(
-                        cdp_url,
-                        sec_user_id,
-                        cookies,
-                        str(getattr(client, "headers", {}).get("User-Agent", "")),
-                        max_pages=max_pages,
-                    )
-                    if captured:
-                        _append_unique(all_items, seen, captured)
-                        restricted = False
+                    for attempt in range(2):
+                        captured = await _browser_feed(
+                            cdp_url,
+                            sec_user_id,
+                            cookies,
+                            str(getattr(client, "headers", {}).get("User-Agent", "")),
+                            max_pages=max_pages,
+                        )
+                        if captured:
+                            _append_unique(all_items, seen, captured)
+                            restricted = False
+                            break
+                        if attempt == 0:
+                            print("douyin browser feed empty; reopening browser once", file=sys.stderr)
                 except Exception as exc:
                     print(f"douyin cdp browser feed failed: {type(exc).__name__}: {exc}", file=sys.stderr)
             elif browser_enabled:

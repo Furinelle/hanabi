@@ -327,14 +327,15 @@ class BridgeFeedTest(unittest.IsolatedAsyncioTestCase):
                 raise AssertionError("configured CDP must skip post HTTP")
 
         upstream = (Client, lambda _: {}, lambda _: False, lambda value: value)
-        for captured in ([first, second], []):
-            with self.subTest(exhausted=not captured), patch.object(
+        for responses in (([first, second],), ([], [first, second]), ([], []), (RuntimeError("Oracle 抖音浏览器需要人工验证"),)):
+            succeeds = isinstance(responses[-1], list) and bool(responses[-1])
+            with self.subTest(responses=responses), patch.object(
                 MODULE, "_load_upstream", return_value=upstream
             ), patch.object(MODULE, "_cookie_header", return_value=""), patch.object(
                 MODULE, "os", types.SimpleNamespace(environ={"HANABI_DOUYIN_CDP_URL": "ws://fake"})
-            ), patch.object(MODULE, "_browser_feed", new_callable=AsyncMock, return_value=captured) as browser:
+            ), patch.object(MODULE, "_browser_feed", new_callable=AsyncMock, side_effect=responses) as browser:
                 request = {"target": "https://www.douyin.com/user/fake_author", "known_ids": ["1"]}
-                if captured:
+                if succeeds:
                     result = await MODULE._run(request)
                     self.assertEqual(result["items"], [second])
                     self.assertTrue(result["browser_fallback_used"])
@@ -342,7 +343,8 @@ class BridgeFeedTest(unittest.IsolatedAsyncioTestCase):
                 else:
                     with self.assertRaisesRegex(RuntimeError, "浏览器兜底没有取得作品"):
                         await MODULE._run(request)
-                browser.assert_awaited_once_with("ws://fake", "fake_author", {}, "fake_UA", max_pages=3)
+                self.assertEqual(browser.await_count, len(responses))
+                browser.assert_has_awaits([call("ws://fake", "fake_author", {}, "fake_UA", max_pages=3)] * len(responses))
                 self.assertEqual(http_calls, [])
 
     async def test_without_cdp_api_paginates_and_403_is_not_success(self):

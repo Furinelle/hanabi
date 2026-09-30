@@ -59,7 +59,7 @@
 export HANABI_DOUYIN_COOKIE='sessionid=...; ttwid=...; msToken=...'
 # 或指定 Cookie 文件路径（默认 .douyin-cookies.json，权限自动设为 600）：
 export HANABI_DOUYIN_COOKIE_FILE=/root/hanabi/.douyin-cookies.json
-# 可选：详情 API 风控时复用内网 CDP 浏览器（禁止暴露到公网）
+# 可选：复用内网 CDP 浏览器；作者主页优先走网页 SDK，详情解析失败时兜底（禁止暴露到公网）
 export HANABI_DOUYIN_CDP_URL='ws://browser:3000'
 ```
 

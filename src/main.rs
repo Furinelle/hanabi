@@ -587,7 +587,7 @@ async fn handle_douyin(
                 sink.delete_review_messages(&[job.user_msg_id]).await;
                 sink.edit_review_text(
                     job.notice_msg_id,
-                    &failure_notice("ℹ️ 抖音作者主页解析失败(可能需刷新 Cookie)", &job.url),
+                    &failure_notice("ℹ️ 抖音作者主页解析失败", &job.url),
                 )
                 .await;
                 return Ok(());

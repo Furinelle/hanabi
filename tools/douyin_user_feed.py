@@ -809,18 +809,19 @@ async def _browser_feed(
                         else:
                             empty_responses += 1
 
-                # Refresh cookies if any
-                with contextlib.suppress(Exception):
-                    refreshed = await command(
-                        "Network.getAllCookies", session_id=target_session
-                    )
-                    _persist_browser_cookies(
-                        {
-                            cookie["name"]: cookie["value"]
-                            for cookie in refreshed.get("cookies", [])
-                            if cookie.get("name") and cookie.get("value")
-                        }
-                    )
+                # 只有实际取得作品，才让网页会话更新持久 Cookie。
+                if items:
+                    with contextlib.suppress(Exception):
+                        refreshed = await command(
+                            "Network.getAllCookies", session_id=target_session
+                        )
+                        _persist_browser_cookies(
+                            {
+                                cookie["name"]: cookie["value"]
+                                for cookie in refreshed.get("cookies", [])
+                                if cookie.get("name") and cookie.get("value")
+                            }
+                        )
 
                 if not items:
                     statuses = ",".join(map(str, sorted(response_statuses))) or "none"
@@ -889,7 +890,9 @@ async def _run(request: dict[str, Any]) -> dict[str, Any]:
 
     async with DouyinAPIClient(cookies) as client:
         if is_short_url(target):
-            resolved = await client.resolve_short_url(normalize_short_url(target))
+            # 分享短链只需匿名展开，避免将登录 Cookie 发送给跳转链上的域名。
+            async with DouyinAPIClient({}) as resolver:
+                resolved = await resolver.resolve_short_url(normalize_short_url(target))
             if not resolved:
                 raise RuntimeError("抖音短链解析失败")
             resolved_url = resolved
@@ -946,43 +949,48 @@ async def _run(request: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError(f"链接没有解析为作者主页: {resolved_url.split('?', 1)[0]}")
         sec_user_id = match.group(1)
 
-        try:
-            profile = await client.get_user_info(sec_user_id)
-        except Exception:
-            profile = None
-        if isinstance(profile, dict):
-            try:
-                expected_count = max(0, int(profile.get("aweme_count") or 0))
-            except (TypeError, ValueError):
-                expected_count = 0
-
-        cursor = 0
-        for _ in range(max_pages):
-            try:
-                page = await client.get_user_post(sec_user_id, max_cursor=cursor, count=20)
-            except Exception as exc:
-                print(f"douyin direct get_user_post error: {exc}", file=sys.stderr)
-                restricted = True
-                break
-            pages_fetched += 1
-            page_items = page.get("items") or page.get("aweme_list") or []
-            if not isinstance(page_items, list) or not page_items:
-                restricted = bool(page.get("has_more")) or pages_fetched == 1
-                break
-            _append_unique(all_items, seen, page_items)
-
-            if not bool(page.get("has_more")):
-                break
-            try:
-                next_cursor = int(page.get("max_cursor") or 0)
-            except (TypeError, ValueError):
-                next_cursor = 0
-            if next_cursor == cursor:
-                restricted = True
-                break
-            cursor = next_cursor
-
         cdp_url = os.environ.get("HANABI_DOUYIN_CDP_URL", "").strip()
+        # 作者作品接口要求网页 SDK 签名；已配置 CDP 时直接在网页读取作品。
+        if not cdp_url:
+            try:
+                profile = await client.get_user_info(sec_user_id)
+            except Exception:
+                profile = None
+            if isinstance(profile, dict):
+                try:
+                    expected_count = max(0, int(profile.get("aweme_count") or 0))
+                except (TypeError, ValueError):
+                    expected_count = 0
+
+            cursor = 0
+            for _ in range(max_pages):
+                try:
+                    page = await client.get_user_post(sec_user_id, max_cursor=cursor, count=20)
+                except Exception as exc:
+                    print(f"douyin direct get_user_post error: {exc}", file=sys.stderr)
+                    restricted = True
+                    break
+                pages_fetched += 1
+                page_items = page.get("items") or page.get("aweme_list") or []
+                if not isinstance(page_items, list) or not page_items:
+                    restricted = bool(page.get("has_more")) or pages_fetched == 1
+                    break
+                _append_unique(all_items, seen, page_items)
+
+                if not bool(page.get("has_more")):
+                    break
+                try:
+                    next_cursor = int(page.get("max_cursor") or 0)
+                except (TypeError, ValueError):
+                    next_cursor = 0
+                if next_cursor == cursor:
+                    restricted = True
+                    break
+                cursor = next_cursor
+
+        else:
+            restricted = True
+
         if (restricted or not all_items) and (browser_enabled or cdp_url):
             browser_used = True
             if cdp_url:
@@ -1050,7 +1058,7 @@ async def _run(request: dict[str, Any]) -> dict[str, Any]:
         if not all_items and (restricted or expected_count > 0):
             suffix = "；浏览器兜底没有取得作品" if browser_used else ""
             raise RuntimeError(
-                "作者作品接口返回空列表，可能是 Cookie/签名失效或触发验证" + suffix
+                "作者主页未返回作品，可能页面加载失败或触发验证" + suffix
             )
 
     # Rust/SQLite 再做一次最终幂等；这里先过滤旧 id，减少跨进程 JSON 与解析开销。

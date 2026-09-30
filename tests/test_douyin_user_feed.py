@@ -1,12 +1,11 @@
 import asyncio
 import importlib.util
 import json
-import os
 import sys
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 
 SPEC = importlib.util.spec_from_file_location(
@@ -96,6 +95,7 @@ class FakeCDP:
             "Target.createTarget": {"targetId": "target"},
             "Target.attachToTarget": {"sessionId": "session"},
             "Runtime.evaluate": {"result": {"value": self.challenge}},
+            "Network.getAllCookies": {"cookies": [{"name": "ttwid", "value": "fake_ttwid"}]},
         }.get(method, {})
         response = {"id": message["id"], "result": result}
         if method == "Network.getResponseBody":
@@ -148,8 +148,13 @@ class BrowserFeedTest(unittest.IsolatedAsyncioTestCase):
         )
         with patch.dict(sys.modules, aiohttp=aiohttp), patch.object(
             MODULE, "time", socket.clock
-        ), patch.object(MODULE, "asyncio", async_api), patch.object(MODULE, "_persist_browser_cookies"):
-            return await MODULE._browser_feed("ws://fake", "fake_author", {}, "fake_UA", max_pages=max_pages)
+        ), patch.object(MODULE, "asyncio", async_api), patch.object(MODULE, "_persist_browser_cookies") as persist:
+            items = await MODULE._browser_feed("ws://fake", "fake_author", {}, "fake_UA", max_pages=max_pages)
+            if items:
+                persist.assert_called_once_with({"ttwid": "fake_ttwid"})
+            else:
+                persist.assert_not_called()
+            return items
 
     def assert_cleaned(self, socket):
         methods = [method for _, method, _ in socket.commands]
@@ -268,8 +273,38 @@ class BrowserFeedTest(unittest.IsolatedAsyncioTestCase):
 
 
 class BridgeFeedTest(unittest.IsolatedAsyncioTestCase):
-    async def test_direct_403_uses_cdp_filters_known_ids_and_reports_exhaustion(self):
+    async def test_short_link_resolution_is_anonymous_and_cdp_keeps_author_cookies(self):
+        cookies = {"fake_session": "fake_value"}
+        item = {"aweme_id": "1"}
+        short_url = "https://v.douyin.com/fake/"
+        author_url = "https://www.douyin.com/user/fake_author"
+        main, resolver = MagicMock(), MagicMock()
+        for client in (main, resolver):
+            client.__aenter__.return_value = client
+            client.__aexit__.return_value = None
+        main.headers = {"User-Agent": "fake_UA"}
+        main.resolve_short_url = AsyncMock(side_effect=AssertionError("authenticated client must not resolve"))
+        resolver.resolve_short_url = AsyncMock(return_value=author_url)
+        factory = MagicMock(side_effect=[main, resolver])
+        upstream = (factory, lambda _: cookies, lambda url: url == short_url, lambda url: url)
+        with patch.object(MODULE, "_load_upstream", return_value=upstream), patch.object(
+            MODULE, "_cookie_header", return_value="fake_header"
+        ), patch.object(
+            MODULE, "os", types.SimpleNamespace(environ={"HANABI_DOUYIN_CDP_URL": "ws://fake"})
+        ), patch.object(MODULE, "_browser_feed", new_callable=AsyncMock, return_value=[item]) as browser:
+            result = await MODULE._run({"target": short_url})
+        self.assertEqual(result["items"], [item])
+        self.assertEqual(factory.call_args_list, [call(cookies), call({})])
+        main.resolve_short_url.assert_not_awaited()
+        resolver.resolve_short_url.assert_awaited_once_with(short_url)
+        browser.assert_awaited_once_with("ws://fake", "fake_author", cookies, "fake_UA", max_pages=3)
+        self.assertIs(browser.await_args.args[2], cookies)
+        for client in (main, resolver):
+            client.__aexit__.assert_awaited_once()
+
+    async def test_configured_cdp_skips_http_filters_known_ids_and_reports_exhaustion(self):
         first, second = {"aweme_id": "1"}, {"aweme_id": "2"}
+        http_calls = []
 
         class Client:
             headers = {"User-Agent": "fake_UA"}
@@ -284,17 +319,19 @@ class BridgeFeedTest(unittest.IsolatedAsyncioTestCase):
                 pass
 
             async def get_user_info(self, _):
-                return {"aweme_count": 2}
+                http_calls.append("profile")
+                raise AssertionError("configured CDP must skip profile HTTP")
 
             async def get_user_post(self, *_args, **_kwargs):
-                raise RuntimeError("HTTP 403")
+                http_calls.append("post")
+                raise AssertionError("configured CDP must skip post HTTP")
 
         upstream = (Client, lambda _: {}, lambda _: False, lambda value: value)
         for captured in ([first, second], []):
             with self.subTest(exhausted=not captured), patch.object(
                 MODULE, "_load_upstream", return_value=upstream
-            ), patch.object(MODULE, "_cookie_header", return_value=""), patch.dict(
-                os.environ, {"HANABI_DOUYIN_CDP_URL": "ws://fake"}
+            ), patch.object(MODULE, "_cookie_header", return_value=""), patch.object(
+                MODULE, "os", types.SimpleNamespace(environ={"HANABI_DOUYIN_CDP_URL": "ws://fake"})
             ), patch.object(MODULE, "_browser_feed", new_callable=AsyncMock, return_value=captured) as browser:
                 request = {"target": "https://www.douyin.com/user/fake_author", "known_ids": ["1"]}
                 if captured:
@@ -306,6 +343,55 @@ class BridgeFeedTest(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaisesRegex(RuntimeError, "浏览器兜底没有取得作品"):
                         await MODULE._run(request)
                 browser.assert_awaited_once_with("ws://fake", "fake_author", {}, "fake_UA", max_pages=3)
+                self.assertEqual(http_calls, [])
+
+    async def test_without_cdp_api_paginates_and_403_is_not_success(self):
+        first, second = {"aweme_id": "1"}, {"aweme_id": "2"}
+        cursors = []
+
+        class Client:
+            def __init__(self, cookies):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                pass
+
+            async def get_user_info(self, _):
+                return {"aweme_count": 2}
+
+            async def get_user_post(self, _, max_cursor, count):
+                cursors.append(max_cursor)
+                if blocked:
+                    raise RuntimeError("HTTP 403")
+                return {
+                    "items": [first if max_cursor == 0 else second],
+                    "has_more": max_cursor == 0, "max_cursor": 1,
+                }
+
+        upstream = (Client, lambda _: {}, lambda _: False, lambda value: value)
+        for blocked in (False, True):
+            cursors.clear()
+            with self.subTest(blocked=blocked), patch.object(
+                MODULE, "_load_upstream", return_value=upstream
+            ), patch.object(MODULE, "_cookie_header", return_value=""), patch.object(
+                MODULE, "os", types.SimpleNamespace(environ={})
+            ), patch.object(MODULE, "_browser_feed", new_callable=AsyncMock) as browser:
+                request = {"target": "https://www.douyin.com/user/fake_author"}
+                if blocked:
+                    with self.assertRaisesRegex(RuntimeError, "作者主页未返回作品"):
+                        await MODULE._run(request)
+                    self.assertEqual(cursors, [0])
+                else:
+                    result = await MODULE._run(request)
+                    self.assertEqual(result["items"], [first, second])
+                    self.assertEqual(result["pages_fetched"], 2)
+                    self.assertFalse(result["browser_fallback_used"])
+                    self.assertFalse(result["restricted"])
+                    self.assertEqual(cursors, [0, 1])
+                browser.assert_not_awaited()
 
 
 if __name__ == "__main__":

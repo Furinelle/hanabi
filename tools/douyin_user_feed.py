@@ -697,10 +697,15 @@ async def _browser_feed(
                 items: list[dict[str, Any]] = []
                 seen_ids: set[str] = set()
                 deadline = time.monotonic() + 30
+                reload_at = time.monotonic() + 15
+                reloaded = False
                 last_scroll = time.monotonic()
                 pages_done = 0
 
                 while time.monotonic() < deadline:
+                    if not items and not reloaded and time.monotonic() >= reload_at:
+                        await command("Page.reload", session_id=target_session)
+                        reloaded = True
                     try:
                         event = await asyncio.wait_for(
                             events.get(),

@@ -623,6 +623,7 @@ async def _browser_feed(
                 method: str,
                 params: dict[str, Any] | None = None,
                 session_id: str | None = None,
+                timeout: float = 15,
             ) -> dict[str, Any]:
                 nonlocal next_id
                 next_id += 1
@@ -636,7 +637,7 @@ async def _browser_feed(
                 future = asyncio.get_running_loop().create_future()
                 pending[next_id] = future
                 await ws.send_json(message)
-                response = await asyncio.wait_for(future, 15)
+                response = await asyncio.wait_for(future, timeout)
                 if "error" in response:
                     raise RuntimeError(
                         f"CDP {method} 失败: {response['error'].get('message', 'unknown')}"
@@ -708,23 +709,35 @@ async def _browser_feed(
 
                 while time.monotonic() < deadline:
                     if not items and not reloaded and time.monotonic() >= reload_at:
-                        await command("Page.reload", session_id=target_session)
                         reloaded = True
+                        with contextlib.suppress(RuntimeError, TimeoutError):
+                            await command(
+                                "Page.reload",
+                                session_id=target_session,
+                                timeout=max(0.01, min(15, deadline - time.monotonic())),
+                            )
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
                     try:
                         event = await asyncio.wait_for(
                             events.get(),
-                            max(0.01, min(0.5, deadline - time.monotonic())),
+                            min(0.5, remaining),
                         )
                     except TimeoutError:
                         if items and pages_done >= max_pages:
                             break
                         if items and time.monotonic() - last_scroll > 4:
                             if pages_done < max_pages:
-                                await command(
-                                    "Runtime.evaluate",
-                                    {"expression": "window.scrollTo(0, document.body.scrollHeight)"},
-                                    target_session,
-                                )
+                                try:
+                                    await command(
+                                        "Runtime.evaluate",
+                                        {"expression": "window.scrollTo(0, document.body.scrollHeight)"},
+                                        target_session,
+                                        timeout=max(0.01, min(15, deadline - time.monotonic())),
+                                    )
+                                except (RuntimeError, TimeoutError):
+                                    break
                                 last_scroll = time.monotonic()
                         continue
 
@@ -755,13 +768,11 @@ async def _browser_feed(
                         if remaining <= 0:
                             break
                         try:
-                            body = await asyncio.wait_for(
-                                command(
-                                    "Network.getResponseBody",
-                                    {"requestId": request_id},
-                                    target_session,
-                                ),
-                                min(15, remaining),
+                            body = await command(
+                                "Network.getResponseBody",
+                                {"requestId": request_id},
+                                target_session,
+                                timeout=min(15, remaining),
                             )
                         except (RuntimeError, TimeoutError):
                             body_failures += 1
@@ -775,7 +786,16 @@ async def _browser_feed(
                         except Exception:
                             data = None
                         if isinstance(data, dict):
-                            aweme_list = data.get("aweme_list") or data.get("cards") or []
+                            aweme_list = data.get("aweme_list")
+                            if aweme_list is None:
+                                aweme_list = data.get("cards")
+                            if (
+                                not isinstance(aweme_list, list)
+                                or data.get("status_code", 0) != 0
+                                or (aweme_list and not any(_aweme_id(it) for it in aweme_list))
+                            ):
+                                empty_responses += 1
+                                continue
                             before_count = len(items)
                             _append_unique(items, seen_ids, aweme_list)
                             if items and data.get("has_more") in (False, 0):

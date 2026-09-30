@@ -694,6 +694,10 @@ async def _browser_feed(
                 )
 
                 wanted_requests: set[str] = set()
+                completed_requests: set[str] = set()
+                response_statuses: set[int] = set()
+                empty_responses = 0
+                body_failures = 0
                 items: list[dict[str, Any]] = []
                 seen_ids: set[str] = set()
                 deadline = time.monotonic() + 30
@@ -709,7 +713,7 @@ async def _browser_feed(
                     try:
                         event = await asyncio.wait_for(
                             events.get(),
-                            0.5,
+                            max(0.01, min(0.5, deadline - time.monotonic())),
                         )
                     except TimeoutError:
                         if items and pages_done >= max_pages:
@@ -722,7 +726,6 @@ async def _browser_feed(
                                     target_session,
                                 )
                                 last_scroll = time.monotonic()
-                                pages_done += 1
                         continue
 
                     if event.get("sessionId") != target_session:
@@ -735,18 +738,34 @@ async def _browser_feed(
                         if (
                             _is_douyin_domain(parsed.hostname)
                             and "/aweme/v1/web/aweme/post/" in parsed.path
-                            and int(response.get("status", 0)) == 200
                         ):
-                            wanted_requests.add(str(params.get("requestId", "")))
+                            status = int(response.get("status", 0))
+                            response_statuses.add(status)
+                            request_id = str(params.get("requestId", ""))
+                            if status == 200 and request_id not in completed_requests:
+                                wanted_requests.add(request_id)
                     elif (
                         method == "Network.loadingFinished"
                         and str(params.get("requestId", "")) in wanted_requests
                     ):
-                        body = await command(
-                            "Network.getResponseBody",
-                            {"requestId": params["requestId"]},
-                            target_session,
-                        )
+                        request_id = str(params["requestId"])
+                        wanted_requests.discard(request_id)
+                        completed_requests.add(request_id)
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        try:
+                            body = await asyncio.wait_for(
+                                command(
+                                    "Network.getResponseBody",
+                                    {"requestId": request_id},
+                                    target_session,
+                                ),
+                                min(15, remaining),
+                            )
+                        except (RuntimeError, TimeoutError):
+                            body_failures += 1
+                            continue
                         raw = body.get("body", "")
                         if body.get("base64Encoded"):
                             with contextlib.suppress(Exception):
@@ -757,15 +776,18 @@ async def _browser_feed(
                             data = None
                         if isinstance(data, dict):
                             aweme_list = data.get("aweme_list") or data.get("cards") or []
-                            for it in aweme_list:
-                                if isinstance(it, dict):
-                                    aid = _aweme_id(it)
-                                    if aid and aid not in seen_ids:
-                                        seen_ids.add(aid)
-                                        items.append(it)
+                            before_count = len(items)
+                            _append_unique(items, seen_ids, aweme_list)
+                            if items and data.get("has_more") in (False, 0):
+                                break
+                            if len(items) == before_count:
+                                empty_responses += 1
+                                continue
                             pages_done += 1
                             if pages_done >= max_pages:
                                 break
+                        else:
+                            empty_responses += 1
 
                 # Refresh cookies if any
                 with contextlib.suppress(Exception):
@@ -781,6 +803,13 @@ async def _browser_feed(
                     )
 
                 if not items:
+                    statuses = ",".join(map(str, sorted(response_statuses))) or "none"
+                    print(
+                        f"douyin browser feed empty: statuses={statuses} "
+                        f"empty_responses={empty_responses} body_failures={body_failures} "
+                        f"reloads={int(reloaded)}",
+                        file=sys.stderr,
+                    )
                     blocked = await command(
                         "Runtime.evaluate",
                         {

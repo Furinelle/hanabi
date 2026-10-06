@@ -33,9 +33,30 @@ impl Store {
                  source_id   TEXT NOT NULL,
                  pushed_at   INTEGER NOT NULL,
                  PRIMARY KEY (source_kind, source_id)
+             );
+             CREATE TABLE IF NOT EXISTS douyin_subscriptions (
+                 profile_url TEXT PRIMARY KEY,
+                 shared_url TEXT NOT NULL
              );",
         )?;
         Ok(())
+    }
+
+    pub fn subscribe_douyin(&self, profile_url: &str, shared_url: &str) -> Result<bool> {
+        let profile_url = crate::source::douyin::canonical_user_profile(profile_url)
+            .ok_or_else(|| anyhow::anyhow!("不是有效的抖音作者主页"))?;
+        Ok(self.conn.execute(
+            "INSERT OR IGNORE INTO douyin_subscriptions (profile_url, shared_url) VALUES (?1, ?2)",
+            params![profile_url, shared_url],
+        )? > 0)
+    }
+
+    pub fn douyin_subscriptions(&self) -> Result<Vec<(String, String)>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT profile_url, shared_url FROM douyin_subscriptions ORDER BY rowid")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn already_pushed(&self, item: &MediaItem) -> Result<bool> {
@@ -123,5 +144,36 @@ mod tests {
         store.mark_pushed(&it).unwrap();
         store.mark_pushed(&it).unwrap();
         assert!(store.already_pushed(&it).unwrap());
+    }
+    #[test]
+    fn douyin_subscriptions_survive_reopen_and_deduplicate_cards() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("subscriptions.db");
+        let profile = "https://www.douyin.com/user/MS4wTEST";
+        {
+            let store = Store::open(path.to_str().unwrap()).unwrap();
+            assert!(store
+                .subscribe_douyin(
+                    "https://www.iesdouyin.com/share/user/MS4wTEST/?share=1",
+                    "https://v.douyin.com/card1/",
+                )
+                .unwrap());
+            assert!(!store
+                .subscribe_douyin(profile, "https://v.douyin.com/card2/")
+                .unwrap());
+            for invalid in [
+                "https://www.douyin.com/note/123",
+                "https://evil.example/user/MS4wTEST",
+                "https://www.douyin.com/user/",
+                "https://www.douyin.com/user/MS4wTEST/extra",
+            ] {
+                assert!(store.subscribe_douyin(invalid, invalid).is_err());
+            }
+        }
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            store.douyin_subscriptions().unwrap(),
+            vec![(profile.into(), "https://v.douyin.com/card1/".into())]
+        );
     }
 }

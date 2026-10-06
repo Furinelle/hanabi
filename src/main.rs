@@ -166,29 +166,7 @@ async fn main() -> Result<()> {
 
     let x_size = cfg.x_image.size.clone();
     let douyin_runtime = cfg.douyin.clone();
-    // kind 白名单:拼错时旧逻辑静默按 X 源解析 pixiv 输出,恒 0 命中且无提示;
-    // 启动即报错,尽早暴露配置问题。
-    let mut sources: Vec<Box<dyn Source>> = Vec::new();
-    for s in &cfg.sources {
-        match s.kind.as_str() {
-            "pixiv_user" | "pixiv_bookmarks" | "pixiv_ranking" => {
-                sources.push(Box::new(PixivSource::new(s.clone(), gdl.clone())));
-            }
-            "x_list" | "x_foryou" => {
-                sources.push(Box::new(XSource::new(s.clone(), gdl.clone())));
-            }
-            "douyin_user" => {
-                sources.push(Box::new(DouyinUserSource::new(
-                    s.clone(),
-                    cfg.douyin.clone(),
-                )?));
-            }
-            other => anyhow::bail!(
-                "源 {} 的 kind 无效: {other}(可选: pixiv_user | pixiv_bookmarks | pixiv_ranking | x_list | x_foryou | douyin_user)",
-                s.name
-            ),
-        }
-    }
+    let sources = build_sources(&cfg, &gdl, &store)?;
 
     // 下载闭包:复用 download_work。x_size 克隆给闭包,原值留给手动链接(handle_link)。
     // gallery-dl 是同步子进程等待,包 spawn_blocking 不占 tokio worker
@@ -230,17 +208,24 @@ async fn main() -> Result<()> {
     let inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
         Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
-    // 启动立即跑首轮。
-    if let Err(e) = run_once(
-        &store,
-        &sources,
-        &chain,
-        sink.as_ref() as &dyn Sink,
-        &download,
-    )
-    .await
+    // ponytail: serialize scheduled rounds and manual Douyin batches to protect shared
+    // download paths and approval dedup; use per-author locks if waiting becomes material.
+    let douyin_gate = Arc::new(tokio::sync::Mutex::new(()));
+
     {
-        tracing::error!(error = %e, "本轮异常");
+        let _guard = douyin_gate.lock().await;
+        // 启动立即跑首轮。
+        if let Err(e) = run_once(
+            &store,
+            &sources,
+            &chain,
+            sink.as_ref() as &dyn Sink,
+            &download,
+        )
+        .await
+        {
+            tracing::error!(error = %e, "本轮异常");
+        }
     }
     loop {
         let now_unix = std::time::SystemTime::now()
@@ -268,6 +253,7 @@ async fn main() -> Result<()> {
                 let x_size = x_size.clone();
                 let douyin_runtime = douyin_runtime.clone();
                 let inflight = inflight.clone();
+                let douyin_gate = douyin_gate.clone();
                 tokio::spawn(async move {
                     let url = job.url.clone();
                     let notice_id = job.notice_msg_id;
@@ -282,6 +268,11 @@ async fn main() -> Result<()> {
                     let _guard = InflightGuard {
                         set: inflight.clone(),
                         url: url.clone(),
+                    };
+                    let _douyin_guard = if hanabi::source::douyin::is_douyin_url(&url) {
+                        Some(douyin_gate.lock().await)
+                    } else {
+                        None
                     };
                     if let Err(e) = handle_link(
                         job,
@@ -312,6 +303,8 @@ async fn main() -> Result<()> {
             }
         };
         if do_fetch {
+            let _guard = douyin_gate.lock().await;
+            let sources = build_sources(&cfg, &gdl, &store)?;
             if let Err(e) = run_once(
                 &store,
                 &sources,
@@ -325,6 +318,62 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+/// 每轮重读持久订阅，新名片无需重启即可跟随配置源一起抓取。
+fn build_sources(
+    cfg: &Config,
+    gdl: &Arc<GalleryDl>,
+    store: &Store,
+) -> Result<Vec<Box<dyn Source>>> {
+    let mut sources: Vec<Box<dyn Source>> = Vec::new();
+    let mut configs = cfg.sources.clone();
+    for (profile_url, shared_url) in store.douyin_subscriptions()? {
+        if configs.iter().any(|source| {
+            source.kind == "douyin_user"
+                && source.targets.iter().any(|target| {
+                    target == &profile_url
+                        || target == &shared_url
+                        || hanabi::source::douyin::canonical_user_profile(target).as_ref()
+                            == Some(&profile_url)
+                })
+        }) {
+            continue;
+        }
+        configs.push(hanabi::config::SourceCfg {
+            name: format!(
+                "douyin_subscription_{}",
+                profile_url.rsplit('/').next().unwrap_or_default()
+            ),
+            kind: "douyin_user".into(),
+            targets: vec![profile_url],
+            filters: hanabi::config::SourceFilterCfg {
+                require_media: true,
+                ..Default::default()
+            },
+        });
+    }
+    for s in &configs {
+        match s.kind.as_str() {
+            "pixiv_user" | "pixiv_bookmarks" | "pixiv_ranking" => {
+                sources.push(Box::new(PixivSource::new(s.clone(), gdl.clone())));
+            }
+            "x_list" | "x_foryou" => {
+                sources.push(Box::new(XSource::new(s.clone(), gdl.clone())));
+            }
+            "douyin_user" => {
+                sources.push(Box::new(DouyinUserSource::new(
+                    s.clone(),
+                    cfg.douyin.clone(),
+                )?));
+            }
+            other => anyhow::bail!(
+                "源 {} 的 kind 无效: {other}(可选: pixiv_user | pixiv_bookmarks | pixiv_ranking | x_list | x_foryou | douyin_user)",
+                s.name
+            ),
+        }
+    }
+    Ok(sources)
 }
 
 /// 处理手动发来的作品链接:probe + 解析 + 下载,直接发布到频道(跳过审批)。
@@ -533,13 +582,15 @@ async fn handle_douyin_user(
     if failed > 0 {
         sink.edit_review_text(
             job.notice_msg_id,
-            &format!(
-                "⚠️ {failed} 个作品下载/投递失败(本次进审批 {delivered} 个);失败项未入库,可重发链接重试"
-            ),
+            &format!("✅ 作者已加入定时抓取；本次送审 {delivered} 个，失败 {failed} 个，下轮重试"),
         )
         .await;
     } else {
-        sink.delete_review_messages(&[job.notice_msg_id]).await;
+        sink.edit_review_text(
+            job.notice_msg_id,
+            &format!("✅ 作者已加入定时抓取；本次送审 {delivered} 个作品"),
+        )
+        .await;
     }
     Ok(())
 }
@@ -567,19 +618,21 @@ async fn handle_douyin(
 
     // 明确落到作者主页时直接走作者桥；既避免 note 页三次无效解析，也避免 Python
     // 再解析一遍短链时遇到偶发超时。
-    if resolved_url
-        .as_ref()
-        .is_some_and(douyin::is_user_profile_url)
-    {
-        match douyin::fetch_user_feed(runtime, resolved_target, "manual").await {
-            Ok(items) if !items.is_empty() => {
+    if let Some(profile_url) = douyin::canonical_user_profile(resolved_target) {
+        store.subscribe_douyin(&profile_url, &job.url)?;
+        match douyin::fetch_user_feed(runtime, &profile_url, "manual").await {
+            Ok(feed) if !feed.items.is_empty() => {
+                let items = feed.items;
                 tracing::info!(items = items.len(), "手动抖音作者主页解析成功,进入批量审批");
                 return handle_douyin_user(job, items, store, &client, sink).await;
             }
             Ok(_) => {
                 sink.delete_review_messages(&[job.user_msg_id]).await;
-                sink.edit_review_text(job.notice_msg_id, "ℹ️ 该作者主页没有可用图文作品")
-                    .await;
+                sink.edit_review_text(
+                    job.notice_msg_id,
+                    "✅ 作者已加入定时抓取；本次没有新的图文作品",
+                )
+                .await;
                 return Ok(());
             }
             Err(error) => {
@@ -587,7 +640,7 @@ async fn handle_douyin(
                 sink.delete_review_messages(&[job.user_msg_id]).await;
                 sink.edit_review_text(
                     job.notice_msg_id,
-                    &failure_notice("ℹ️ 抖音作者主页解析失败", &job.url),
+                    &failure_notice("✅ 作者已加入定时抓取；本次抓取失败，下轮重试", &job.url),
                 )
                 .await;
                 return Ok(());
@@ -678,15 +731,21 @@ async fn handle_douyin(
             }
             // 作者短链若预解析失败,再判一次主页桥。
             match douyin::fetch_user_feed(runtime, &job.url, "manual").await {
-                Ok(items) if !items.is_empty() => {
+                Ok(feed) if !feed.items.is_empty() => {
+                    store.subscribe_douyin(&feed.profile_url, &job.url)?;
+                    let items = feed.items;
                     tracing::info!(items = items.len(), "手动抖音作者主页解析成功,进入批量审批");
                     handle_douyin_user(job, items, store, &client, sink).await?;
                 }
-                Ok(_) => {
+                Ok(feed) => {
+                    store.subscribe_douyin(&feed.profile_url, &job.url)?;
                     tracing::warn!(error = %note_error, "抖音作者主页没有可用图文作品");
                     sink.delete_review_messages(&[job.user_msg_id]).await;
-                    sink.edit_review_text(job.notice_msg_id, "ℹ️ 该作者主页没有可用图文作品")
-                        .await;
+                    sink.edit_review_text(
+                        job.notice_msg_id,
+                        "✅ 作者已加入定时抓取；本次没有新的图文作品",
+                    )
+                    .await;
                 }
                 Err(user_error) => {
                     tracing::warn!(note_error = %note_error, user_error = %user_error, "抖音解析失败");
@@ -705,7 +764,7 @@ async fn handle_douyin(
 
 #[cfg(test)]
 mod tests {
-    use super::{douyin_download_complete, failure_notice, secs_until_next_slot};
+    use super::*;
 
     #[test]
     fn slot_aligns_to_interval_in_local_tz() {
@@ -732,5 +791,94 @@ mod tests {
             failure_notice("ℹ️ 解析失败", "https://v.douyin.com/original/"),
             "ℹ️ 解析失败\n原链接: https://v.douyin.com/original/"
         );
+    }
+    #[tokio::test]
+    async fn new_subscriptions_join_next_round_and_keep_work_dedup() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("feed.py");
+        std::fs::write(
+            &helper,
+            r#"
+import json, sys
+request = json.load(sys.stdin)
+id = request['target'].rsplit('/', 1)[-1]
+if id == 'MS4wFAIL':
+    sys.exit(1)
+items = [] if id == 'MS4wEMPTY' else [{
+    'aweme_id': '7600000000000000001',
+    'author': {'nickname': 'Artist', 'sec_uid': id},
+    'images': [{'url_list': ['https://images.example/one.jpg']}]}
+]
+json.dump({'resolved_url': request['target'], 'sec_user_id': id, 'items': items}, sys.stdout)
+"#,
+        )
+        .unwrap();
+        let mut cfg: Config = toml::from_str(
+            r#"
+poll_interval_secs = 28800
+[telegram]
+channel_id = "1"
+[gallery_dl]
+config_path = "unused"
+[[source]]
+name = "pixiv_existing"
+kind = "pixiv_user"
+targets = []
+[[source]]
+name = "x_existing"
+kind = "x_list"
+targets = []
+"#,
+        )
+        .unwrap();
+        cfg.douyin.python_command = "python3".into();
+        cfg.douyin.helper_path = helper.to_string_lossy().into_owned();
+        cfg.douyin.cookie_file.clear();
+        let gdl = Arc::new(GalleryDl {
+            config_path: "unused".into(),
+            probe_range: "1-20".into(),
+        });
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(build_sources(&cfg, &gdl, &store).unwrap().len(), 2);
+        // Empty/failing authors stay subscribed and cannot stop the following author.
+        for id in ["MS4wFAIL", "MS4wEMPTY", "MS4wTEST"] {
+            let url = format!("https://www.douyin.com/user/{id}");
+            store.subscribe_douyin(&url, &url).unwrap();
+        }
+        let sources = build_sources(&cfg, &gdl, &store).unwrap();
+        assert_eq!(sources.len(), 5);
+        assert_eq!(sources[0].name(), "pixiv_existing");
+        assert_eq!(sources[1].name(), "x_existing");
+        assert!(sources[3].fetch(&store).await.unwrap().is_empty());
+        struct Capture(std::sync::Mutex<Vec<String>>);
+        #[async_trait::async_trait]
+        impl Sink for Capture {
+            async fn deliver(&self, item: &MediaItem, _: &[PathBuf]) -> Result<()> {
+                self.0.lock().unwrap().push(item.source_id.clone());
+                Ok(())
+            }
+        }
+        let sink = Capture(std::sync::Mutex::new(Vec::new()));
+        for _ in 0..2 {
+            run_once(
+                &store,
+                &sources,
+                &FilterChain::standard(),
+                &sink,
+                |_| async { Vec::<PathBuf>::new() },
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(*sink.0.lock().unwrap(), vec!["7600000000000000001"]);
+        assert_eq!(store.douyin_subscriptions().unwrap().len(), 3);
+        // A configured mobile profile and the matching card produce just one source.
+        cfg.sources.push(hanabi::config::SourceCfg {
+            name: "configured_artist".into(),
+            kind: "douyin_user".into(),
+            targets: vec!["https://www.iesdouyin.com/share/user/MS4wTEST/?share=2".into()],
+            filters: Default::default(),
+        });
+        assert_eq!(build_sources(&cfg, &gdl, &store).unwrap().len(), 5);
     }
 }

@@ -32,19 +32,17 @@ const IMAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const IMAGE_RETRY_BASE_MS: u64 = if cfg!(test) { 1 } else { 400 };
 
 /// 是否抖音链接(短链 v.douyin.com / www.douyin.com / iesdouyin.com)。
-pub fn is_douyin_url(url: &str) -> bool {
-    let host = url
-        .split_once("://")
-        .map(|(_, r)| r)
-        .unwrap_or(url)
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
-    host == "douyin.com"
-        || host.ends_with(".douyin.com")
-        || host == "iesdouyin.com"
-        || host.ends_with(".iesdouyin.com")
+pub fn is_douyin_url(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some_and(|host| {
+            host == "douyin.com"
+                || host.ends_with(".douyin.com")
+                || host == "iesdouyin.com"
+                || host.ends_with(".iesdouyin.com")
+        })
 }
 
 /// 从 desc 抽连续话题标签(`#tag#tag` 或 `#tag 文字`),返回(去标签后的正文, 标签列表)。
@@ -413,13 +411,14 @@ fn run_douyin_helper(
     })
 }
 
-/// 通过 douyin-downloader 桥接器抓取一个作者主页，并只返回可发布的图文作品。
-/// 可用于定时 `douyin_user` 来源，也可用于手动发送作者主页链接的多作品流程。
-pub async fn fetch_user_feed(
-    runtime: &DouyinCfg,
-    target: &str,
-    origin: &str,
-) -> Result<Vec<MediaItem>> {
+/// 作者身份与可发布图文；没有图文作品时也保留作者身份用于订阅。
+pub struct UserFeed {
+    pub profile_url: String,
+    pub items: Vec<MediaItem>,
+}
+
+/// 定时来源与手动作者名片共用的 douyin-downloader 抓取桥。
+pub async fn fetch_user_feed(runtime: &DouyinCfg, target: &str, origin: &str) -> Result<UserFeed> {
     let runtime = runtime.clone();
     let target_owned = target.to_string();
     let response = tokio::task::spawn_blocking(move || {
@@ -449,7 +448,12 @@ pub async fn fetch_user_feed(
         image_items = out.len(),
         "抖音作者作品发现完成"
     );
-    Ok(out)
+    let profile_url = canonical_user_profile(&response.resolved_url)
+        .context("抖音作者桥接器未返回有效作者主页")?;
+    Ok(UserFeed {
+        profile_url,
+        items: out,
+    })
 }
 
 /// 定时抓取抖音作者主页公开图文作品。签名、Cookie 与可选 Playwright 兜底由
@@ -489,7 +493,10 @@ impl Source for DouyinUserSource {
         let mut seen = HashSet::new();
         for target in &self.cfg.targets {
             // 最终增量幂等由 pipeline 的 SQLite already_pushed 统一完成。
-            for item in fetch_user_feed(&self.runtime, target, &self.cfg.name).await? {
+            for item in fetch_user_feed(&self.runtime, target, &self.cfg.name)
+                .await?
+                .items
+            {
                 if seen.insert(item.source_id.clone()) {
                     out.push(item);
                 }
@@ -554,7 +561,8 @@ pub async fn resolve_douyin_url(client: &reqwest::Client, url: &str) -> Result<r
     if !is_douyin_url(final_url.as_str()) {
         anyhow::bail!("抖音短链重定向到非抖音域名");
     }
-    if !status.is_success() {
+    // 重定向已揭示作者 ID 时，落地页 403 不应阻止持久订阅和网页 SDK 重试。
+    if !status.is_success() && canonical_user_profile(final_url.as_str()).is_none() {
         anyhow::bail!("抖音短链响应状态异常 status={status}");
     }
     final_url.set_query(None);
@@ -566,6 +574,29 @@ pub async fn resolve_douyin_url(client: &reqwest::Client, url: &str) -> Result<r
 pub fn is_user_profile_url(url: &reqwest::Url) -> bool {
     let path = url.path();
     path.starts_with("/user/") || path.starts_with("/share/user/")
+}
+
+/// 将网页/移动端作者名片归一为同一订阅键，作品链接不能成为订阅。
+pub fn canonical_user_profile(raw: &str) -> Option<String> {
+    let url = reqwest::Url::parse(raw).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || !is_douyin_url(url.as_str()) {
+        return None;
+    }
+    let parts: Vec<_> = url
+        .path_segments()?
+        .filter(|part| !part.is_empty())
+        .collect();
+    let id = match parts.as_slice() {
+        ["user", id] | ["share", "user", id] => *id,
+        _ => return None,
+    };
+    if !id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return None;
+    }
+    Some(format!("https://www.douyin.com/user/{id}"))
 }
 
 /// 是否为单条作品落点（图文 / 视频 / slides）。短链本身不算。
@@ -886,6 +917,11 @@ mod tests {
         assert!(is_douyin_url("https://www.iesdouyin.com/share/note/123/"));
         assert!(!is_douyin_url("https://www.pixiv.net/artworks/1"));
         assert!(!is_douyin_url("https://x.com/u/status/9"));
+        assert!(is_douyin_url("https://www.douyin.com:443/user/MS4wTEST"));
+        assert!(!is_douyin_url(
+            "https://www.douyin.com@evil.example/user/MS4wTEST"
+        ));
+        assert!(!is_douyin_url("https://evil-douyin.com/user/MS4wTEST"));
     }
 
     #[test]
@@ -1040,6 +1076,41 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn profile_redirect_keeps_identity_on_403_but_content_403_fails() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for response in [
+                "HTTP/1.1 302 Found\r\nLocation: /share/user/MS4wTEST/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).unwrap() > 0);
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("www.douyin.com", addr)
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("http://www.douyin.com:{}/card", addr.port());
+        let resolved = resolve_douyin_url(&client, &url).await.unwrap();
+        assert_eq!(
+            canonical_user_profile(resolved.as_str()).as_deref(),
+            Some("https://www.douyin.com/user/MS4wTEST")
+        );
+        let note = format!("http://www.douyin.com:{}/note/123", addr.port());
+        assert!(resolve_douyin_url(&client, &note).await.is_err());
+        server.join().unwrap();
     }
 
     #[test]

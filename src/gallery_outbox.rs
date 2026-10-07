@@ -131,6 +131,8 @@ impl std::fmt::Display for GalleryUploadFailure {
     }
 }
 
+// async_trait's generated must_use triggers Clippy 1.99 (rust-clippy#17529).
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait GalleryUploader: Send + Sync {
     async fn ingest_paths(

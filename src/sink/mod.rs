@@ -5,6 +5,8 @@ use async_trait::async_trait;
 
 use crate::model::MediaItem;
 
+// async_trait's generated must_use triggers Clippy 1.99 (rust-clippy#17529).
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Sink: Send + Sync {
     async fn deliver(&self, item: &MediaItem, files: &[std::path::PathBuf]) -> Result<()>;

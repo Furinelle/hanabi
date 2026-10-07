@@ -115,6 +115,48 @@ impl GalleryClient {
         })
     }
 
+    /// Read the author only from an exact cached Douyin work, never a fuzzy match.
+    pub async fn douyin_author(&self, source_id: &str) -> Result<Option<String>> {
+        anyhow::ensure!(
+            !source_id.is_empty() && source_id.bytes().all(|byte| byte.is_ascii_digit()),
+            "不是有效的抖音作品 ID"
+        );
+        let response: serde_json::Value = self
+            .client
+            .get(format!("{}/api/works", self.endpoint))
+            .bearer_auth(&self.token)
+            .query(&[("source", "douyin"), ("q", source_id), ("limit", "100")])
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        anyhow::ensure!(response["ok"] == true, "图库作者查询响应无效");
+        let works = response["works"]
+            .as_array()
+            .context("图库作者查询缺少作品列表")?;
+        let mut author = None;
+        for work in works {
+            if work["source"].as_str() != Some("douyin")
+                || work["source_id"].as_str() != Some(source_id)
+            {
+                continue;
+            }
+            let Some(profile) = work["author_url"]
+                .as_str()
+                .and_then(crate::source::douyin::canonical_user_profile)
+            else {
+                return Ok(None);
+            };
+            if author.as_ref().is_some_and(|known| known != &profile) {
+                return Ok(None);
+            }
+            author = Some(profile);
+        }
+        Ok(author)
+    }
+
     /// 上传整套作品图片到图库。失败返回 Err，调用方只记日志不阻断频道发布。
     pub async fn ingest(
         &self,
@@ -364,6 +406,96 @@ mod tests {
         let debug = format!("{client:?}");
         assert!(!debug.contains("super-secret-ingest-token"));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn douyin_author_requires_exact_work_and_unambiguous_valid_profile() {
+        use std::io::{Read, Write};
+        let cases = [
+            (
+                serde_json::json!([
+                    {"source":"douyin","source_id":"123","author_url":"https://www.douyin.com/user/MS4wA"}
+                ]),
+                Some("https://www.douyin.com/user/MS4wA"),
+            ),
+            (
+                serde_json::json!([
+                    {"source":"douyin","source_id":"1234","author_url":"https://www.douyin.com/user/MS4wA"},
+                    {"source":"pixiv","source_id":"123","author_url":"https://www.douyin.com/user/MS4wA"}
+                ]),
+                None,
+            ),
+            (
+                serde_json::json!([
+                    {"source":"douyin","source_id":"123","author_url":"https://evil.example/user/MS4wA"}
+                ]),
+                None,
+            ),
+            (
+                serde_json::json!([
+                    {"source":"douyin","source_id":"123","author_url":"https://www.douyin.com/note/123"}
+                ]),
+                None,
+            ),
+            (
+                serde_json::json!([
+                    {"source":"douyin","source_id":"123","author_url":"https://www.douyin.com/user/MS4wA"},
+                    {"source":"douyin","source_id":"123","author_url":"https://www.douyin.com/user/MS4wB"}
+                ]),
+                None,
+            ),
+            (
+                serde_json::json!([
+                    {"source":"douyin","source_id":"123","author_url":"https://www.douyin.com/user/MS4wA"},
+                    {"source":"douyin","source_id":"123","author_url":"https://evil.example/user/MS4wA"}
+                ]),
+                None,
+            ),
+            (
+                serde_json::json!([
+                    {"source":"douyin","source_id":"123","author_url":"https://www.douyin.com/user/MS4wA"},
+                    {"source":"douyin","source_id":"123","author_url":"https://www.iesdouyin.com/share/user/MS4wA/?s=1"}
+                ]),
+                Some("https://www.douyin.com/user/MS4wA"),
+            ),
+        ];
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let bodies: Vec<_> = cases
+            .iter()
+            .map(|(works, _)| serde_json::json!({"ok":true,"works":works}).to_string())
+            .collect();
+        let server = std::thread::spawn(move || {
+            for body in bodies {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut buffer = [0; 1024];
+                    let length = socket.read(&mut buffer).unwrap();
+                    assert!(length > 0);
+                    request.extend_from_slice(&buffer[..length]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request.starts_with("GET /api/works?source=douyin&q=123&limit=100 "));
+                assert!(request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer fake-token\r\n"));
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+        let mut gallery = GalleryClient::new(endpoint, "fake-token".into()).unwrap();
+        gallery.client = reqwest::Client::builder().no_proxy().build().unwrap();
+        assert!(gallery.douyin_author("../123").await.is_err());
+        for (_, expected) in cases {
+            assert_eq!(
+                gallery.douyin_author("123").await.unwrap().as_deref(),
+                expected
+            );
+        }
+        server.join().unwrap();
     }
 
     #[test]

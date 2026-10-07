@@ -171,6 +171,33 @@ def _aweme_id(item: Any) -> str:
     return text if text.isdigit() else ""
 
 
+def _has_media_url(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.startswith(("http://", "https://"))
+    if isinstance(value, dict):
+        return any(_has_media_url(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_has_media_url(child) for child in value)
+    return False
+
+
+def _usable_detail(item: Any, aweme_id: str) -> bool:
+    if not isinstance(item, dict) or _aweme_id(item) != aweme_id:
+        return False
+    # Videos can contribute author identity without publishable gallery images.
+    for key in ("authorInfo", "author"):
+        author = item.get(key)
+        if isinstance(author, dict):
+            sec_uid = author.get("sec_uid") or author.get("secUid")
+            if isinstance(sec_uid, str) and re.fullmatch(r"[A-Za-z0-9_-]+", sec_uid):
+                return True
+    # Preserve legacy image details even when the author identity is unavailable.
+    post = item.get("image_post_info")
+    if isinstance(post, dict) and any(_has_media_url(post.get(key)) for key in ("images", "image_list")):
+        return True
+    return any(_has_media_url(item.get(key)) for key in ("images", "image_list"))
+
+
 def _append_unique(items: list[dict[str, Any]], seen: set[str], values: Any) -> None:
     if not isinstance(values, list):
         return
@@ -473,7 +500,7 @@ async def _browser_detail(
                             )
                             outer_html = eval_res.get("result", {}).get("value") or ""
                             item = extract_aweme_from_html(outer_html, aweme_id)
-                            if item:
+                            if _usable_detail(item, aweme_id):
                                 refreshed = await command(
                                     "Network.getAllCookies", session_id=target_session
                                 )
@@ -541,7 +568,7 @@ async def _browser_detail(
                             parsed_json = None
                         if parsed_json:
                             item = _browser_aweme(parsed_json, aweme_id)
-                            if item:
+                            if _usable_detail(item, aweme_id):
                                 refreshed = await command(
                                     "Network.getAllCookies", session_id=target_session
                                 )
@@ -917,17 +944,14 @@ async def _run(request: dict[str, Any]) -> dict[str, Any]:
                 print(f"douyin direct html detail extract failed: {exc}", file=sys.stderr)
 
             # 2. Try upstream client.get_video_detail
-            if not isinstance(item, dict) or _aweme_id(item) != aweme_id:
+            if not _usable_detail(item, aweme_id):
                 try:
                     item = await client.get_video_detail(aweme_id)
                 except Exception:
                     item = None
 
             # 3. Fallback to CDP browser
-            if (
-                (not isinstance(item, dict) or _aweme_id(item) != aweme_id)
-                and cdp_url
-            ):
+            if not _usable_detail(item, aweme_id) and cdp_url:
                 item = await _browser_detail(
                     cdp_url,
                     aweme_id,
@@ -936,7 +960,7 @@ async def _run(request: dict[str, Any]) -> dict[str, Any]:
                 )
                 browser_used = True
 
-            if not isinstance(item, dict) or _aweme_id(item) != aweme_id:
+            if not _usable_detail(item, aweme_id):
                 raise RuntimeError("作品详情接口返回空数据，可能是 Cookie/签名失效或触发验证")
             return {
                 "resolved_url": resolved_url.split("?", 1)[0],

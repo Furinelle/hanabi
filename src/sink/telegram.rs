@@ -621,6 +621,14 @@ impl TelegramSink {
         }
     }
 
+    /// 从图库读取已入库作品的作者身份。
+    pub async fn known_douyin_author(&self, source_id: &str) -> Result<Option<String>> {
+        match &self.state.gallery {
+            Some(gallery) => gallery.douyin_author(source_id).await,
+            None => Ok(None),
+        }
+    }
+
     /// 删审批私聊里的若干消息(手动链接发布后清理:用户链接 + "抓取中"提示)。
     pub async fn delete_review_messages(&self, msg_ids: &[i32]) {
         for id in msg_ids {

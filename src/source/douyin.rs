@@ -608,7 +608,11 @@ pub fn canonical_user_profile(raw: &str) -> Option<String> {
 
 /// 是否为单条作品落点（图文 / 视频 / slides）。短链本身不算。
 pub fn is_aweme_content_url(url: &reqwest::Url) -> bool {
-    aweme_kind_and_id(url).is_some()
+    aweme_content_id(url).is_some()
+}
+
+pub fn aweme_content_id(url: &reqwest::Url) -> Option<&str> {
+    aweme_kind_and_id(url).map(|(_, id)| id)
 }
 
 fn aweme_kind_and_id(url: &reqwest::Url) -> Option<(&str, &str)> {

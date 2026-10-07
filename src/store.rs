@@ -91,6 +91,10 @@ impl Store {
 
     pub fn already_pushed(&self, item: &MediaItem) -> Result<bool> {
         let (kind, id) = item.dedup_key();
+        self.already_pushed_key(&kind, &id)
+    }
+
+    pub fn already_pushed_key(&self, kind: &str, id: &str) -> Result<bool> {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM pushed WHERE source_kind = ?1 AND source_id = ?2",
             params![kind, id],

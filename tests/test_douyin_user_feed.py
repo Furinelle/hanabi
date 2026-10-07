@@ -272,6 +272,119 @@ class BrowserFeedTest(unittest.IsolatedAsyncioTestCase):
         self.assert_cleaned(socket)
 
 
+class BridgeDetailTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.skeleton = {
+            "aweme_id": "2", "awemeId": "2", "desc": "",
+            "author": {"sec_uid": "", "secUid": ""},
+            "authorInfo": {"sec_uid": "", "secUid": ""}, "images": [],
+        }
+        self.client = MagicMock()
+        self.client.__aenter__.return_value = self.client
+        self.client.__aexit__.return_value = None
+        self.client.headers = {"User-Agent": "fake_UA"}
+        self.client.get_video_detail = AsyncMock(return_value=self.skeleton)
+        upstream = (lambda _: self.client, lambda _: {}, lambda _: False, lambda url: url)
+        self.enterContext(patch.object(MODULE, "_load_upstream", return_value=upstream))
+        self.enterContext(patch.object(MODULE, "_cookie_header", return_value=""))
+        self.environment = {}
+        self.enterContext(patch.object(MODULE, "os", types.SimpleNamespace(environ=self.environment)))
+        self.html = self.enterContext(patch.object(
+            MODULE, "_fetch_and_extract_html_detail", new_callable=AsyncMock, return_value=self.skeleton,
+        ))
+        self.browser = self.enterContext(patch.object(
+            MODULE, "_browser_detail", new_callable=AsyncMock, return_value=self.skeleton,
+        ))
+
+    async def detail(self):
+        return await MODULE._run({"target": "https://www.douyin.com/note/2", "operation": "detail"})
+
+    async def test_skeleton_html_continues_to_api(self):
+        valid = {"aweme_id": "2", "images": [{"url_list": ["https://images.example/2.jpg"]}]}
+        self.client.get_video_detail.return_value = valid
+        result = await self.detail()
+        self.assertIs(result["item"], valid)
+        self.assertFalse(result["browser_fallback_used"])
+        self.client.get_video_detail.assert_awaited_once_with("2")
+        self.browser.assert_not_awaited()
+
+    async def test_skeleton_html_and_api_continue_to_browser(self):
+        self.environment["HANABI_DOUYIN_CDP_URL"] = "ws://fake"
+        valid = {"aweme_id": "2", "author": {"sec_uid": "MS4wVIDEO"}, "video": {"cover": {}}}
+        self.browser.return_value = valid
+        result = await self.detail()
+        self.assertIs(result["item"], valid)
+        self.assertTrue(result["browser_fallback_used"])
+        self.client.get_video_detail.assert_awaited_once_with("2")
+        self.browser.assert_awaited_once_with("ws://fake", "2", {}, "fake_UA")
+
+    async def test_real_video_author_identity_returns_without_gallery_images(self):
+        for author_key, id_key in (("author", "sec_uid"), ("authorInfo", "secUid")):
+            with self.subTest(author_key=author_key):
+                valid = {"aweme_id": "2", author_key: {id_key: "MS4wVIDEO"}, "video": {"cover": {}}}
+                self.html.return_value = valid
+                result = await self.detail()
+                self.assertIs(result["item"], valid)
+                self.client.get_video_detail.assert_not_awaited()
+                self.browser.assert_not_awaited()
+
+    async def test_real_gallery_images_keep_legacy_details_without_author(self):
+        images = [{"origin_image": {"url_list": ["https://images.example/2.jpg"]}}]
+        for gallery in ({"images": images}, {"image_list": images},
+                        {"image_post_info": {"images": images}}):
+            with self.subTest(gallery=gallery):
+                valid = {"aweme_id": "2", **gallery}
+                self.html.return_value = valid
+                self.assertIs((await self.detail())["item"], valid)
+                self.client.get_video_detail.assert_not_awaited()
+                self.browser.assert_not_awaited()
+
+    async def test_terminal_skeleton_is_not_success_with_or_without_browser(self):
+        for cdp_url in ("", "ws://fake"):
+            with self.subTest(cdp_url=cdp_url):
+                self.environment["HANABI_DOUYIN_CDP_URL"] = cdp_url
+                with self.assertRaisesRegex(RuntimeError, "作品详情接口返回空数据"):
+                    await self.detail()
+        self.assertEqual(self.client.get_video_detail.await_count, 2)
+        self.browser.assert_awaited_once()
+        for invalid in (None, {"aweme_id": "1", "author": {"sec_uid": "MS4wVIDEO"}},
+                        {"aweme_id": "2", "images": [{}]},
+                        {"aweme_id": "2", "author": {"sec_uid": "invalid/id"}}):
+            self.assertFalse(MODULE._usable_detail(invalid, "2"))
+
+
+class BrowserDetailTest(unittest.IsolatedAsyncioTestCase):
+    async def test_placeholder_html_and_network_payload_do_not_hide_valid_video(self):
+        skeleton = {"aweme_id": "2", "author": {"sec_uid": ""}, "images": []}
+        valid = {"aweme_id": "2", "author": {"sec_uid": "MS4wVIDEO"}, "video": {"cover": {}}}
+
+        def navigate(socket):
+            socket.post("skeleton", [skeleton])
+            socket.post("valid", [valid])
+
+        socket = FakeCDP(navigate)
+        socket.clock.now = 2  # Make the first outerHTML poll precede network inspection.
+        aiohttp = types.SimpleNamespace(ClientSession=lambda: socket, WSMsgType=types.SimpleNamespace(TEXT=1))
+        async_api = types.SimpleNamespace(
+            Queue=asyncio.Queue, create_task=asyncio.create_task,
+            get_running_loop=asyncio.get_running_loop, CancelledError=asyncio.CancelledError,
+            wait_for=socket.wait_for,
+        )
+        with patch.dict(sys.modules, aiohttp=aiohttp), patch.object(
+            MODULE, "time", socket.clock
+        ), patch.object(MODULE, "asyncio", async_api), patch.object(
+            MODULE, "extract_aweme_from_html", return_value=skeleton
+        ) as html, patch.object(MODULE, "_persist_browser_cookies") as persist:
+            result = await MODULE._browser_detail("ws://fake", "2", {}, "fake_UA")
+        self.assertIsNotNone(html.call_args)
+        self.assertEqual(result, valid)
+        self.assertEqual(socket.body_reads, ["skeleton", "valid"])
+        persist.assert_called_once_with({"ttwid": "fake_ttwid"})
+        methods = [method for _, method, _ in socket.commands]
+        self.assertEqual(methods.count("Target.closeTarget"), 1)
+        self.assertEqual(methods.count("Target.disposeBrowserContext"), 1)
+
+
 class BridgeFeedTest(unittest.IsolatedAsyncioTestCase):
     async def test_short_link_resolution_is_anonymous_and_cdp_keeps_author_cookies(self):
         cookies = {"fake_session": "fake_value"}

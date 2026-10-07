@@ -625,6 +625,7 @@ async fn handle_douyin(
     sink: &TelegramSink,
 ) -> Result<()> {
     use hanabi::source::douyin;
+    const SUBSCRIPTION_NOTICE: &str = "✅ 同一作者累计收到 10 个不同作品链接，已加入定时监控";
     let store = Store::open("hanabi.db").context("handle_douyin 打开 Store 失败")?;
     let client = douyin::build_client()?;
     let resolved_url = match douyin::resolve_douyin_url(&client, &job.url).await {
@@ -671,6 +672,35 @@ async fn handle_douyin(
         }
     }
 
+    // Published works can reuse their exact gallery author metadata even when Douyin is limited.
+    if let Some(url) = resolved_url
+        .clone()
+        .or_else(|| reqwest::Url::parse(resolved_target).ok())
+    {
+        if let Some(id) = douyin::aweme_content_id(&url) {
+            if store.already_pushed_key("douyin", id)? {
+                match sink.known_douyin_author(id).await {
+                    Ok(Some(profile)) => {
+                        let subscribed = store.record_manual_douyin_work(&profile, id)?;
+                        tracing::info!(id, "抖音作品已发过,跳过");
+                        sink.delete_review_messages(&[job.user_msg_id]).await;
+                        if subscribed {
+                            sink.edit_review_text(job.notice_msg_id, SUBSCRIPTION_NOTICE)
+                                .await;
+                        } else {
+                            sink.delete_review_messages(&[job.notice_msg_id]).await;
+                        }
+                        return Ok(());
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(error = %error, "图库作者查询失败,继续解析作品详情")
+                    }
+                }
+            }
+        }
+    }
+
     match douyin::fetch_shared_work(&client, runtime, resolved_target, "manual").await {
         Ok(work) => {
             let subscribed = if let Some(profile) = douyin::canonical_user_profile(&work.author.url)
@@ -680,13 +710,12 @@ async fn handle_douyin(
                 tracing::warn!(id = %work.source_id, "抖音作品缺少有效作者身份,不累计监控链接");
                 false
             };
-            let subscription_notice = "✅ 同一作者累计收到 10 个不同作品链接，已加入定时监控";
             let Some(item) = work.item else {
                 sink.delete_review_messages(&[job.user_msg_id]).await;
                 let mut text = "⚠️ 抖音作品没有可发布图片,未发布".to_string();
                 if subscribed {
                     text.push('\n');
-                    text.push_str(subscription_notice);
+                    text.push_str(SUBSCRIPTION_NOTICE);
                 }
                 sink.edit_review_text(job.notice_msg_id, &failure_notice(&text, &job.url))
                     .await;
@@ -740,7 +769,7 @@ async fn handle_douyin(
                 if !text.is_empty() {
                     text.push('\n');
                 }
-                text.push_str(subscription_notice);
+                text.push_str(SUBSCRIPTION_NOTICE);
             }
             match notice {
                 // 全部顺利:删链接消息 + "抓取中"提示,保持私聊干净。

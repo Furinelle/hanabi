@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let cfg_path = std::env::var("HANABI_CONFIG").unwrap_or_else(|_| "config.toml".into());
-    let cfg = Config::load(&cfg_path).context("加载 config.toml 失败")?;
+    let mut cfg = Config::load(&cfg_path).context("加载 config.toml 失败")?;
     // 校验:整点时间槽要求 poll_interval_secs 能整除 86400。
     // 0 会让 secs_until_next_slot 整数除零 panic(且是跑完首轮才崩),启动即拦截。
     if cfg.poll_interval_secs == 0 {
@@ -75,6 +75,29 @@ async fn main() -> Result<()> {
         );
     }
     let token = std::env::var("HANABI_BOT_TOKEN").context("缺少环境变量 HANABI_BOT_TOKEN")?;
+
+    // Resolve configured cards once so persistent subscriptions share the same author key.
+    // Keep the original target if resolution fails; the source can retry normally.
+    let douyin_client = hanabi::source::douyin::build_client()?;
+    for source in cfg.sources.iter_mut().filter(|s| s.kind == "douyin_user") {
+        for target in &mut source.targets {
+            if hanabi::source::douyin::canonical_user_profile(target).is_some() {
+                continue;
+            }
+            match hanabi::source::douyin::resolve_douyin_url(&douyin_client, target).await {
+                Ok(url) => {
+                    if let Some(profile) =
+                        hanabi::source::douyin::canonical_user_profile(url.as_str())
+                    {
+                        *target = profile;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "配置抖音作者名片预解析失败,保留原链接")
+                }
+            }
+        }
+    }
 
     let store = Store::open("hanabi.db")?;
     let chain = FilterChain::standard();
@@ -648,8 +671,27 @@ async fn handle_douyin(
         }
     }
 
-    match douyin::fetch_note(&client, runtime, resolved_target, "manual").await {
-        Ok(item) => {
+    match douyin::fetch_shared_work(&client, runtime, resolved_target, "manual").await {
+        Ok(work) => {
+            let subscribed = if let Some(profile) = douyin::canonical_user_profile(&work.author.url)
+            {
+                store.record_manual_douyin_work(&profile, &work.source_id)?
+            } else {
+                tracing::warn!(id = %work.source_id, "抖音作品缺少有效作者身份,不累计监控链接");
+                false
+            };
+            let subscription_notice = "✅ 同一作者累计收到 10 个不同作品链接，已加入定时监控";
+            let Some(item) = work.item else {
+                sink.delete_review_messages(&[job.user_msg_id]).await;
+                let mut text = "⚠️ 抖音作品没有可发布图片,未发布".to_string();
+                if subscribed {
+                    text.push('\n');
+                    text.push_str(subscription_notice);
+                }
+                sink.edit_review_text(job.notice_msg_id, &failure_notice(&text, &job.url))
+                    .await;
+                return Ok(());
+            };
             // 结束时留给用户的提示;None = 全部顺利,静默删掉两条消息即可。
             let mut notice: Option<String> = None;
             if store.already_pushed(&item)? {
@@ -692,6 +734,13 @@ async fn handle_douyin(
                         );
                     }
                 }
+            }
+            if subscribed {
+                let text = notice.get_or_insert_with(String::new);
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(subscription_notice);
             }
             match notice {
                 // 全部顺利:删链接消息 + "抓取中"提示,保持私聊干净。

@@ -228,7 +228,7 @@ fn gallery_items(item: &Value) -> Option<&Vec<Value>> {
         })
 }
 
-fn parse_item(item: &Value, origin: &str, image_policy: ImagePolicy) -> Option<MediaItem> {
+fn aweme_id(item: &Value) -> Option<String> {
     // aweme_id 可能是数字或字符串。
     let aweme_id = item
         .get("aweme_id")
@@ -243,6 +243,27 @@ fn parse_item(item: &Value, origin: &str, image_policy: ImagePolicy) -> Option<M
     if aweme_id.is_empty() || !aweme_id.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
+    Some(aweme_id)
+}
+
+fn aweme_author(item: &Value) -> Author {
+    let author = item.get("authorInfo").or_else(|| item.get("author"));
+    let nickname = author
+        .and_then(|a| a.get("nickname"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let sec_uid = author
+        .and_then(|a| a.get("sec_uid").or_else(|| a.get("secUid")))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    Author {
+        name: nickname.to_string(),
+        url: format!("https://www.douyin.com/user/{sec_uid}"),
+    }
+}
+
+fn parse_item(item: &Value, origin: &str, image_policy: ImagePolicy) -> Option<MediaItem> {
+    let aweme_id = aweme_id(item)?;
 
     // 每张图保留完整 url_list:首项为主地址,其余作为 CDN 故障时的备用地址。
     // slidesinfo 的 images 同时包含视频卡片:clip_type=2 才是静态图;
@@ -278,17 +299,6 @@ fn parse_item(item: &Value, origin: &str, image_policy: ImagePolicy) -> Option<M
         return None;
     }
 
-    let author = item.get("authorInfo").or_else(|| item.get("author"));
-    let nickname = author
-        .and_then(|a| a.get("nickname"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let sec_uid = author
-        .and_then(|a| a.get("sec_uid").or_else(|| a.get("secUid")))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
     let desc = item.get("desc").and_then(|v| v.as_str()).unwrap_or("");
     let (title, tags) = split_desc_tags(desc);
 
@@ -296,10 +306,7 @@ fn parse_item(item: &Value, origin: &str, image_policy: ImagePolicy) -> Option<M
     Some(MediaItem {
         source: SourceKind::Douyin,
         source_id: aweme_id.clone(),
-        author: Author {
-            name: nickname,
-            url: format!("https://www.douyin.com/user/{sec_uid}"),
-        },
+        author: aweme_author(item),
         title: if title.is_empty() { None } else { Some(title) },
         url: format!("https://www.douyin.com/note/{aweme_id}"),
         tags,
@@ -627,6 +634,25 @@ pub async fn fetch_note(
     url: &str,
     origin: &str,
 ) -> Result<MediaItem> {
+    fetch_shared_work(client, runtime, url, origin)
+        .await?
+        .item
+        .context("抖音作品详情没有可发布的静态图片")
+}
+
+/// Preserve the work/author identity even for videos with no publishable images.
+pub struct SharedWork {
+    pub source_id: String,
+    pub author: Author,
+    pub item: Option<MediaItem>,
+}
+
+pub async fn fetch_shared_work(
+    client: &reqwest::Client,
+    runtime: &DouyinCfg,
+    url: &str,
+    origin: &str,
+) -> Result<SharedWork> {
     // `/share/slides/` 的 slidesinfo 仍免签可用;失败再走签名详情。
     // note 页 SSR 已空,直接走签名详情,不再三次抓空 HTML。
     if reqwest::Url::parse(url)
@@ -636,9 +662,15 @@ pub async fn fetch_note(
         .is_some()
     {
         match fetch_note_with_validator(client, url, origin, is_douyin_url).await {
-            Ok(item) => return Ok(item),
+            Ok(item) => {
+                return Ok(SharedWork {
+                    source_id: item.source_id.clone(),
+                    author: item.author.clone(),
+                    item: Some(item),
+                });
+            }
             Err(page_error) => {
-                return fetch_signed_detail(runtime, url, origin)
+                return fetch_signed_work(runtime, url, origin)
                     .await
                     .with_context(|| {
                         format!("slidesinfo 失败后作品详情桥接也失败: {page_error:#}")
@@ -646,10 +678,10 @@ pub async fn fetch_note(
             }
         }
     }
-    fetch_signed_detail(runtime, url, origin).await
+    fetch_signed_work(runtime, url, origin).await
 }
 
-async fn fetch_signed_detail(runtime: &DouyinCfg, url: &str, origin: &str) -> Result<MediaItem> {
+async fn fetch_signed_work(runtime: &DouyinCfg, url: &str, origin: &str) -> Result<SharedWork> {
     let runtime = runtime.clone();
     let target = url.to_string();
     let response = tokio::task::spawn_blocking(move || {
@@ -663,10 +695,13 @@ async fn fetch_signed_detail(runtime: &DouyinCfg, url: &str, origin: &str) -> Re
     } else {
         ImagePolicy::All
     };
-    let item =
-        parse_item(&raw, origin, image_policy).context("抖音作品详情没有可发布的静态图片")?;
-    tracing::info!(id = %item.source_id, "抖音作品通过签名详情接口解析");
-    Ok(item)
+    let source_id = aweme_id(&raw).context("抖音作品详情缺少有效作品 ID")?;
+    tracing::info!(id = %source_id, "抖音作品通过签名详情接口解析");
+    Ok(SharedWork {
+        source_id,
+        author: aweme_author(&raw),
+        item: parse_item(&raw, origin, image_policy),
+    })
 }
 
 async fn fetch_note_with_validator<F>(
@@ -1214,6 +1249,73 @@ mod tests {
                 "/share/note/7668600536471822181".to_string()
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn video_identity_counts_manual_links_without_publishing_cover_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let helper = temp.path().join("video_helper.py");
+        std::fs::write(
+            &helper,
+            r#"import json, sys
+request = json.load(sys.stdin)
+id = request['target'].rsplit('/', 1)[-1]
+assert request['operation'] == 'detail'
+if id == '12':
+    sys.exit(1)
+json.dump({'item': {
+    'aweme_id': id,
+    'author': {'nickname': 'Video artist', 'sec_uid': 'MS4wVIDEO' if id != '11' else ''},
+    'video': {'cover': {'url_list': ['https://images.example/cover.jpg']}}
+}}, sys.stdout)
+"#,
+        )
+        .unwrap();
+        let runtime = DouyinCfg {
+            python_command: "python3".into(),
+            helper_path: helper.to_string_lossy().into_owned(),
+            ..DouyinCfg::default()
+        };
+        let store = Store::open_in_memory().unwrap();
+        let client = build_client().unwrap();
+        for id in 1..=11 {
+            let work = fetch_shared_work(
+                &client,
+                &runtime,
+                &format!("https://www.douyin.com/video/{id}"),
+                "manual",
+            )
+            .await
+            .unwrap();
+            assert!(work.item.is_none());
+            if let Some(profile) = canonical_user_profile(&work.author.url) {
+                assert_eq!(
+                    store
+                        .record_manual_douyin_work(&profile, &work.source_id)
+                        .unwrap(),
+                    id == 10
+                );
+            } else {
+                assert_eq!(id, 11);
+            }
+        }
+        assert_eq!(store.douyin_subscriptions().unwrap().len(), 1);
+        assert!(fetch_shared_work(
+            &client,
+            &runtime,
+            "https://www.douyin.com/video/12",
+            "manual"
+        )
+        .await
+        .is_err());
+        assert!(fetch_note(
+            &client,
+            &runtime,
+            "https://www.douyin.com/video/1",
+            "gallery_repair"
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]

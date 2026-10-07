@@ -2504,27 +2504,25 @@ async fn handle_command(
     // 非命令:识别 Pixiv/X 作品链接 → 交抓取循环直发频道(跳过审批)。
     // 记下用户链接消息 id 与"抓取中"提示 id,发布成功后一并删除,保持私聊干净。
     if !text.starts_with('/') {
-        if let Some(url) = extract_supported_url(text) {
+        for url in extract_supported_urls(text) {
             let notice = state
                 .bot
                 .send_message(msg.chat.id, "🔗 收到链接,抓取中…")
                 .await?;
             // try_send:与 /run 同理,抓取执行期间主循环不消费 link_rx(容量 16),
             // 阻塞式 send 在通道满时会把整个 review loop 挂死。
-            if link
-                .try_send(LinkJob {
-                    url,
-                    user_msg_id: msg.id.0,
-                    notice_msg_id: notice.id.0,
-                })
-                .is_err()
-            {
+            if let Err(rejected) = link.try_send(LinkJob {
+                url,
+                user_msg_id: msg.id.0,
+                notice_msg_id: notice.id.0,
+            }) {
+                let job = rejected.into_inner();
                 let _ = state
                     .bot
                     .edit_message_text(
                         msg.chat.id,
                         notice.id,
-                        "⏳ 链接队列已满,请稍后重发".to_string(),
+                        format!("⏳ 链接队列已满,请稍后重发这个链接\n原链接: {}", job.url),
                     )
                     .await;
             }
@@ -2816,14 +2814,17 @@ pub fn classify_link(url: &str) -> Option<LinkKind> {
     })
 }
 
-/// 从消息文本中提取首个受支持作品链接(host 精确判定)。pixiv/x/抖音。
-fn extract_supported_url(text: &str) -> Option<String> {
+/// 从消息文本中提取受支持的不同作品链接(host 精确判定)。pixiv/x/抖音。
+fn extract_supported_urls(text: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
     text.split_whitespace()
-        .find(|w| {
+        .filter(|w| {
             w.starts_with("http")
                 && (classify_link(w).is_some() || crate::source::douyin::is_douyin_url(w))
         })
+        .filter(|w| seen.insert(*w))
         .map(|s| s.to_string())
+        .collect()
 }
 
 async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<()> {
@@ -3364,24 +3365,38 @@ mod tests {
     #[test]
     fn extract_url_recognizes_pixiv_and_x() {
         assert_eq!(
-            extract_supported_url("https://www.pixiv.net/artworks/123").as_deref(),
+            extract_supported_urls("https://www.pixiv.net/artworks/123")
+                .first()
+                .map(String::as_str),
             Some("https://www.pixiv.net/artworks/123")
         );
         assert_eq!(
-            extract_supported_url("看这张 https://x.com/u/status/9 不错").as_deref(),
+            extract_supported_urls("看这张 https://x.com/u/status/9 不错")
+                .first()
+                .map(String::as_str),
             Some("https://x.com/u/status/9")
         );
         assert_eq!(
-            extract_supported_url("https://twitter.com/u/status/7").as_deref(),
+            extract_supported_urls("https://twitter.com/u/status/7")
+                .first()
+                .map(String::as_str),
             Some("https://twitter.com/u/status/7")
         );
     }
 
     #[test]
     fn extract_url_ignores_commands_and_other_links() {
-        assert!(extract_supported_url("/run").is_none());
-        assert!(extract_supported_url("https://example.com/a").is_none());
-        assert!(extract_supported_url("随便聊聊").is_none());
+        assert!(extract_supported_urls("/run").is_empty());
+        assert!(extract_supported_urls("https://example.com/a").is_empty());
+        assert!(extract_supported_urls("随便聊聊").is_empty());
+    }
+
+    #[test]
+    fn extract_urls_keeps_multiple_douyin_links_in_order_without_duplicates() {
+        assert_eq!(
+            extract_supported_urls("分享 https://v.douyin.com/one/ https://www.douyin.com/note/123\nhttps://v.douyin.com/one/ https://evil.example/note/456"),
+            vec!["https://v.douyin.com/one/", "https://www.douyin.com/note/123"]
+        );
     }
 
     #[test]

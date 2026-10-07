@@ -37,7 +37,13 @@ impl Store {
              CREATE TABLE IF NOT EXISTS douyin_subscriptions (
                  profile_url TEXT PRIMARY KEY,
                  shared_url TEXT NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS douyin_shared_works (
+                 source_id TEXT PRIMARY KEY,
+                 profile_url TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS douyin_shared_works_author
+                 ON douyin_shared_works(profile_url);",
         )?;
         Ok(())
     }
@@ -57,6 +63,30 @@ impl Store {
             .prepare("SELECT profile_url, shared_url FROM douyin_subscriptions ORDER BY rowid")?;
         let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Only owner-submitted work links call this; fetched author feeds do not count.
+    /// Returns true exactly when the tenth distinct work creates a subscription.
+    pub fn record_manual_douyin_work(&self, profile_url: &str, source_id: &str) -> Result<bool> {
+        let profile_url = crate::source::douyin::canonical_user_profile(profile_url)
+            .ok_or_else(|| anyhow::anyhow!("不是有效的抖音作者主页"))?;
+        anyhow::ensure!(
+            !source_id.is_empty() && source_id.bytes().all(|b| b.is_ascii_digit()),
+            "不是有效的抖音作品 ID"
+        );
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO douyin_shared_works (source_id, profile_url) VALUES (?1, ?2)",
+            params![source_id, profile_url],
+        )?;
+        let subscribed = transaction.execute(
+            "INSERT OR IGNORE INTO douyin_subscriptions (profile_url, shared_url)
+             SELECT ?1, ?1 WHERE
+                 (SELECT COUNT(*) FROM douyin_shared_works WHERE profile_url = ?1) >= 10",
+            params![profile_url],
+        )? > 0;
+        transaction.commit()?;
+        Ok(subscribed)
     }
 
     pub fn already_pushed(&self, item: &MediaItem) -> Result<bool> {
@@ -175,5 +205,45 @@ mod tests {
             store.douyin_subscriptions().unwrap(),
             vec![(profile.into(), "https://v.douyin.com/card1/".into())]
         );
+    }
+
+    #[test]
+    fn ten_distinct_manual_works_subscribe_and_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.db");
+        let profile = "https://www.douyin.com/user/MS4wTEST";
+        {
+            let store = Store::open(path.to_str().unwrap()).unwrap();
+            for n in 1..10 {
+                assert!(!store
+                    .record_manual_douyin_work(profile, &n.to_string())
+                    .unwrap());
+            }
+            // Feed/published dedup is independent from links submitted by the owner.
+            let mut published = item("10");
+            published.source = SourceKind::Douyin;
+            store.mark_pushed(&published).unwrap();
+            assert!(store.douyin_subscriptions().unwrap().is_empty());
+        }
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        assert!(!store
+            .record_manual_douyin_work("https://www.iesdouyin.com/share/user/MS4wTEST/?s=1", "9")
+            .unwrap());
+        assert!(!store
+            .record_manual_douyin_work("https://www.douyin.com/user/MS4wOTHER", "1")
+            .unwrap());
+        assert!(store.record_manual_douyin_work(profile, "10").unwrap());
+        assert!(!store.record_manual_douyin_work(profile, "10").unwrap());
+        assert!(!store.record_manual_douyin_work(profile, "11").unwrap());
+        assert_eq!(
+            store.douyin_subscriptions().unwrap(),
+            vec![(profile.into(), profile.into())]
+        );
+        for (author, id) in [
+            ("https://evil.example/user/MS4wTEST", "12"),
+            (profile, "../12"),
+        ] {
+            assert!(store.record_manual_douyin_work(author, id).is_err());
+        }
     }
 }

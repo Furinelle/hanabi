@@ -883,10 +883,17 @@ async fn download_one(
                 .timeout(IMAGE_REQUEST_TIMEOUT)
                 .send()
                 .await
+                .map_err(reqwest::Error::without_url)
                 .context("发送图片请求失败")?
                 .error_for_status()
+                .map_err(reqwest::Error::without_url)
                 .context("图片响应状态异常")?;
-            let bytes = response.bytes().await.context("读取图片响应失败")?.to_vec();
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(reqwest::Error::without_url)
+                .context("读取图片响应失败")?
+                .to_vec();
             transcode_to_jpeg(bytes, dir, idx).await
         }
         .await;
@@ -1518,6 +1525,60 @@ json.dump({
     }
 
     #[tokio::test]
+    async fn download_errors_keep_diagnostics_without_signed_urls() {
+        for (stage, response, diagnostic) in [
+            ("send", None, "发送图片请求失败"),
+            (
+                "status",
+                Some("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+                "503 Service Unavailable",
+            ),
+            (
+                "body",
+                Some("HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort"),
+                "读取图片响应失败",
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = response.map(|response| {
+                std::thread::spawn(move || {
+                    for _ in 0..IMAGE_MAX_ATTEMPTS {
+                        let (mut stream, _) = listener.accept().unwrap();
+                        let mut request = [0_u8; 4096];
+                        let _ = stream.read(&mut request).unwrap();
+                        stream.write_all(response.as_bytes()).unwrap();
+                    }
+                })
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let log_path = dir.path().join("test.log");
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(std::sync::Mutex::new(std::fs::File::create(&log_path).unwrap()))
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let url = format!("http://fake-user:fake-password@{addr}/signed-image?token=fake-token");
+            let image_ref = ImageRef { url: url.clone(), referer: None, fallback_urls: vec![] };
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let error = download_one(&client, &image_ref, dir.path(), 0).await.unwrap_err();
+            if let Some(server) = server {
+                server.join().unwrap();
+            }
+            let logs = std::fs::read_to_string(log_path).unwrap();
+            for output in [format!("{error}"), format!("{error:#}"), format!("{error:?}"), logs] {
+                assert!(output.contains("127.0.0.1"), "missing host diagnostic for {stage}");
+                assert!(output.contains(diagnostic), "missing error diagnostic for {stage}");
+                for secret in [&url, "fake-token", "fake-user", "fake-password", "signed-image"] {
+                    assert!(!output.contains(secret), "{stage} error leaked signed URL: {output}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn download_one_rotates_to_fallback_url_after_http_failure() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1546,7 +1607,7 @@ json.dump({
                     .to_string();
                 paths.push(path.clone());
 
-                if path == "/primary" {
+                if path == "/primary?token=primary-signature" {
                     stream
                         .write_all(
                             b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -1566,9 +1627,9 @@ json.dump({
         });
 
         let image_ref = ImageRef {
-            url: format!("http://{addr}/primary"),
+            url: format!("http://{addr}/primary?token=primary-signature"),
             referer: None,
-            fallback_urls: vec![format!("http://{addr}/fallback")],
+            fallback_urls: vec![format!("http://{addr}/fallback?token=fallback-signature")],
         };
         let dir = tempfile::tempdir().unwrap();
         let path = download_one(&build_client().unwrap(), &image_ref, dir.path(), 0)
@@ -1578,7 +1639,10 @@ json.dump({
         assert!(image::open(path).is_ok());
         assert_eq!(
             server.join().unwrap(),
-            vec!["/primary".to_string(), "/fallback".to_string()]
+            vec![
+                "/primary?token=primary-signature".to_string(),
+                "/fallback?token=fallback-signature".to_string()
+            ]
         );
     }
 

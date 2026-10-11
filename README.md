@@ -74,6 +74,14 @@ python3 -m venv .venv
   'git+https://github.com/jiji262/douyin-downloader.git@ad7338fdc474c14e2063370540a362cd8a953b43'
 ```
 
+抖音详情的 HTML fast-path 只携带会话 Cookie 请求受信 `douyin.com` / `iesdouyin.com` 域及其子域的 HTTPS 默认端口（443），拒绝 userinfo 与其他端口。该路径不自动跟随重定向；30x 或不可信目标交回现有签名详情 API / 浏览器兜底，不修改 Cookie 文件或共享 session。短链展开仍使用独立匿名客户端。HTML 请求错误仅记录异常类型，避免凭据进入诊断。
+
+本地边界回归使用已安装的 `aiohttp`、`openssl` 和临时 TLS 证书，所有连接均限制在回环地址，不需要真实 Cookie：
+
+```bash
+.venv/bin/python -m unittest discover -s tests -p 'test_*.py'
+```
+
 ## 配置（`config.toml`）
 
 复制 `config.example.toml` 为 `config.toml`（已 gitignore），关键字段：

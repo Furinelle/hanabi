@@ -163,6 +163,20 @@ def _is_douyin_domain(host: str | None) -> bool:
     )
 
 
+def _is_trusted_html_url(raw: str) -> bool:
+    try:
+        url = urlsplit(raw)
+        return (
+            url.scheme == "https"
+            and _is_douyin_domain(url.hostname)
+            and url.port in (None, 443)
+            and url.username is None
+            and url.password is None
+        )
+    except ValueError:
+        return False
+
+
 def _aweme_id(item: Any) -> str:
     if not isinstance(item, dict):
         return ""
@@ -354,16 +368,22 @@ async def _fetch_and_extract_html_detail(
 
     try:
         for url in targets:
+            if not _is_trusted_html_url(url):
+                continue
             try:
                 timeout = aiohttp.ClientTimeout(total=10)
-                async with session.get(url, headers=headers, timeout=timeout) as resp:
-                    if resp.status == 200:
+                # The upstream session has shared cookies: never send them to a
+                # redirect target. A 30x falls back to the existing detail API.
+                async with session.get(
+                    url, headers=headers, timeout=timeout, allow_redirects=False
+                ) as resp:
+                    if resp.status == 200 and _is_trusted_html_url(str(resp.url)):
                         html = await resp.text()
                         item = extract_aweme_from_html(html, aweme_id)
                         if item:
                             return item
             except Exception as exc:
-                print(f"douyin direct html get failed url={url}: {exc}", file=sys.stderr)
+                print(f"douyin direct html get failed: {type(exc).__name__}", file=sys.stderr)
     finally:
         if close_session:
             await session.close()
@@ -941,7 +961,7 @@ async def _run(request: dict[str, Any]) -> dict[str, Any]:
                     client, aweme_id, resolved_url
                 )
             except Exception as exc:
-                print(f"douyin direct html detail extract failed: {exc}", file=sys.stderr)
+                print(f"douyin direct html detail extract failed: {type(exc).__name__}", file=sys.stderr)
 
             # 2. Try upstream client.get_video_detail
             if not _usable_detail(item, aweme_id):

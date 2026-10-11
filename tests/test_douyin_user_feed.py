@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import io
 import importlib.util
 import json
 import sys
@@ -307,6 +309,20 @@ class BridgeDetailTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["browser_fallback_used"])
         self.client.get_video_detail.assert_awaited_once_with("2")
         self.browser.assert_not_awaited()
+
+    async def test_html_exception_does_not_log_credentials_and_api_still_runs(self):
+        canary = "SYNTHETIC_COOKIE_IN_EXCEPTION"
+        self.html.side_effect = RuntimeError("Cookie: sessionid=" + canary)
+        self.client.get_video_detail.return_value = {
+            "aweme_id": "2", "images": [{"url_list": ["https://images.example/2.jpg"]}]
+        }
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            result = await self.detail()
+        self.assertEqual(result["item"], self.client.get_video_detail.return_value)
+        self.client.get_video_detail.assert_awaited_once_with("2")
+        self.assertIn("RuntimeError", output.getvalue())
+        self.assertNotIn(canary, output.getvalue())
 
     async def test_skeleton_html_and_api_continue_to_browser(self):
         self.environment["HANABI_DOUYIN_CDP_URL"] = "ws://fake"

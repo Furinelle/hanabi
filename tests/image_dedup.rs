@@ -218,3 +218,67 @@ fn fully_transparent_images_are_solid_despite_hidden_rgb() {
         MatchKind::Different
     );
 }
+
+#[test]
+fn near_black_filter_preserves_dark_artwork_small_details_and_alpha() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dark.png");
+    let mut image = image::RgbaImage::from_fn(256, 256, |x, _| {
+        image::Rgba([if x < 128 { 0 } else { 2 }, 0, 0, 255])
+    });
+    image.put_pixel(0, 0, image::Rgba([30, 30, 30, 255]));
+    image.save(&path).unwrap();
+    assert!(
+        !inspect_image(&path).unwrap().solid_color,
+        "dark layers exceed mean 1"
+    );
+
+    image = image::RgbaImage::from_pixel(256, 256, image::Rgba([0, 0, 0, 255]));
+    for x in 0..33 {
+        image.put_pixel(x, 0, image::Rgba([17, 17, 17, 255]));
+    }
+    image.save(&path).unwrap();
+    assert!(
+        !inspect_image(&path).unwrap().solid_color,
+        "visible detail exceeds 0.05 percent"
+    );
+    image.put_pixel(32, 0, image::Rgba([0, 0, 0, 255]));
+    image.save(&path).unwrap();
+    assert!(inspect_image(&path).unwrap().solid_color);
+    image.put_pixel(255, 255, image::Rgba([0, 0, 0, 0]));
+    image.save(&path).unwrap();
+    assert!(
+        !inspect_image(&path).unwrap().solid_color,
+        "alpha shape survives"
+    );
+
+    let mut small = image::RgbImage::new(100, 100);
+    small.put_pixel(50, 50, image::Rgb([30, 30, 30]));
+    small.save(&path).unwrap();
+    assert!(
+        !inspect_image(&path).unwrap().solid_color,
+        "small pixel detail survives"
+    );
+}
+
+#[test]
+fn near_black_filter_respects_mean_intensity_and_minimum_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("boundary.png");
+    let mut image = image::RgbImage::from_fn(256, 256, |_, y| {
+        image::Rgb(if y < 16 { [16; 3] } else { [0; 3] })
+    });
+    image.save(&path).unwrap();
+    assert!(inspect_image(&path).unwrap().solid_color, "mean exactly 1");
+    image.put_pixel(0, 0, image::Rgb([17; 3]));
+    image.save(&path).unwrap();
+    assert!(!inspect_image(&path).unwrap().solid_color, "mean above 1");
+
+    let mut small = image::RgbImage::new(255, 256);
+    small.put_pixel(0, 0, image::Rgb([17; 3]));
+    small.save(&path).unwrap();
+    assert!(
+        !inspect_image(&path).unwrap().solid_color,
+        "width below 256"
+    );
+}

@@ -78,28 +78,29 @@ async fn main() -> Result<()> {
 
     // Resolve configured cards once so persistent subscriptions share the same author key.
     // Keep the original target if resolution fails; the source can retry normally.
+    let store = Store::open("hanabi.db")?;
     let douyin_client = hanabi::source::douyin::build_client()?;
     for source in cfg.sources.iter_mut().filter(|s| s.kind == "douyin_user") {
         for target in &mut source.targets {
-            if hanabi::source::douyin::canonical_user_profile(target).is_some() {
-                continue;
-            }
-            match hanabi::source::douyin::resolve_douyin_url(&douyin_client, target).await {
-                Ok(url) => {
-                    if let Some(profile) =
-                        hanabi::source::douyin::canonical_user_profile(url.as_str())
-                    {
-                        *target = profile;
+            let shared_url = target.clone();
+            if hanabi::source::douyin::canonical_user_profile(target).is_none() {
+                match hanabi::source::douyin::resolve_douyin_url(&douyin_client, target).await {
+                    Ok(url) => {
+                        if let Some(profile) =
+                            hanabi::source::douyin::canonical_user_profile(url.as_str())
+                        {
+                            *target = profile;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "配置抖音作者名片预解析失败,保留原链接")
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(error = %error, "配置抖音作者名片预解析失败,保留原链接")
-                }
             }
+            store.register_configured_douyin(target, &shared_url, &source.name)?;
         }
     }
 
-    let store = Store::open("hanabi.db")?;
     let chain = FilterChain::standard();
     let gallery = if cfg.gallery.enabled() {
         match hanabi::gallery::GalleryClient::new(
@@ -351,6 +352,17 @@ fn build_sources(
 ) -> Result<Vec<Box<dyn Source>>> {
     let mut sources: Vec<Box<dyn Source>> = Vec::new();
     let mut configs = cfg.sources.clone();
+    for config in configs.iter_mut().filter(|s| s.kind == "douyin_user") {
+        let mut active = Vec::new();
+        for target in &config.targets {
+            store.register_configured_douyin(target, target, &config.name)?;
+            if !store.is_douyin_disabled(target)? {
+                active.push(target.clone());
+            }
+        }
+        config.targets = active;
+    }
+    configs.retain(|s| s.kind != "douyin_user" || !s.targets.is_empty());
     for (profile_url, shared_url) in store.douyin_subscriptions()? {
         if configs.iter().any(|source| {
             source.kind == "douyin_user"
@@ -570,6 +582,10 @@ async fn handle_douyin_user(
     let mut delivered = 0usize;
     let mut failed = 0usize;
     for item in &items {
+        store.remember_douyin_author(&item.author.url, &item.author.name)?;
+        if store.is_douyin_disabled(&item.author.url)? {
+            break;
+        }
         if store.already_pushed(item)? {
             continue;
         }
@@ -705,7 +721,9 @@ async fn handle_douyin(
         Ok(work) => {
             let subscribed = if let Some(profile) = douyin::canonical_user_profile(&work.author.url)
             {
-                store.record_manual_douyin_work(&profile, &work.source_id)?
+                let subscribed = store.record_manual_douyin_work(&profile, &work.source_id)?;
+                store.remember_douyin_author(&profile, &work.author.name)?;
+                subscribed
             } else {
                 tracing::warn!(id = %work.source_id, "抖音作品缺少有效作者身份,不累计监控链接");
                 false
@@ -958,5 +976,16 @@ targets = []
             filters: Default::default(),
         });
         assert_eq!(build_sources(&cfg, &gdl, &store).unwrap().len(), 5);
+        let author = store
+            .list_douyin_monitors()
+            .unwrap()
+            .into_iter()
+            .find(|a| a.profile_url.ends_with("MS4wTEST"))
+            .unwrap();
+        assert_eq!(author.display_name, "Artist");
+        store.unsubscribe_douyin(author.id).unwrap();
+        // The configured source must not recreate a manually removed subscription.
+        assert_eq!(build_sources(&cfg, &gdl, &store).unwrap().len(), 4);
+        assert_eq!(build_sources(&cfg, &gdl, &store).unwrap().len(), 4);
     }
 }

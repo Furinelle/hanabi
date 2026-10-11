@@ -15,13 +15,15 @@ use teloxide::types::{
 };
 use tokio::sync::Mutex;
 
+mod douyin_monitor;
 mod image_review;
 
 use crate::gallery::{GalleryClient, GalleryIngestError, GalleryPublication, GalleryPublishState};
 use crate::gallery_outbox::{GalleryOutbox, QueuedGalleryWork};
 use crate::image_dedup::{
-    init_schema as init_image_dedup_schema, inspect_image, mark_work_status, record_work,
-    remove_work, ImageFingerprint, WorkStatus,
+    classify_similarity, has_strict_duplicate, init_schema as init_image_dedup_schema,
+    inspect_image, mark_work_status, record_work, remove_work, ImageFingerprint, MatchKind,
+    WorkStatus,
 };
 use crate::model::MediaItem;
 use crate::similar_review::{
@@ -167,8 +169,11 @@ pub struct ReviewState {
     owner: i64,                 // 审批私聊数字 id;仅响应本人的命令/链接
     publish_channel: Recipient, // 批准后发布频道
     db: Mutex<rusqlite::Connection>,
+    douyin_store: Mutex<crate::store::Store>,
     // ponytail: serialize review mutations; use per-session locks if review throughput matters.
     review_gate: Arc<Mutex<()>>,
+    // Keep duplicate lookup and fingerprint registration atomic across concurrent intake jobs.
+    intake_gate: Mutex<()>,
     counter: AtomicU64,
     // 频道帖首条 msg_id → 待投递评论区的原图任务。
     pending_comments: Mutex<std::collections::HashMap<i32, CommentJob>>,
@@ -357,7 +362,9 @@ impl TelegramSink {
                 owner,
                 publish_channel: to_recipient(publish_channel_id),
                 db: Mutex::new(conn),
+                douyin_store: Mutex::new(crate::store::Store::open(db_path)?),
                 review_gate: Arc::new(Mutex::new(())),
+                intake_gate: Mutex::new(()),
                 counter: AtomicU64::new((max_token as u64 + 1).max(now_secs() as u64 * 1_000_000)),
                 pending_comments: Mutex::new(std::collections::HashMap::new()),
                 gallery,
@@ -384,7 +391,8 @@ impl TelegramSink {
         if files.is_empty() {
             anyhow::bail!("无图片可发: {}", item.source_id);
         }
-        let (kept_files, fingerprints) = inspect_non_solid_images(files).await?;
+        let _intake = self.state.intake_gate.lock().await;
+        let (kept_files, fingerprints) = self.inspect_new_images(files).await?;
         if kept_files.is_empty() {
             cleanup(files);
             return Ok(PublishResult {
@@ -480,6 +488,29 @@ impl TelegramSink {
             outcome: PublishOutcome::Full,
             publication,
         })
+    }
+
+    async fn inspect_new_images(
+        &self,
+        files: &[PathBuf],
+    ) -> Result<(Vec<PathBuf>, Vec<ImageFingerprint>)> {
+        let (files, fingerprints) = inspect_non_solid_images(files).await?;
+        let db = self.state.db.lock().await;
+        let mut kept_files = Vec::new();
+        let mut kept_fingerprints = Vec::new();
+        for (file, fingerprint) in files.into_iter().zip(fingerprints) {
+            if has_strict_duplicate(&db, &fingerprint)?
+                || kept_fingerprints
+                    .iter()
+                    .any(|old| classify_similarity(&fingerprint, old) == MatchKind::StrictSame)
+            {
+                tracing::info!(path = %file.display(), "跳过严格重复图片");
+                continue;
+            }
+            kept_files.push(file);
+            kept_fingerprints.push(fingerprint);
+        }
+        Ok((kept_files, kept_fingerprints))
     }
 
     /// 维护入口：只处理显式指定的待审 token，复用正常审批的原子抢占、频道发布、
@@ -964,6 +995,7 @@ fn command_menu(gallery_enabled: bool) -> Vec<BotCommand> {
     commands.extend([
         BotCommand::new("undo", "撤销最近一次审批动作"),
         BotCommand::new("status", "查看待审数和运行状态"),
+        BotCommand::new("douyin", "查看和删除抖音作者监控"),
         BotCommand::new("ping", "存活测试"),
         BotCommand::new("help", "查看命令列表"),
     ]);
@@ -1721,8 +1753,6 @@ fn backfill_pending_image_catalog(conn: &rusqlite::Connection) -> Result<usize> 
     Ok(backfilled)
 }
 
-/// 高清严格同图到达时，只能替换仍处于 pending 的旧审批卡片。若旧卡正发布或已经
-/// 发布，不能后台删除外部消息；调用方会保留旧版本并跳过当前版本以避免重复。
 fn review_keyboard(token: i64, has_gallery: bool) -> InlineKeyboardMarkup {
     if has_gallery {
         InlineKeyboardMarkup::new(vec![
@@ -1751,7 +1781,8 @@ impl Sink for TelegramSink {
         if files.is_empty() {
             anyhow::bail!("无图片可发: {}", item.source_id);
         }
-        let (kept_files, fingerprints) = inspect_non_solid_images(files).await?;
+        let _intake = self.state.intake_gate.lock().await;
+        let (kept_files, fingerprints) = self.inspect_new_images(files).await?;
         if kept_files.is_empty() {
             cleanup(files);
             return Ok(());
@@ -2539,6 +2570,9 @@ async fn handle_command(
     }
     let cmd = text.split_whitespace().next().unwrap_or("");
     let cmd = cmd.split('@').next().unwrap_or(cmd);
+    if cmd == "/douyin" && state.owner > 0 {
+        return douyin_monitor::send(state).await;
+    }
     if cmd == "/undo" {
         let publishing = {
             let db = state.db.lock().await;
@@ -2768,7 +2802,7 @@ async fn handle_command(
                 ""
             };
             format!(
-                "命令列表:\n/run — 立即抓取一轮\n/approve — 批准并发布全部剩余待审(仅频道,不入库){archive_help}\n/undo — 撤销最近一次审批动作并恢复审批卡片\n/status — 待审数+运行状态\n/ping — 存活测试\n/help — 本帮助\n\n💡 审批按钮:✅ 发送到频道 / 📦 发送并入库 / ❌ 丢弃\n💡 误点发送、入库或丢弃后立即发 /undo 可撤回上一步并恢复审批卡片\n💡 先逐条点 ❌ 丢弃不想推送的图片，再发 /approve 或 /approve_archive 一键处理其余图片\n💡 直接发 Pixiv/X 作品链接 → 自动抓取并发布到频道(配置图库后同步入库)\n💡 发抖音作者名片 → 自动订阅，立即抓取送审，之后随 Pixiv/X 定时抓取"
+                "命令列表:\n/run — 立即抓取一轮\n/approve — 批准并发布全部剩余待审(仅频道,不入库){archive_help}\n/undo — 撤销最近一次审批动作并恢复审批卡片\n/douyin — 查看和删除抖音作者监控\n/status — 待审数+运行状态\n/ping — 存活测试\n/help — 本帮助\n\n💡 审批按钮:✅ 发送到频道 / 📦 发送并入库 / ❌ 丢弃\n💡 误点发送、入库或丢弃后立即发 /undo 可撤回上一步并恢复审批卡片\n💡 先逐条点 ❌ 丢弃不想推送的图片，再发 /approve 或 /approve_archive 一键处理其余图片\n💡 直接发 Pixiv/X 作品链接 → 自动抓取并发布到频道(配置图库后同步入库)\n💡 发抖音作者名片 → 自动订阅，立即抓取送审，之后随 Pixiv/X 定时抓取"
             )
         }
         _ => return Ok(()),
@@ -2836,6 +2870,12 @@ fn extract_supported_urls(text: &str) -> Vec<String> {
 }
 
 async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<()> {
+    if q.data
+        .as_deref()
+        .is_some_and(|data| data.starts_with("dy:"))
+    {
+        return douyin_monitor::callback(state, q).await;
+    }
     // 权限校验:仅审批人本人可操作按钮(纵深防御,防 review_chat 被误配成可多人
     // 触达的会话时他人代批直发频道)。只在 owner 为正(私聊形态,chat_id==user_id,
     // 二者同值可比)时启用;owner 为负(群组 id)或 0(非数字降级形态)时用户 id
@@ -3083,7 +3123,118 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matching_images_use_ordinary_review_and_direct_publish() {
+    async fn douyin_menu_and_delete_are_owner_only_and_idempotent() {
+        let (base, stop, calls, server) = review_mock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = TelegramSink::new(
+            "123:test".into(),
+            "42".into(),
+            "-100123".into(),
+            dir.path().join("test.db").to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        Arc::get_mut(&mut sink.state).unwrap().bot =
+            Bot::new("123:test").set_api_url(reqwest::Url::parse(&base).unwrap());
+        let id = {
+            let store = sink.state.douyin_store.lock().await;
+            store
+                .subscribe_douyin(
+                    "https://www.douyin.com/user/MS4wTEST",
+                    "https://v.douyin.com/test/",
+                )
+                .unwrap();
+            store
+                .remember_douyin_author("https://www.douyin.com/user/MS4wTEST", "测试作者")
+                .unwrap();
+            store.list_douyin_monitors().unwrap()[0].id
+        };
+        let message = |owner: i64| {
+            serde_json::from_value::<Message>(serde_json::json!({
+            "message_id": 101, "date": 1, "chat": {"id": owner,"type": "private","first_name": "Owner"},
+            "from": {"id": owner,"is_bot": false,"first_name": "Owner"}, "text": "/douyin"
+        })).unwrap()
+        };
+        let (trigger, _) = tokio::sync::mpsc::channel(1);
+        let (link, _) = tokio::sync::mpsc::channel(1);
+        handle_command(&sink.state, &message(7), &trigger, &link)
+            .await
+            .unwrap();
+        assert!(calls.lock().unwrap().is_empty());
+        handle_command(&sink.state, &message(42), &trigger, &link)
+            .await
+            .unwrap();
+        let callback = |sender: i64, chat: i64, data: String| {
+            serde_json::from_value::<CallbackQuery>(serde_json::json!({
+                "id": "query", "from": {"id":sender,"is_bot":false,"first_name":"User"},
+                "chat_instance":"test", "message":message(chat), "data":data
+            }))
+            .unwrap()
+        };
+        for (sender, chat) in [(7, 42), (42, 7)] {
+            handle_callback(
+                &sink.state,
+                callback(sender, chat, format!("dy:remove:{id}:0")),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                sink.state
+                    .douyin_store
+                    .lock()
+                    .await
+                    .list_douyin_monitors()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        handle_callback(&sink.state, callback(42, 42, format!("dy:remove:{id}:bad")))
+            .await
+            .unwrap();
+        assert_eq!(
+            sink.state
+                .douyin_store
+                .lock()
+                .await
+                .list_douyin_monitors()
+                .unwrap()
+                .len(),
+            1
+        );
+        for _ in 0..2 {
+            handle_callback(&sink.state, callback(42, 42, format!("dy:remove:{id}:0")))
+                .await
+                .unwrap();
+        }
+        assert!(sink
+            .state
+            .douyin_store
+            .lock()
+            .await
+            .list_douyin_monitors()
+            .unwrap()
+            .is_empty());
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let calls = calls.lock().unwrap();
+        let (_, body) = calls
+            .iter()
+            .find(|(route, _)| route.to_lowercase().ends_with("sendmessage"))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert!(body["text"].as_str().unwrap().contains("1 位"));
+        assert_eq!(
+            body["reply_markup"]["inline_keyboard"][0][0]["text"],
+            "测试作者"
+        );
+        assert!(command_menu(false)
+            .iter()
+            .any(|cmd| cmd.command == "douyin"));
+    }
+
+    #[tokio::test]
+    async fn strict_duplicates_are_skipped_and_similar_images_use_ordinary_review() {
         let (base, stop, calls, server) = review_mock();
         let dir = tempfile::tempdir().unwrap();
         let mut sink = TelegramSink::new(
@@ -3120,13 +3271,25 @@ mod tests {
             }],
             origin: "test".into(),
         };
-        let file = dir.path().join("candidate.png");
-        image::RgbImage::from_fn(32, 32, |x, y| {
+        let candidate_dir = dir.path().join("candidate");
+        std::fs::create_dir_all(&candidate_dir).unwrap();
+        let file = candidate_dir.join("candidate.png");
+        let candidate = image::RgbImage::from_fn(32, 32, |x, y| {
             image::Rgb([(x * 7) as u8, (y * 7) as u8, 80])
-        })
-        .save(&file)
-        .unwrap();
+        });
+        candidate.save(&file).unwrap();
         let fingerprint = inspect_image(&file).unwrap();
+        let (kept, _) = sink
+            .inspect_new_images(&[file.clone(), file.clone()])
+            .await
+            .unwrap();
+        assert_eq!(kept, vec![file.clone()]);
+        let other_file = candidate_dir.join("other.png");
+        image::RgbImage::from_fn(32, 32, |x, y| {
+            image::Rgb([200, (x * 7) as u8, (y * 7) as u8])
+        })
+        .save(&other_file)
+        .unwrap();
         for near in [false, true] {
             let mut old = item.clone();
             old.source_id = format!("old-{near}");
@@ -3139,18 +3302,50 @@ mod tests {
                 let db = sink.state.db.lock().await;
                 db.execute("DELETE FROM image_fingerprints", []).unwrap();
                 record_work(&db, &old, &[stored], WorkStatus::Published).unwrap();
+                assert_eq!(has_strict_duplicate(&db, &fingerprint).unwrap(), !near);
+                mark_work_status(&db, &old, WorkStatus::Pending).unwrap();
+                assert_eq!(has_strict_duplicate(&db, &fingerprint).unwrap(), !near);
+                let mut resized = fingerprint.clone();
+                resized.content_sha256 = "reencoded".into();
+                resized.width *= 2;
+                resized.height *= 2;
+                assert_eq!(has_strict_duplicate(&db, &resized).unwrap(), !near);
+                resized.width *= 2;
+                assert!(!has_strict_duplicate(&db, &resized).unwrap());
+                mark_work_status(&db, &old, WorkStatus::Published).unwrap();
+            }
+            if !near {
+                let (kept, _) = sink
+                    .inspect_new_images(&[file.clone(), other_file.clone(), file.clone()])
+                    .await
+                    .unwrap();
+                assert_eq!(kept, vec![other_file.clone()]);
             }
             let mut incoming = item.clone();
             incoming.source_id = format!("new-{near}");
-            sink.deliver(&incoming, std::slice::from_ref(&file))
+            // Each attempt owns a separate download directory, as in production.
+            let review_dir = dir.path().join(format!("review-{near}"));
+            std::fs::create_dir_all(&review_dir).unwrap();
+            let review_file = review_dir.join("candidate.png");
+            candidate.save(&review_file).unwrap();
+            sink.deliver(&incoming, std::slice::from_ref(&review_file))
                 .await
                 .unwrap();
+            remove_work(&*sink.state.db.lock().await, &incoming).unwrap();
+            let direct_dir = dir.path().join(format!("direct-{near}"));
+            std::fs::create_dir_all(&direct_dir).unwrap();
+            let direct_file = direct_dir.join("candidate.png");
+            candidate.save(&direct_file).unwrap();
             assert_eq!(
-                sink.publish_direct(&incoming, std::slice::from_ref(&file))
+                sink.publish_direct(&incoming, std::slice::from_ref(&direct_file))
                     .await
                     .unwrap()
                     .outcome,
-                PublishOutcome::Full
+                if near {
+                    PublishOutcome::Full
+                } else {
+                    PublishOutcome::Skipped
+                }
             );
         }
         stop.store(true, Ordering::SeqCst);
@@ -3163,7 +3358,7 @@ mod tests {
                 |r| r.get::<_, i64>(0)
             )
             .unwrap(),
-            2
+            1
         );
         for table in ["image_review_sessions", "similar_reviews"] {
             assert_eq!(
@@ -3179,14 +3374,14 @@ mod tests {
                 .iter()
                 .filter(|(route, _)| route == "/api/ingest")
                 .count(),
-            2
+            1
         );
         assert_eq!(
             calls
                 .iter()
                 .filter(|(route, _)| route.to_lowercase().ends_with("sendphoto"))
                 .count(),
-            4
+            2
         );
         assert!(calls
             .iter()

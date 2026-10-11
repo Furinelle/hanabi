@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use reqwest::Url;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::image_dedup::{init_schema, inspect_image_bytes, ImageFingerprint, RegionFingerprint};
 use crate::model::SourceKind;
@@ -29,7 +30,30 @@ pub struct CatalogImageRecord {
 #[derive(Debug, Deserialize)]
 struct CatalogPage {
     ok: bool,
-    images: Vec<CatalogImageRecord>,
+    images: Vec<CatalogSyncImage>,
+    #[serde(deserialize_with = "required_nullable_string")]
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CatalogSyncImage {
+    #[serde(flatten)]
+    image: CatalogImageRecord,
+    catalog_id: String,
+    #[serde(deserialize_with = "required_nullable_string")]
+    fingerprint_digest: Option<String>,
+}
+
+fn required_nullable_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    Option::deserialize(deserializer)
+}
+
+#[derive(Deserialize)]
+struct FingerprintAck {
+    ok: bool,
+    upserted: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -212,13 +236,17 @@ pub async fn sync_gallery_fingerprints(
     let conn = Arc::new(Mutex::new(conn));
 
     let mut summary = CatalogSyncSummary::default();
-    let mut offset = 0_usize;
+    let mut cursor = String::new();
     let mut pending_upload: Vec<serde_json::Value> = Vec::new();
     loop {
         let response = client
             .get(format!("{endpoint}/api/catalog"))
             .bearer_auth(token)
-            .query(&[("limit", PAGE_SIZE), ("offset", offset)])
+            .query(&[
+                ("limit", PAGE_SIZE.to_string()),
+                ("after", cursor.clone()),
+                ("fingerprints", "1".into()),
+            ])
             .send()
             .await
             .context("请求 Vitrine 图片目录失败")?;
@@ -231,11 +259,28 @@ pub async fn sync_gallery_fingerprints(
         if !page.ok {
             bail!("Vitrine 图片目录返回 ok=false");
         }
-        let count = page.images.len();
-        if count == 0 {
-            break;
+        if page.images.len() > PAGE_SIZE {
+            bail!("Vitrine 图片目录超过分页上限");
         }
-        for image in page.images {
+        let mut previous = cursor.as_str();
+        for item in &page.images {
+            if item.catalog_id.as_str() <= previous {
+                bail!("Vitrine 图片目录游标未严格前进");
+            }
+            previous = &item.catalog_id;
+            if let Some(digest) = &item.fingerprint_digest {
+                if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    bail!("Vitrine 图片指纹摘要无效");
+                }
+            }
+        }
+        if let Some(next) = &page.next_cursor {
+            if page.images.is_empty() || next != previous {
+                bail!("Vitrine 图片目录下一页游标无效");
+            }
+        }
+        for item in page.images {
+            let image = item.image;
             summary.listed += 1;
             let needs_image = {
                 let conn = conn
@@ -292,17 +337,20 @@ pub async fn sync_gallery_fingerprints(
                 load_fingerprint(&conn, &image)?
             };
             if let Some(fingerprint) = fingerprint {
-                pending_upload.push(fingerprint_upload_json(&image.r2_key, &fingerprint));
+                let payload = fingerprint_upload_json(&image.r2_key, &fingerprint);
+                let digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&payload)?));
+                if item.fingerprint_digest.as_deref() == Some(digest.as_str()) {
+                    continue;
+                }
+                pending_upload.push(payload);
                 if pending_upload.len() == 50 {
                     summary.pushed +=
                         push_fingerprints(&client, endpoint, token, &mut pending_upload).await;
                 }
             }
         }
-        offset += count;
-        if count < PAGE_SIZE {
-            break;
-        }
+        let Some(next) = page.next_cursor else { break };
+        cursor = next;
     }
     summary.pushed += push_fingerprints(&client, endpoint, token, &mut pending_upload).await;
     Ok(summary)
@@ -327,7 +375,15 @@ async fn push_fingerprints(
         .send()
         .await
     {
-        Ok(response) if response.status().is_success() => count,
+        Ok(response) if response.status().is_success() => {
+            match response.json::<FingerprintAck>().await {
+                Ok(ack) if ack.ok && ack.upserted == count => count,
+                _ => {
+                    tracing::warn!("上传图库指纹确认数量无效，下一轮重新核对");
+                    0
+                }
+            }
+        }
         Ok(response) => {
             tracing::warn!(
                 status = %response.status(),

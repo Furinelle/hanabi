@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use crate::filter::FilterChain;
-use crate::model::MediaItem;
+use crate::model::{MediaItem, SourceKind};
 use crate::sink::Sink;
 use crate::source::Source;
 use crate::store::Store;
@@ -33,6 +33,12 @@ where
             }
         };
         for item in items {
+            if item.source == SourceKind::Douyin {
+                store.remember_douyin_author(&item.author.url, &item.author.name)?;
+                if store.is_douyin_disabled(&item.author.url)? {
+                    continue;
+                }
+            }
             if store.already_pushed(&item)? {
                 continue;
             }

@@ -136,8 +136,30 @@ fn is_solid_color(image: &image::DynamicImage) -> bool {
             min[channel] = min[channel].min(pixel[channel]);
             max[channel] = max[channel].max(pixel[channel]);
             if max[channel] - min[channel] > 5 {
-                return false;
+                return is_near_black_placeholder(&rgba);
             }
+        }
+    }
+    true
+}
+
+fn is_near_black_placeholder(rgba: &image::RgbaImage) -> bool {
+    // Only large opaque pages can be nearly invisible filler; preserve pixel art and alpha shapes.
+    if rgba.width() < 256 || rgba.height() < 256 {
+        return false;
+    }
+    let pixels = u64::from(rgba.width()) * u64::from(rgba.height());
+    let mut intensity = 0_u64;
+    let mut visible = 0_u64;
+    for pixel in rgba.pixels() {
+        if pixel[3] != 255 {
+            return false;
+        }
+        let peak = pixel[0].max(pixel[1]).max(pixel[2]);
+        intensity += u64::from(peak);
+        visible += u64::from(peak > 16);
+        if intensity > pixels || visible * 2000 > pixels {
+            return false;
         }
     }
     true
@@ -276,6 +298,32 @@ pub fn classify_similarity(left: &ImageFingerprint, right: &ImageFingerprint) ->
     }
 }
 
+pub fn has_strict_duplicate(conn: &Connection, image: &ImageFingerprint) -> Result<bool> {
+    let mut stmt = conn.prepare(
+        "SELECT content_sha256,average_hash,difference_hash,width,height
+         FROM image_fingerprints
+         WHERE status IN ('pending','published') AND solid_color=0
+           AND (content_sha256=?1 OR (color_key=?2 AND detail_key=?3))",
+    )?;
+    let mut rows = stmt.query(params![
+        image.content_sha256,
+        image.color_key,
+        image.detail_key
+    ])?;
+    while let Some(row) = rows.next()? {
+        let mut old = image.clone();
+        old.content_sha256 = row.get(0)?;
+        old.average_hash = u64::from_str_radix(&row.get::<_, String>(1)?, 16)?;
+        old.difference_hash = u64::from_str_radix(&row.get::<_, String>(2)?, 16)?;
+        old.width = row.get(3)?;
+        old.height = row.get(4)?;
+        if classify_similarity(image, &old) == MatchKind::StrictSame {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn partial_distance(left: &ImageFingerprint, right: &ImageFingerprint) -> Option<u32> {
     region_distance(&left.regions, right)
         .into_iter()
@@ -350,7 +398,11 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_image_fingerprints_strict
            ON image_fingerprints(strict_key);
          CREATE INDEX IF NOT EXISTS idx_image_fingerprints_status
-           ON image_fingerprints(status);",
+           ON image_fingerprints(status);
+         CREATE INDEX IF NOT EXISTS idx_image_fingerprints_content
+           ON image_fingerprints(content_sha256);
+         CREATE INDEX IF NOT EXISTS idx_image_fingerprints_visual
+           ON image_fingerprints(color_key,detail_key);",
     )?;
     let _ = conn.execute(
         "ALTER TABLE image_fingerprints ADD COLUMN regions_json TEXT NOT NULL DEFAULT '[]'",

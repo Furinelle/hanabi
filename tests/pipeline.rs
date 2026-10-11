@@ -157,3 +157,34 @@ async fn failed_delivery_not_marked_and_retried_next_round() {
     .unwrap();
     assert_eq!(ok_sink.delivered.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn removed_douyin_author_is_not_downloaded_or_marked_pushed() {
+    let store = Store::open_in_memory().unwrap();
+    let url = "https://www.douyin.com/user/MS4wREMOVED";
+    store.subscribe_douyin(url, url).unwrap();
+    let id = store.list_douyin_monitors().unwrap()[0].id;
+    store.unsubscribe_douyin(id).unwrap();
+    let mut removed = item("removed", 100);
+    removed.source = SourceKind::Douyin;
+    removed.author.url = url.into();
+    let sources: Vec<Box<dyn Source>> = vec![Box::new(MockSource {
+        items: vec![removed.clone(), item("keep", 100)],
+        cfg: Default::default(),
+    })];
+    let sink = MockSink::default();
+    run_once(
+        &store,
+        &sources,
+        &FilterChain::standard(),
+        &sink,
+        |work| async move {
+            assert_ne!(work.source_id, "removed");
+            Vec::<PathBuf>::new()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(*sink.delivered.lock().unwrap(), vec!["keep"]);
+    assert!(!store.already_pushed(&removed).unwrap());
+}

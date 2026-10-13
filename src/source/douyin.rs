@@ -424,8 +424,13 @@ pub struct UserFeed {
     pub items: Vec<MediaItem>,
 }
 
+/// 桥接器共用同一份 Cookie 文件与登录态:逐次串行,避免并发写坏 Cookie、并发请求加重风控。
+/// 粒度是单次调用(一个作者 feed 或一个作品详情),手动链接最多等定时抓取当前这一个作者。
+static BRIDGE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// 定时来源与手动作者名片共用的 douyin-downloader 抓取桥。
 pub async fn fetch_user_feed(runtime: &DouyinCfg, target: &str, origin: &str) -> Result<UserFeed> {
+    let _bridge = BRIDGE_GATE.lock().await;
     let runtime = runtime.clone();
     let target_owned = target.to_string();
     let response = tokio::task::spawn_blocking(move || {
@@ -686,6 +691,7 @@ pub async fn fetch_shared_work(
 }
 
 async fn fetch_signed_work(runtime: &DouyinCfg, url: &str, origin: &str) -> Result<SharedWork> {
+    let _bridge = BRIDGE_GATE.lock().await;
     let runtime = runtime.clone();
     let target = url.to_string();
     let response = tokio::task::spawn_blocking(move || {

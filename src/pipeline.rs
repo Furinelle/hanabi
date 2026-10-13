@@ -33,6 +33,8 @@ where
             }
         };
         for item in items {
+            // 手动链接可能正在处理同一作品:持锁后再查重,避免重复交付。
+            let _work = crate::util::work_lock(item.source.as_str(), &item.source_id).await;
             if item.source == SourceKind::Douyin {
                 store.remember_douyin_author(&item.author.url, &item.author.name)?;
                 if store.is_douyin_disabled(&item.author.url)? {

@@ -227,57 +227,26 @@ async fn main() -> Result<()> {
         }
     };
 
-    // 手动链接 in-flight 去重:同一链接连发两次时,两个任务会在"查重→下载→发布"的
-    // 窗口内都读到未推送,各自发布 → 频道重复;以 URL 粒度串行化。
-    let inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
-        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-
-    // ponytail: serialize scheduled rounds and manual Douyin batches to protect shared
-    // download paths and approval dedup; use per-author locks if waiting becomes material.
-    let douyin_gate = Arc::new(tokio::sync::Mutex::new(()));
-
+    // 手动链接由独立任务消费:定时抓取一轮可达十几分钟,主循环内联等待 run_once,
+    // 链接若也在主循环里取,整轮期间都会卡在"抓取中"。
     {
-        let _guard = douyin_gate.lock().await;
-        // 启动立即跑首轮。
-        if let Err(e) = run_once(
-            &store,
-            &sources,
-            &chain,
-            sink.as_ref() as &dyn Sink,
-            &download,
-        )
-        .await
-        {
-            tracing::error!(error = %e, "本轮异常");
-        }
-    }
-    loop {
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let wait = secs_until_next_slot(cfg.poll_interval_secs, cfg.tz_offset_hours, now_unix);
-        tracing::info!(
-            wait_secs = wait,
-            "下次抓取在 {:.1} 小时后",
-            wait as f64 / 3600.0
-        );
-        // 整点时间槽到点 / /run 手动触发 → 跑一轮;手动链接 → 直发频道(不跑全量)。
-        let do_fetch = tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(wait)) => true,
-            _ = trigger_rx.recv() => {
-                tracing::info!("收到 /run 手动触发,立即抓取");
-                true
-            }
-            Some(job) = link_rx.recv() => {
+        let gdl = gdl.clone();
+        let sink = sink.clone();
+        let x_size = x_size.clone();
+        let douyin_runtime = douyin_runtime.clone();
+        tokio::spawn(async move {
+            // in-flight 去重:同一链接连发两次时,两个任务会在"查重→下载→发布"的
+            // 窗口内都读到未推送,各自发布 → 频道重复;以 URL 粒度串行化。
+            let inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+                Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+            while let Some(job) = link_rx.recv().await {
                 tracing::info!(url = %job.url, "收到手动链接,直发频道");
-                // 移入独立 task:慢链接(probe+下载+上传)不阻塞定时槽与 /run。
+                // 移入独立 task:慢链接(probe+下载+上传)不阻塞后面的链接。
                 let gdl = gdl.clone();
                 let sink = sink.clone();
                 let x_size = x_size.clone();
                 let douyin_runtime = douyin_runtime.clone();
                 let inflight = inflight.clone();
-                let douyin_gate = douyin_gate.clone();
                 tokio::spawn(async move {
                     let url = job.url.clone();
                     let notice_id = job.notice_msg_id;
@@ -293,19 +262,8 @@ async fn main() -> Result<()> {
                         set: inflight.clone(),
                         url: url.clone(),
                     };
-                    let _douyin_guard = if hanabi::source::douyin::is_douyin_url(&url) {
-                        Some(douyin_gate.lock().await)
-                    } else {
-                        None
-                    };
-                    if let Err(e) = handle_link(
-                        job,
-                        &gdl,
-                        x_size.as_deref(),
-                        &douyin_runtime,
-                        &sink,
-                    )
-                    .await
+                    if let Err(e) =
+                        handle_link(job, &gdl, x_size.as_deref(), &douyin_runtime, &sink).await
                     {
                         tracing::warn!(error = %e, "手动链接处理失败");
                         // 失败反馈:把"抓取中"改成失败提示,不再永久残留
@@ -323,23 +281,49 @@ async fn main() -> Result<()> {
                         .await;
                     }
                 });
-                false
             }
-        };
-        if do_fetch {
-            let _guard = douyin_gate.lock().await;
-            let sources = build_sources(&cfg, &gdl, &store)?;
-            if let Err(e) = run_once(
-                &store,
-                &sources,
-                &chain,
-                sink.as_ref() as &dyn Sink,
-                &download,
-            )
-            .await
-            {
-                tracing::error!(error = %e, "本轮异常");
-            }
+        });
+    }
+
+    // 启动立即跑首轮。
+    if let Err(e) = run_once(
+        &store,
+        &sources,
+        &chain,
+        sink.as_ref() as &dyn Sink,
+        &download,
+    )
+    .await
+    {
+        tracing::error!(error = %e, "本轮异常");
+    }
+    loop {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let wait = secs_until_next_slot(cfg.poll_interval_secs, cfg.tz_offset_hours, now_unix);
+        tracing::info!(
+            wait_secs = wait,
+            "下次抓取在 {:.1} 小时后",
+            wait as f64 / 3600.0
+        );
+        // 整点时间槽到点 / /run 手动触发 → 跑一轮。
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
+            _ = trigger_rx.recv() => tracing::info!("收到 /run 手动触发,立即抓取"),
+        }
+        let sources = build_sources(&cfg, &gdl, &store)?;
+        if let Err(e) = run_once(
+            &store,
+            &sources,
+            &chain,
+            sink.as_ref() as &dyn Sink,
+            &download,
+        )
+        .await
+        {
+            tracing::error!(error = %e, "本轮异常");
         }
     }
 }
@@ -462,6 +446,7 @@ async fn handle_link(
         let mut delivered = 0usize;
         let mut failed = 0usize; // 下载 0 张 + 交付失败
         for item in &items {
+            let _work = hanabi::util::work_lock(item.source.as_str(), &item.source_id).await;
             if store.already_pushed(item)? {
                 continue;
             }
@@ -506,6 +491,7 @@ async fn handle_link(
     let mut partial = 0usize;
     let mut failed = 0usize;
     for item in &items {
+        let _work = hanabi::util::work_lock(item.source.as_str(), &item.source_id).await;
         if store.already_pushed(item)? {
             tracing::info!(id = %item.source_id, "手动链接作品已发过,跳过");
             continue;
@@ -582,6 +568,7 @@ async fn handle_douyin_user(
     let mut delivered = 0usize;
     let mut failed = 0usize;
     for item in &items {
+        let _work = hanabi::util::work_lock(item.source.as_str(), &item.source_id).await;
         store.remember_douyin_author(&item.author.url, &item.author.name)?;
         if store.is_douyin_disabled(&item.author.url)? {
             break;
@@ -741,6 +728,8 @@ async fn handle_douyin(
             };
             // 结束时留给用户的提示;None = 全部顺利,静默删掉两条消息即可。
             let mut notice: Option<String> = None;
+            // 定时抓取可能正在送审同一作品:持锁后再查重。
+            let _work = hanabi::util::work_lock(item.source.as_str(), &item.source_id).await;
             if store.already_pushed(&item)? {
                 tracing::info!(id = %item.source_id, "抖音作品已发过,跳过");
             } else {

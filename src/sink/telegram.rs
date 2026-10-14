@@ -20,11 +20,7 @@ mod image_review;
 
 use crate::gallery::{GalleryClient, GalleryIngestError, GalleryPublication, GalleryPublishState};
 use crate::gallery_outbox::{GalleryOutbox, QueuedGalleryWork};
-use crate::image_dedup::{
-    classify_similarity, has_strict_duplicate, init_schema as init_image_dedup_schema,
-    inspect_image, mark_work_status, record_work, remove_work, ImageFingerprint, MatchKind,
-    WorkStatus,
-};
+use crate::image_dedup::inspect_image;
 use crate::model::MediaItem;
 use crate::similar_review::{
     init_schema as init_similar_review_schema, remove_pending_candidate_reviews,
@@ -172,8 +168,6 @@ pub struct ReviewState {
     douyin_store: Mutex<crate::store::Store>,
     // ponytail: serialize review mutations; use per-session locks if review throughput matters.
     review_gate: Arc<Mutex<()>>,
-    // Keep duplicate lookup and fingerprint registration atomic across concurrent intake jobs.
-    intake_gate: Mutex<()>,
     counter: AtomicU64,
     // 频道帖首条 msg_id → 待投递评论区的原图任务。
     pending_comments: Mutex<std::collections::HashMap<i32, CommentJob>>,
@@ -259,7 +253,6 @@ impl TelegramSink {
              );",
         )
         .context("初始化 pending 表失败")?;
-        init_image_dedup_schema(&conn).context("初始化图片去重表失败")?;
         init_similar_review_schema(&conn).context("初始化相似图审批表失败")?;
         image_review::init_schema(&conn)?;
         // 兼容旧库:补列,已存在则忽略报错。
@@ -319,10 +312,6 @@ impl TelegramSink {
             [],
         )
         .context("恢复中断的撤销操作失败")?;
-        let backfilled = backfill_pending_image_catalog(&conn)?;
-        if backfilled > 0 {
-            tracing::info!(backfilled, "已为现有待审作品补建图片指纹");
-        }
         // counter 从已有最大 token 续上,避免重启后 token 与旧记录冲突。
         let max_token: i64 = conn
             .query_row("SELECT COALESCE(MAX(token), 0) FROM (SELECT token FROM pending UNION ALL SELECT token FROM image_review_sessions UNION ALL SELECT token FROM review_actions UNION ALL SELECT token FROM similar_reviews)", [], |r| {
@@ -364,7 +353,6 @@ impl TelegramSink {
                 db: Mutex::new(conn),
                 douyin_store: Mutex::new(crate::store::Store::open(db_path)?),
                 review_gate: Arc::new(Mutex::new(())),
-                intake_gate: Mutex::new(()),
                 counter: AtomicU64::new((max_token as u64 + 1).max(now_secs() as u64 * 1_000_000)),
                 pending_comments: Mutex::new(std::collections::HashMap::new()),
                 gallery,
@@ -391,8 +379,7 @@ impl TelegramSink {
         if files.is_empty() {
             anyhow::bail!("无图片可发: {}", item.source_id);
         }
-        let _intake = self.state.intake_gate.lock().await;
-        let (kept_files, fingerprints) = self.inspect_new_images(files).await?;
+        let kept_files = non_solid_images(files).await?;
         if kept_files.is_empty() {
             cleanup(files);
             return Ok(PublishResult {
@@ -460,10 +447,6 @@ impl TelegramSink {
                 Some(&gallery_publication),
             )
             .await;
-            let db = self.state.db.lock().await;
-            if let Err(error) = record_work(&db, item, &fingerprints, WorkStatus::Published) {
-                tracing::warn!(error = %error, id = %item.source_id, "登记直发图片指纹失败");
-            }
             return Ok(PublishResult {
                 outcome: PublishOutcome::Partial,
                 publication,
@@ -479,38 +462,10 @@ impl TelegramSink {
             Some(&gallery_publication),
         )
         .await;
-        let db = self.state.db.lock().await;
-        if let Err(error) = record_work(&db, item, &fingerprints, WorkStatus::Published) {
-            tracing::warn!(error = %error, id = %item.source_id, "登记直发图片指纹失败");
-        }
-        drop(db);
         Ok(PublishResult {
             outcome: PublishOutcome::Full,
             publication,
         })
-    }
-
-    async fn inspect_new_images(
-        &self,
-        files: &[PathBuf],
-    ) -> Result<(Vec<PathBuf>, Vec<ImageFingerprint>)> {
-        let (files, fingerprints) = inspect_non_solid_images(files).await?;
-        let db = self.state.db.lock().await;
-        let mut kept_files = Vec::new();
-        let mut kept_fingerprints = Vec::new();
-        for (file, fingerprint) in files.into_iter().zip(fingerprints) {
-            if has_strict_duplicate(&db, &fingerprint)?
-                || kept_fingerprints
-                    .iter()
-                    .any(|old| classify_similarity(&fingerprint, old) == MatchKind::StrictSame)
-            {
-                tracing::info!(path = %file.display(), "跳过严格重复图片");
-                continue;
-            }
-            kept_files.push(file);
-            kept_fingerprints.push(fingerprint);
-        }
-        Ok((kept_files, kept_fingerprints))
     }
 
     /// 维护入口：只处理显式指定的待审 token，复用正常审批的原子抢占、频道发布、
@@ -1542,13 +1497,13 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
     }
     // ① 超期 pending。
     let cutoff = now_secs() - PENDING_TTL_SECS;
-    let expired: Vec<(i64, String, String, String)> = {
+    let expired: Vec<(i64, String, String)> = {
         let db = state.db.lock().await;
         let mut out = Vec::new();
         if let Ok(mut stmt) = db.prepare(
             // 只清未在发布中的审批：publishing 表示有发布任务在途,清了会与其互踩
             // (删其正在上传的文件、DELETE 其记录,失败后的 restore 变成空操作)。
-            "SELECT token, files, msg_ids, COALESCE(item_meta, '{}') FROM pending
+            "SELECT token, files, msg_ids FROM pending
              WHERE created_at > 0 AND created_at < ?1 AND state IN ('pending','similar')",
         ) {
             if let Ok(rows) = stmt.query_map([cutoff], |r| {
@@ -1556,7 +1511,6 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
                 ))
             }) {
                 out.extend(rows.flatten());
@@ -1564,7 +1518,7 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
         }
         out
     };
-    for (token, files_json, msg_json, item_meta) in &expired {
+    for (token, files_json, msg_json) in &expired {
         if let Ok(ids) = serde_json::from_str::<Vec<i32>>(msg_json) {
             for mid in ids {
                 let _ = state
@@ -1580,9 +1534,6 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
         let db = state.db.lock().await;
         let _ = db.execute("DELETE FROM pending WHERE token=?1", [*token]);
         let _ = remove_pending_candidate_reviews(&db, *token);
-        if let Ok(item) = serde_json::from_str::<MediaItem>(item_meta) {
-            let _ = remove_work(&db, &item);
-        }
     }
     if !expired.is_empty() {
         tracing::info!(count = expired.len(), "清理超期 pending");
@@ -1676,81 +1627,26 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
     .await;
 }
 
-async fn inspect_non_solid_images(
-    files: &[PathBuf],
-) -> Result<(Vec<PathBuf>, Vec<ImageFingerprint>)> {
-    let fingerprints = inspect_images(files).await?;
-    let mut kept_files = Vec::new();
-    let mut kept_fingerprints = Vec::new();
-    for (file, fingerprint) in files.iter().zip(fingerprints) {
-        if fingerprint.solid_color {
-            tracing::info!(path = %file.display(), "跳过纯色图片");
-        } else {
-            kept_files.push(file.clone());
-            kept_fingerprints.push(fingerprint);
-        }
-    }
-    Ok((kept_files, kept_fingerprints))
-}
-
-async fn inspect_images(files: &[PathBuf]) -> Result<Vec<ImageFingerprint>> {
+/// Drop solid-color and near-black filler pages; duplicates are Vitrine's job.
+async fn non_solid_images(files: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let files = files.to_vec();
     tokio::task::spawn_blocking(move || {
-        files
+        let solid = files
             .par_iter()
-            .map(|path| inspect_image(path))
-            .collect::<Result<Vec<_>>>()
+            .map(|path| inspect_image(path).map(|fingerprint| fingerprint.solid_color))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(files
+            .into_iter()
+            .zip(solid)
+            .filter_map(|(file, solid)| {
+                if solid {
+                    tracing::info!(path = %file.display(), "跳过纯色图片");
+                }
+                (!solid).then_some(file)
+            })
+            .collect())
     })
     .await?
-}
-
-fn backfill_pending_image_catalog(conn: &rusqlite::Connection) -> Result<usize> {
-    let rows: Vec<(String, String, String)> = {
-        let mut stmt = conn.prepare(
-            "SELECT COALESCE(item_meta, '{}'),originals,files FROM pending
-             WHERE state IN ('pending','similar')",
-        )?;
-        let mapped = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-        mapped.collect::<rusqlite::Result<_>>()?
-    };
-    let mut backfilled = 0;
-    for (item_meta, originals_json, files_json) in rows {
-        let Ok(item) = serde_json::from_str::<MediaItem>(&item_meta) else {
-            continue;
-        };
-        let (kind, source_id) = item.dedup_key();
-        let exists: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM image_fingerprints WHERE source_kind=?1 AND source_id=?2",
-            rusqlite::params![kind, source_id],
-            |row| row.get(0),
-        )?;
-        if exists > 0 {
-            continue;
-        }
-        let raw = serde_json::from_str::<Vec<String>>(&originals_json)
-            .ok()
-            .filter(|paths| !paths.is_empty())
-            .or_else(|| serde_json::from_str::<Vec<String>>(&files_json).ok())
-            .unwrap_or_default();
-        let fingerprints = raw
-            .iter()
-            .map(|path| inspect_image(Path::new(path)))
-            .collect::<Result<Vec<_>>>();
-        match fingerprints {
-            Ok(fingerprints) if !fingerprints.is_empty() => {
-                record_work(conn, &item, &fingerprints, WorkStatus::Pending)?;
-                backfilled += 1;
-            }
-            Ok(_) => {}
-            Err(error) => tracing::warn!(
-                error = %error,
-                source = item.source.as_str(),
-                id = %item.source_id,
-                "现有待审图片指纹补建失败"
-            ),
-        }
-    }
-    Ok(backfilled)
 }
 
 fn review_keyboard(token: i64, has_gallery: bool) -> InlineKeyboardMarkup {
@@ -1781,15 +1677,13 @@ impl Sink for TelegramSink {
         if files.is_empty() {
             anyhow::bail!("无图片可发: {}", item.source_id);
         }
-        let _intake = self.state.intake_gate.lock().await;
-        let (kept_files, fingerprints) = self.inspect_new_images(files).await?;
+        let kept_files = non_solid_images(files).await?;
         if kept_files.is_empty() {
             cleanup(files);
             return Ok(());
         }
         let files = kept_files.as_slice();
         let originals = files.to_vec();
-        let kept_fingerprints = fingerprints;
         let effective_item = item.clone();
         let caption = render_caption(&effective_item);
         let files_owned = originals.clone();
@@ -1881,12 +1775,6 @@ impl Sink for TelegramSink {
                 tx.execute(
                     "INSERT OR REPLACE INTO pending(token, files, caption, msg_ids, originals, created_at, state, is_r18, item_meta) VALUES(?1,?2,?3,?4,?5,?6,'pending',?7,?8)",
                     rusqlite::params![token as i64, files_json, caption, msg_json, originals_json, now_secs(), effective_item.is_r18, item_meta],
-                )?;
-                record_work(
-                    &tx,
-                    &effective_item,
-                    &kept_fingerprints,
-                    WorkStatus::Pending,
                 )?;
                 tx.commit()?;
                 Ok(())
@@ -2114,18 +2002,6 @@ async fn finish_claimed(
             return Err(e).context("登记最近审批动作失败");
         }
     };
-    if let Ok(item) = serde_json::from_str::<MediaItem>(&work.item_meta) {
-        let db = state.db.lock().await;
-        let catalog_result = if publish {
-            mark_work_status(&db, &item, WorkStatus::Published)
-        } else {
-            remove_work(&db, &item)
-        };
-        if let Err(error) = catalog_result {
-            tracing::warn!(error = %error, token, "更新图片去重状态失败");
-        }
-    }
-
     if delete_review_messages {
         for mid in &work.msg_ids {
             let _ = state
@@ -2666,12 +2542,6 @@ async fn handle_command(
                     if action_kind != "discard" {
                         cancel_undone_gallery_outbox(state, &item);
                         retract_undone_gallery(state, action_id, &item).await?;
-                    }
-                    {
-                        let db = state.db.lock().await;
-                        if let Err(error) = remove_work(&db, &item) {
-                            tracing::warn!(error = %error, action_id, "撤销时清除已发布指纹失败");
-                        }
                     }
                     TelegramSink {
                         state: state.clone(),
@@ -3234,7 +3104,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_duplicates_are_skipped_and_similar_images_use_ordinary_review() {
+    async fn duplicate_images_are_left_to_the_gallery() {
         let (base, stop, calls, server) = review_mock();
         let dir = tempfile::tempdir().unwrap();
         let mut sink = TelegramSink::new(
@@ -3250,124 +3120,55 @@ mod tests {
             .bot
             .clone()
             .set_api_url(reqwest::Url::parse(&base).unwrap());
-        let item = crate::model::MediaItem {
+        let item = |id: &str| crate::model::MediaItem {
             source: crate::model::SourceKind::X,
-            source_id: "backfill-1".into(),
+            source_id: id.into(),
             author: crate::model::Author {
                 name: "画师".into(),
                 url: "https://x.com/a".into(),
             },
-            title: Some("旧待审".into()),
-            url: "https://x.com/a/status/1".into(),
+            title: Some("同图".into()),
+            url: format!("https://x.com/a/status/{id}"),
             tags: vec![],
             bookmark_count: None,
             is_r18: false,
             pixiv_type: None,
             page_count: 1,
-            images: vec![crate::model::ImageRef {
-                url: "https://example.test/1.png".into(),
-                referer: None,
-                fallback_urls: vec![],
-            }],
+            images: vec![],
             origin: "test".into(),
         };
-        let candidate_dir = dir.path().join("candidate");
-        std::fs::create_dir_all(&candidate_dir).unwrap();
-        let file = candidate_dir.join("candidate.png");
-        let candidate = image::RgbImage::from_fn(32, 32, |x, y| {
+        let image = image::RgbImage::from_fn(32, 32, |x, y| {
             image::Rgb([(x * 7) as u8, (y * 7) as u8, 80])
         });
-        candidate.save(&file).unwrap();
-        let fingerprint = inspect_image(&file).unwrap();
-        let (kept, _) = sink
-            .inspect_new_images(&[file.clone(), file.clone()])
-            .await
-            .unwrap();
-        assert_eq!(kept, vec![file.clone()]);
-        let other_file = candidate_dir.join("other.png");
-        image::RgbImage::from_fn(32, 32, |x, y| {
-            image::Rgb([200, (x * 7) as u8, (y * 7) as u8])
-        })
-        .save(&other_file)
-        .unwrap();
-        for near in [false, true] {
-            let mut old = item.clone();
-            old.source_id = format!("old-{near}");
-            let mut stored = fingerprint.clone();
-            if near {
-                stored.content_sha256 = "different".into();
-                stored.detail_key = "different".into();
-            }
-            {
-                let db = sink.state.db.lock().await;
-                db.execute("DELETE FROM image_fingerprints", []).unwrap();
-                record_work(&db, &old, &[stored], WorkStatus::Published).unwrap();
-                assert_eq!(has_strict_duplicate(&db, &fingerprint).unwrap(), !near);
-                mark_work_status(&db, &old, WorkStatus::Pending).unwrap();
-                assert_eq!(has_strict_duplicate(&db, &fingerprint).unwrap(), !near);
-                let mut resized = fingerprint.clone();
-                resized.content_sha256 = "reencoded".into();
-                resized.width *= 2;
-                resized.height *= 2;
-                assert_eq!(has_strict_duplicate(&db, &resized).unwrap(), !near);
-                resized.width *= 2;
-                assert!(!has_strict_duplicate(&db, &resized).unwrap());
-                mark_work_status(&db, &old, WorkStatus::Published).unwrap();
-            }
-            if !near {
-                let (kept, _) = sink
-                    .inspect_new_images(&[file.clone(), other_file.clone(), file.clone()])
-                    .await
-                    .unwrap();
-                assert_eq!(kept, vec![other_file.clone()]);
-            }
-            let mut incoming = item.clone();
-            incoming.source_id = format!("new-{near}");
-            // Each attempt owns a separate download directory, as in production.
-            let review_dir = dir.path().join(format!("review-{near}"));
-            std::fs::create_dir_all(&review_dir).unwrap();
-            let review_file = review_dir.join("candidate.png");
-            candidate.save(&review_file).unwrap();
-            sink.deliver(&incoming, std::slice::from_ref(&review_file))
-                .await
-                .unwrap();
-            remove_work(&*sink.state.db.lock().await, &incoming).unwrap();
-            let direct_dir = dir.path().join(format!("direct-{near}"));
-            std::fs::create_dir_all(&direct_dir).unwrap();
-            let direct_file = direct_dir.join("candidate.png");
-            candidate.save(&direct_file).unwrap();
-            assert_eq!(
-                sink.publish_direct(&incoming, std::slice::from_ref(&direct_file))
-                    .await
-                    .unwrap()
-                    .outcome,
-                if near {
-                    PublishOutcome::Full
-                } else {
-                    PublishOutcome::Skipped
-                }
-            );
+        // Each attempt owns a separate download directory, as in production.
+        let copy = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            let file = path.join("same.png");
+            image.save(&file).unwrap();
+            file
+        };
+        for id in ["1", "2"] {
+            sink.deliver(&item(id), &[copy(id)]).await.unwrap();
         }
+        assert_eq!(
+            sink.publish_direct(&item("3"), &[copy("3")])
+                .await
+                .unwrap()
+                .outcome,
+            PublishOutcome::Full
+        );
         stop.store(true, Ordering::SeqCst);
         server.join().unwrap();
         let db = sink.state.db.lock().await;
-        assert_eq!(
-            db.query_row(
-                "SELECT COUNT(*) FROM pending WHERE state='pending'",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            1
-        );
-        for table in ["image_review_sessions", "similar_reviews"] {
-            assert_eq!(
-                db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
-                    .get::<_, i64>(0))
-                    .unwrap(),
-                0
-            );
-        }
+        let pending: Vec<String> = db
+            .prepare("SELECT files FROM pending WHERE state='pending' ORDER BY token")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(pending.len(), 2);
         let calls = calls.lock().unwrap();
         assert_eq!(
             calls
@@ -3376,19 +3177,6 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(
-            calls
-                .iter()
-                .filter(|(route, _)| route.to_lowercase().ends_with("sendphoto"))
-                .count(),
-            2
-        );
-        assert!(calls
-            .iter()
-            .all(|(route, body)| !route.contains("/api/catalog")
-                && !route.to_lowercase().ends_with("deletemessage")
-                && !String::from_utf8_lossy(body).contains("image:")
-                && !String::from_utf8_lossy(body).contains("similar:")));
     }
 
     #[tokio::test]
@@ -3400,14 +3188,11 @@ mod tests {
         image.save(&black).unwrap();
         image.put_pixel(10, 10, image::Rgb([200, 100, 50]));
         image.save(&detail).unwrap();
-        let (files, fingerprints) = inspect_non_solid_images(&[black.clone(), detail.clone()])
+        let files = non_solid_images(&[black.clone(), detail.clone()])
             .await
             .unwrap();
         assert_eq!(files, vec![detail]);
-        assert_eq!(fingerprints.len(), 1);
-        assert!(!fingerprints[0].solid_color);
-        let (files, fingerprints) = inspect_non_solid_images(&[black]).await.unwrap();
-        assert!(files.is_empty() && fingerprints.is_empty());
+        assert!(non_solid_images(&[black]).await.unwrap().is_empty());
     }
 
     #[test]
@@ -3644,14 +3429,6 @@ mod tests {
         assert!(cols.contains(&"state".to_string()));
         assert!(cols.contains(&"is_r18".to_string()));
         assert!(cols.contains(&"item_meta".to_string()));
-        let image_table: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='image_fingerprints'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(image_table, 1);
         let state: String = conn
             .query_row("SELECT state FROM pending WHERE token=1", [], |r| r.get(0))
             .unwrap();
@@ -3665,70 +3442,6 @@ mod tests {
             .query_row("SELECT is_r18 FROM pending WHERE token=1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(plain, 0);
-    }
-
-    #[test]
-    fn existing_pending_media_is_backfilled_into_image_catalog() {
-        let dir = tempfile::tempdir().unwrap();
-        let image_path = dir.path().join("pending.png");
-        image::RgbImage::from_pixel(64, 48, image::Rgb([12, 34, 56]))
-            .save(&image_path)
-            .unwrap();
-        let item = crate::model::MediaItem {
-            source: crate::model::SourceKind::X,
-            source_id: "backfill-1".into(),
-            author: crate::model::Author {
-                name: "画师".into(),
-                url: "https://x.com/a".into(),
-            },
-            title: Some("旧待审".into()),
-            url: "https://x.com/a/status/1".into(),
-            tags: vec![],
-            bookmark_count: None,
-            is_r18: false,
-            pixiv_type: None,
-            page_count: 1,
-            images: vec![crate::model::ImageRef {
-                url: "https://example.test/1.png".into(),
-                referer: None,
-                fallback_urls: vec![],
-            }],
-            origin: "test".into(),
-        };
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE pending(
-                token INTEGER PRIMARY KEY,
-                files TEXT NOT NULL,
-                caption TEXT NOT NULL,
-                msg_ids TEXT NOT NULL,
-                originals TEXT NOT NULL DEFAULT '[]',
-                created_at INTEGER NOT NULL DEFAULT 0,
-                state TEXT NOT NULL DEFAULT 'pending',
-                is_r18 INTEGER NOT NULL DEFAULT 0,
-                item_meta TEXT NOT NULL DEFAULT '{}'
-            );",
-        )
-        .unwrap();
-        init_image_dedup_schema(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO pending(token,files,caption,msg_ids,originals,created_at,state,is_r18,item_meta)
-             VALUES(1,?1,'cap','[]',?1,1,'pending',0,?2)",
-            rusqlite::params![
-                serde_json::to_string(&vec![image_path.to_string_lossy().into_owned()]).unwrap(),
-                serde_json::to_string(&item).unwrap()
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(backfill_pending_image_catalog(&conn).unwrap(), 1);
-        assert_eq!(backfill_pending_image_catalog(&conn).unwrap(), 0);
-        let stored: i64 = conn
-            .query_row("SELECT COUNT(*) FROM image_fingerprints", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(stored, 1);
     }
 
     #[test]

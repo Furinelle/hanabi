@@ -234,21 +234,6 @@ pub(super) async fn undo(state: &Arc<ReviewState>, action: &UndoAction) -> Resul
     if session.originals.iter().any(|p| !p.is_file()) {
         anyhow::bail!("原图文件已过期");
     }
-    let paths: Vec<_> = session
-        .originals
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| session.choices.get(*i) != Some(&Some(false)))
-        .map(|(_, path)| path.clone())
-        .collect();
-    let scan_paths = paths.clone();
-    let fps = tokio::task::spawn_blocking(move || {
-        scan_paths
-            .iter()
-            .map(|p| inspect_image(p))
-            .collect::<Result<Vec<_>>>()
-    })
-    .await??;
     {
         let db = state.db.lock().await;
         let tx = db.unchecked_transaction()?;
@@ -261,11 +246,6 @@ pub(super) async fn undo(state: &Arc<ReviewState>, action: &UndoAction) -> Resul
             "UPDATE image_review_sessions SET payload=?2,state='retired' WHERE token=?1",
             rusqlite::params![session.token, serde_json::to_string(&session)?],
         )?;
-        if !paths.is_empty() {
-            record_work(&tx, &session.item, &fps, WorkStatus::Pending)?;
-        } else if !session.originals.is_empty() {
-            remove_work(&tx, &session.item)?;
-        }
         tx.commit()?;
     }
     retire_pending(state).await?;
@@ -519,23 +499,12 @@ fn retire_session(db: &rusqlite::Connection, session: &Session) -> Result<bool> 
             "UPDATE image_review_sessions SET state='decided' WHERE token=?1",
             [session.token],
         )?;
-        if !session.originals.is_empty() {
-            remove_work(db, &session.item)?;
-        }
         return Ok(false);
     };
     let changed = db.execute(
         "UPDATE pending SET files=?2,caption=?3,msg_ids=?4,originals=?5,state='pending',is_r18=?6,item_meta=?7,created_at=?8 WHERE token=?1 AND state IN ('similar','pending')",
         rusqlite::params![session.token,row.0,row.1,row.2,row.3,row.4,row.5,now_secs()],
     )?;
-    if changed == 1 {
-        // Pending page indices may change after discarded pages are removed.
-        // Gallery sync rebuilds fingerprints from the actual archived pages.
-        db.execute(
-            "DELETE FROM image_fingerprints WHERE source_kind=?1 AND source_id=?2 AND status='pending'",
-            rusqlite::params![session.item.source.as_str(), session.item.source_id],
-        )?;
-    }
     db.execute(
         "UPDATE image_review_sessions SET state=?2 WHERE token=?1",
         rusqlite::params![
@@ -860,7 +829,6 @@ mod tests {
         )
         .unwrap();
         init_schema(&db).unwrap();
-        init_image_dedup_schema(&db).unwrap();
         db
     }
 
@@ -868,20 +836,6 @@ mod tests {
     fn retire_keeps_unselected_pages_and_is_idempotent() {
         let db = db();
         let session = session();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fingerprint.png");
-        image::RgbImage::new(4, 4).save(&path).unwrap();
-        let fingerprint = inspect_image(&path).unwrap();
-        record_work(
-            &db,
-            &session.item,
-            std::slice::from_ref(&fingerprint),
-            WorkStatus::Pending,
-        )
-        .unwrap();
-        let mut published = session.item.clone();
-        published.source_id = "already-archived".into();
-        record_work(&db, &published, &[fingerprint], WorkStatus::Published).unwrap();
         db.execute(
             "INSERT INTO image_review_sessions(token,payload) VALUES(?1,?2)",
             rusqlite::params![session.token, serde_json::to_string(&session).unwrap()],
@@ -900,24 +854,6 @@ mod tests {
         assert_eq!(
             db.query_row(
                 "SELECT COUNT(*) FROM image_review_retire_controls",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            1
-        );
-        assert_eq!(
-            db.query_row(
-                "SELECT COUNT(*) FROM image_fingerprints WHERE status='pending'",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            0
-        );
-        assert_eq!(
-            db.query_row(
-                "SELECT COUNT(*) FROM image_fingerprints WHERE status='published'",
                 [],
                 |r| r.get::<_, i64>(0)
             )

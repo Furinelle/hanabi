@@ -1,25 +1,15 @@
-use std::cmp::Ordering;
+//! Image fingerprints: solid/near-black filler detection for intake, and the
+//! perceptual hashes Vitrine uses to keep the best copy of duplicate images.
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use image::imageops::FilterType;
 use rayon::prelude::*;
-use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::model::MediaItem;
-
 const HASH_SIDE: u32 = 8;
 const COLOR_SIDE: u32 = 4;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MatchKind {
-    StrictSame,
-    Similar { distance: u32 },
-    Partial { distance: u32 },
-    Different,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegionFingerprint {
@@ -46,34 +36,6 @@ pub struct ImageFingerprint {
     pub format: String,
     #[serde(default)]
     pub regions: Vec<RegionFingerprint>,
-}
-
-impl ImageFingerprint {
-    pub fn quality_cmp(&self, other: &Self) -> Ordering {
-        (u64::from(self.width) * u64::from(self.height), self.bytes).cmp(&(
-            u64::from(other.width) * u64::from(other.height),
-            other.bytes,
-        ))
-    }
-
-    pub fn dimensions_label(&self) -> String {
-        format!("{}×{}", self.width, self.height)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkStatus {
-    Pending,
-    Published,
-}
-
-impl WorkStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Published => "published",
-        }
-    }
 }
 
 pub fn inspect_image(path: &Path) -> Result<ImageFingerprint> {
@@ -269,220 +231,8 @@ fn split_regions_sequential(image: &image::DynamicImage) -> Vec<RegionFingerprin
         .collect()
 }
 
-pub fn classify_similarity(left: &ImageFingerprint, right: &ImageFingerprint) -> MatchKind {
-    if left.solid_color || right.solid_color {
-        return MatchKind::Different;
-    }
-    if left.content_sha256 == right.content_sha256 {
-        return MatchKind::StrictSame;
-    }
-    let average_distance = (left.average_hash ^ right.average_hash).count_ones();
-    let difference_distance = (left.difference_hash ^ right.difference_hash).count_ones();
-    let same_whole_aspect = same_aspect_ratio(left, right, 0.03);
-    if same_whole_aspect
-        && same_aspect_ratio(left, right, 0.005)
-        && left.color_key == right.color_key
-        && left.detail_key == right.detail_key
-        && average_distance + difference_distance <= 1
-    {
-        return MatchKind::StrictSame;
-    }
-    let distance = average_distance + difference_distance;
-    if let Some(distance) = partial_distance(left, right) {
-        return MatchKind::Partial { distance };
-    }
-    if same_whole_aspect && average_distance <= 10 && difference_distance <= 10 && distance <= 16 {
-        MatchKind::Similar { distance }
-    } else {
-        MatchKind::Different
-    }
-}
-
-pub fn has_strict_duplicate(conn: &Connection, image: &ImageFingerprint) -> Result<bool> {
-    let mut stmt = conn.prepare(
-        "SELECT content_sha256,average_hash,difference_hash,width,height
-         FROM image_fingerprints
-         WHERE status IN ('pending','published') AND solid_color=0
-           AND (content_sha256=?1 OR (color_key=?2 AND detail_key=?3))",
-    )?;
-    let mut rows = stmt.query(params![
-        image.content_sha256,
-        image.color_key,
-        image.detail_key
-    ])?;
-    while let Some(row) = rows.next()? {
-        let mut old = image.clone();
-        old.content_sha256 = row.get(0)?;
-        old.average_hash = u64::from_str_radix(&row.get::<_, String>(1)?, 16)?;
-        old.difference_hash = u64::from_str_radix(&row.get::<_, String>(2)?, 16)?;
-        old.width = row.get(3)?;
-        old.height = row.get(4)?;
-        if classify_similarity(image, &old) == MatchKind::StrictSame {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn partial_distance(left: &ImageFingerprint, right: &ImageFingerprint) -> Option<u32> {
-    region_distance(&left.regions, right)
-        .into_iter()
-        .chain(region_distance(&right.regions, left))
-        .min()
-}
-
-fn region_distance(regions: &[RegionFingerprint], whole: &ImageFingerprint) -> Option<u32> {
-    regions
-        .iter()
-        .filter(|region| same_dimensions_aspect(region.width, region.height, whole, 0.03))
-        .filter(|region| region.color_key == whole.color_key)
-        .filter_map(|region| {
-            let average = (region.average_hash ^ whole.average_hash).count_ones();
-            let difference = (region.difference_hash ^ whole.difference_hash).count_ones();
-            let distance = average + difference;
-            (average <= 10 && difference <= 10 && distance <= 16).then_some(distance)
-        })
-        .min()
-}
-
-fn same_dimensions_aspect(
-    width: u32,
-    height: u32,
-    other: &ImageFingerprint,
-    tolerance: f64,
-) -> bool {
-    if height == 0 || other.height == 0 {
-        return false;
-    }
-    let left_ratio = f64::from(width) / f64::from(height);
-    let right_ratio = f64::from(other.width) / f64::from(other.height);
-    ((left_ratio - right_ratio).abs() / left_ratio.max(right_ratio)) <= tolerance
-}
-
-fn same_aspect_ratio(left: &ImageFingerprint, right: &ImageFingerprint, tolerance: f64) -> bool {
-    if left.height == 0 || right.height == 0 {
-        return false;
-    }
-    let left_ratio = f64::from(left.width) / f64::from(left.height);
-    let right_ratio = f64::from(right.width) / f64::from(right.height);
-    ((left_ratio - right_ratio).abs() / left_ratio.max(right_ratio)) <= tolerance
-}
-
 fn hex_digest(value: &[u8]) -> String {
     format!("{:x}", Sha256::digest(value))
-}
-
-pub fn init_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS image_fingerprints(
-            source_kind     TEXT NOT NULL,
-            source_id       TEXT NOT NULL,
-            image_index     INTEGER NOT NULL,
-            title           TEXT NOT NULL,
-            source_url      TEXT NOT NULL,
-            status          TEXT NOT NULL,
-            content_sha256  TEXT NOT NULL,
-            strict_key      TEXT NOT NULL,
-            average_hash    TEXT NOT NULL,
-            difference_hash TEXT NOT NULL,
-            color_key       TEXT NOT NULL,
-            detail_key      TEXT NOT NULL,
-            width           INTEGER NOT NULL,
-            height          INTEGER NOT NULL,
-            bytes           INTEGER NOT NULL,
-            format          TEXT NOT NULL,
-            regions_json    TEXT NOT NULL DEFAULT '[]',
-            recorded_at     INTEGER NOT NULL,
-            PRIMARY KEY(source_kind, source_id, image_index)
-         );
-         CREATE INDEX IF NOT EXISTS idx_image_fingerprints_strict
-           ON image_fingerprints(strict_key);
-         CREATE INDEX IF NOT EXISTS idx_image_fingerprints_status
-           ON image_fingerprints(status);
-         CREATE INDEX IF NOT EXISTS idx_image_fingerprints_content
-           ON image_fingerprints(content_sha256);
-         CREATE INDEX IF NOT EXISTS idx_image_fingerprints_visual
-           ON image_fingerprints(color_key,detail_key);",
-    )?;
-    let _ = conn.execute(
-        "ALTER TABLE image_fingerprints ADD COLUMN regions_json TEXT NOT NULL DEFAULT '[]'",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE image_fingerprints ADD COLUMN solid_color INTEGER NOT NULL DEFAULT 0",
-        [],
-    );
-    Ok(())
-}
-
-pub fn record_work(
-    conn: &Connection,
-    item: &MediaItem,
-    fingerprints: &[ImageFingerprint],
-    status: WorkStatus,
-) -> Result<()> {
-    let (kind, source_id) = item.dedup_key();
-    conn.execute(
-        "DELETE FROM image_fingerprints WHERE source_kind=?1 AND source_id=?2",
-        params![kind, source_id],
-    )?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs() as i64;
-    let title = item.title.as_deref().unwrap_or("(无标题)");
-    for (index, fingerprint) in fingerprints.iter().enumerate() {
-        conn.execute(
-            "INSERT INTO image_fingerprints(
-                source_kind,source_id,image_index,title,source_url,status,
-                content_sha256,strict_key,average_hash,difference_hash,color_key,detail_key,
-                width,height,bytes,format,regions_json,recorded_at,solid_color
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-            params![
-                kind,
-                source_id,
-                index as i64,
-                title,
-                item.url,
-                status.as_str(),
-                fingerprint.content_sha256,
-                fingerprint.strict_key,
-                format!("{:016x}", fingerprint.average_hash),
-                format!("{:016x}", fingerprint.difference_hash),
-                fingerprint.color_key,
-                fingerprint.detail_key,
-                i64::from(fingerprint.width),
-                i64::from(fingerprint.height),
-                fingerprint.bytes as i64,
-                fingerprint.format,
-                serde_json::to_string(&fingerprint.regions)?,
-                now,
-                fingerprint.solid_color,
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-pub fn mark_work_status(conn: &Connection, item: &MediaItem, status: WorkStatus) -> Result<()> {
-    let (kind, source_id) = item.dedup_key();
-    conn.execute(
-        "UPDATE image_fingerprints SET status=?3 WHERE source_kind=?1 AND source_id=?2",
-        params![kind, source_id, status.as_str()],
-    )?;
-    Ok(())
-}
-
-pub fn remove_work(conn: &Connection, item: &MediaItem) -> Result<()> {
-    let (kind, source_id) = item.dedup_key();
-    remove_work_key(conn, &kind, &source_id)
-}
-
-pub fn remove_work_key(conn: &Connection, source_kind: &str, source_id: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM image_fingerprints WHERE source_kind=?1 AND source_id=?2",
-        params![source_kind, source_id],
-    )?;
-    Ok(())
 }
 
 #[cfg(test)]

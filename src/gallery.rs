@@ -188,17 +188,26 @@ impl GalleryClient {
             payloads.push((filename, ct, bytes));
         }
         let key = idempotency_key_from_bytes(item, &meta_str, &payloads);
-        let files: Vec<serde_json::Value> = payloads
-            .iter()
-            .map(|(name, content_type, bytes)| {
-                serde_json::json!({
-                    "name": name,
-                    "content_type": content_type,
-                    "size": bytes.len(),
-                    "sha256": format!("{:x}", Sha256::digest(bytes)),
+        // Vitrine keeps the best copy of strict duplicates using these fingerprints.
+        let (payloads, files) = tokio::task::spawn_blocking(move || {
+            let files: Vec<serde_json::Value> = payloads
+                .iter()
+                .map(|(name, content_type, bytes)| {
+                    serde_json::json!({
+                        "name": name,
+                        "content_type": content_type,
+                        "size": bytes.len(),
+                        "sha256": format!("{:x}", Sha256::digest(bytes)),
+                        "fingerprint": crate::image_dedup::inspect_image_bytes(bytes)
+                            .ok()
+                            .map(|fp| fingerprint_json(&fp)),
+                    })
                 })
-            })
-            .collect();
+                .collect();
+            (payloads, files)
+        })
+        .await
+        .map_err(|error| GalleryIngestError::permanent(format!("计算图库指纹失败: {error}")))?;
         let mut manifest = serde_json::json!({ "meta": meta_str, "files": files });
 
         // Originals go straight to R2 via presigned URLs; Vitrine only signs and
@@ -330,6 +339,30 @@ impl GalleryClient {
 struct CatalogRetractRequest<'a> {
     decision_id: &'a str,
     work_id: &'a str,
+}
+
+fn fingerprint_json(fp: &crate::image_dedup::ImageFingerprint) -> serde_json::Value {
+    let hash = |value: u64| format!("{value:016x}");
+    serde_json::json!({
+        "solid_color": fp.solid_color,
+        "content_sha256": fp.content_sha256,
+        "strict_key": fp.strict_key,
+        "average_hash": hash(fp.average_hash),
+        "difference_hash": hash(fp.difference_hash),
+        "color_key": fp.color_key,
+        "detail_key": fp.detail_key,
+        "width": fp.width,
+        "height": fp.height,
+        "bytes": fp.bytes,
+        "format": fp.format,
+        "regions": fp.regions.iter().map(|region| serde_json::json!({
+            "width": region.width,
+            "height": region.height,
+            "average_hash": hash(region.average_hash),
+            "difference_hash": hash(region.difference_hash),
+            "color_key": region.color_key,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 fn gallery_meta(

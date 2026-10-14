@@ -1,10 +1,8 @@
 pub mod config;
 pub mod filter;
 pub mod gallery;
-pub mod gallery_catalog;
 pub mod gallery_outbox;
 pub mod gallery_repair;
-pub mod gallery_sync;
 pub mod gallerydl;
 pub mod image_dedup;
 pub mod model;

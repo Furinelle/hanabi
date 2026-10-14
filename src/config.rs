@@ -28,13 +28,6 @@ pub struct GalleryCfg {
     /// 入库 token(与 Worker secret INGEST_TOKEN 一致)。也可用环境变量 HANABI_GALLERY_TOKEN。
     #[serde(default)]
     pub token: String,
-    /// 定期从 Vitrine 补齐已发布图片指纹；0 表示关闭。
-    #[serde(default = "default_gallery_fingerprint_sync_interval")]
-    pub fingerprint_sync_interval_secs: u64,
-}
-
-fn default_gallery_fingerprint_sync_interval() -> u64 {
-    6 * 3600
 }
 
 impl GalleryCfg {
@@ -206,23 +199,5 @@ filters = { r18 = false, min_bookmarks = 500, tags = ["原神"], illust_only = t
         assert_eq!(bm.filters.tags.as_deref(), Some(&["原神".to_string()][..]));
         assert!(bm.filters.illust_only);
         assert_eq!(bm.filters.max_pages, Some(5));
-    }
-
-    #[test]
-    fn gallery_fingerprint_sync_defaults_to_six_hours() {
-        let cfg: Config = toml::from_str(
-            r#"
-poll_interval_secs = 21600
-[telegram]
-channel_id = "1"
-[gallery_dl]
-config_path = "gallery-dl.conf"
-[gallery]
-endpoint = "https://gallery.example"
-token = "secret"
-"#,
-        )
-        .unwrap();
-        assert_eq!(cfg.gallery.fingerprint_sync_interval_secs, 21600);
     }
 }

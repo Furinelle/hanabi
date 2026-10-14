@@ -3372,7 +3372,7 @@ mod tests {
         assert_eq!(
             calls
                 .iter()
-                .filter(|(route, _)| route == "/api/ingest")
+                .filter(|(route, _)| route == "/api/ingest/prepare")
                 .count(),
             1
         );

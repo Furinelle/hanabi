@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use reqwest::multipart::{Form, Part};
 use sha2::{Digest, Sha256};
 
 use crate::model::MediaItem;
@@ -189,31 +188,92 @@ impl GalleryClient {
             payloads.push((filename, ct, bytes));
         }
         let key = idempotency_key_from_bytes(item, &meta_str, &payloads);
-        let mut form = Form::new().text("meta", meta_str);
-        for (filename, ct, bytes) in payloads {
-            let part = Part::bytes(bytes)
-                .file_name(filename)
-                .mime_str(ct)
-                .map_err(|error| {
-                    GalleryIngestError::permanent(format!("构造 multipart part 失败: {error}"))
-                })?;
-            form = form.part("files", part);
+        let files: Vec<serde_json::Value> = payloads
+            .iter()
+            .map(|(name, content_type, bytes)| {
+                serde_json::json!({
+                    "name": name,
+                    "content_type": content_type,
+                    "size": bytes.len(),
+                    "sha256": format!("{:x}", Sha256::digest(bytes)),
+                })
+            })
+            .collect();
+        let mut manifest = serde_json::json!({ "meta": meta_str, "files": files });
+
+        // Originals go straight to R2 via presigned URLs; Vitrine only signs and
+        // records them, which keeps its per-request CPU tiny.
+        let prepared = self.ingest_step("prepare", &key, &manifest).await?;
+        let Some(uploads) = prepared["uploads"].as_array() else {
+            // A replayed Idempotency-Key: Vitrine already recorded this exact ingest.
+            tracing::info!(
+                source = item.source.as_str(),
+                id = %item.source_id,
+                "图库入库成功(幂等重放): {prepared}"
+            );
+            return Ok(());
+        };
+        if uploads.len() != payloads.len() {
+            return Err(GalleryIngestError::permanent(format!(
+                "图库返回 {} 个上传地址，预期 {}",
+                uploads.len(),
+                payloads.len()
+            )));
+        }
+        for (upload, (_, _, bytes)) in uploads.iter().zip(payloads) {
+            let url = upload["url"]
+                .as_str()
+                .ok_or_else(|| GalleryIngestError::permanent("图库上传地址缺失"))?;
+            let mut request = self.client.put(url).body(bytes);
+            for (name, value) in upload["headers"].as_object().into_iter().flatten() {
+                request = request.header(name, value.as_str().unwrap_or_default());
+            }
+            let response = request.send().await.map_err(|error| {
+                GalleryIngestError::transient(format!("图库原图直传 R2 失败: {error}"))
+            })?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                let message = format!("图库原图直传 R2 HTTP {status}: {body}");
+                return Err(if retryable_status(status) {
+                    GalleryIngestError::transient(message)
+                } else {
+                    GalleryIngestError::permanent(message)
+                });
+            }
         }
 
-        let url = format!("{}/api/ingest", self.endpoint);
-        let resp = self
+        manifest["ingest_id"] = prepared["ingest_id"].clone();
+        let committed = self.ingest_step("commit", &key, &manifest).await?;
+        tracing::info!(
+            source = item.source.as_str(),
+            id = %item.source_id,
+            "图库入库成功: {committed}"
+        );
+        Ok(())
+    }
+
+    async fn ingest_step(
+        &self,
+        step: &str,
+        idempotency_key: &str,
+        manifest: &serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, GalleryIngestError> {
+        let response = self
             .client
-            .post(&url)
+            .post(format!("{}/api/ingest/{step}", self.endpoint))
             .bearer_auth(&self.token)
-            .header("Idempotency-Key", key)
-            .multipart(form)
+            .header("Idempotency-Key", idempotency_key)
+            .json(manifest)
             .send()
             .await
             .map_err(|error| {
-                GalleryIngestError::transient(format!("请求 Vitrine /api/ingest 失败: {error}"))
+                GalleryIngestError::transient(format!(
+                    "请求 Vitrine /api/ingest/{step} 失败: {error}"
+                ))
             })?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
             let message = format!("图库入库 HTTP {status}: {body}");
             return Err(if retryable_status(status) {
@@ -222,12 +282,12 @@ impl GalleryClient {
                 GalleryIngestError::permanent(message)
             });
         }
-        tracing::info!(
-            source = item.source.as_str(),
-            id = %item.source_id,
-            "图库入库成功: {body}"
-        );
-        Ok(())
+        match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(value) if value["ok"] == true => Ok(value),
+            _ => Err(GalleryIngestError::permanent(format!(
+                "图库 /api/ingest/{step} 响应无效: {body}"
+            ))),
+        }
     }
 
     pub async fn retract_work(

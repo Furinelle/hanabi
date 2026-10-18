@@ -149,6 +149,8 @@ struct CommentJob {
     temp_dir: PathBuf,
     created_at: i64,
     retain_dir: bool,
+    /// 正在上传：任务留在 map 里，被替换的审批动作会把目录清理权移交给它。
+    delivering: bool,
 }
 
 /// 评论区原图任务的兜底保留时长:超时仍未等到 auto-forward 则清临时目录,避免泄漏。
@@ -1002,6 +1004,7 @@ async fn register_comment(
             temp_dir,
             created_at: now_secs(),
             retain_dir,
+            delivering: false,
         },
     );
 }
@@ -1069,21 +1072,25 @@ async fn send_documents_reply(
 /// 收到匹配的 auto-forward 后投递原图到评论区。取出任务、发送、清临时目录。
 /// 失败也清目录(频道帖 photo 已发出,评论区只是增益,不重试以免泄漏)。
 async fn deliver_comment(state: &Arc<ReviewState>, anchor: &Message, chan_msg_id: i32) {
-    let job = state.pending_comments.lock().await.remove(&chan_msg_id);
-    let Some(job) = job else {
-        return;
+    let originals = {
+        let mut map = state.pending_comments.lock().await;
+        match map.get_mut(&chan_msg_id) {
+            Some(job) if !job.delivering => {
+                job.delivering = true;
+                job.originals.clone()
+            }
+            _ => return,
+        }
     };
     let chat = Recipient::Id(anchor.chat.id);
-    if let Err(e) = send_documents_reply(&state.bot, &chat, &job.originals, anchor.id).await {
+    if let Err(e) = send_documents_reply(&state.bot, &chat, &originals, anchor.id).await {
         tracing::warn!(error = %e, chan_msg_id, "原图投递评论区失败");
     } else {
-        tracing::info!(
-            chan_msg_id,
-            n = job.originals.len(),
-            "原图已投递到帖子评论区"
-        );
+        tracing::info!(chan_msg_id, n = originals.len(), "原图已投递到帖子评论区");
     }
-    if !job.retain_dir {
+    // 上传期间 retain_dir 可能被 cleanup_unreferenced 改成 false；/undo 取走任务时不删。
+    let job = state.pending_comments.lock().await.remove(&chan_msg_id);
+    if let Some(job) = job.filter(|job| !job.retain_dir) {
         remove_dir_all_bg(job.temp_dir);
     }
 }
@@ -1095,7 +1102,7 @@ async fn sweep_expired_comments(state: &Arc<ReviewState>) {
         let mut map = state.pending_comments.lock().await;
         let keys: Vec<i32> = map
             .iter()
-            .filter(|(_, j)| now - j.created_at > COMMENT_TTL_SECS)
+            .filter(|(_, j)| !j.delivering && now - j.created_at > COMMENT_TTL_SECS)
             .map(|(k, _)| *k)
             .collect();
         keys.iter().filter_map(|k| map.remove(k)).collect()
@@ -1422,14 +1429,16 @@ fn cleanup(files: &[PathBuf]) {
 }
 
 async fn cleanup_review_messages(state: &Arc<ReviewState>, message_ids: &[MessageId]) {
-    for message_id in message_ids {
-        let _ = tg_retry(|| {
-            state
-                .bot
-                .delete_message(state.review_chat.clone(), *message_id)
-        })
-        .await;
+    if message_ids.is_empty() {
+        return;
     }
+    // 一次 deleteMessages 删整组，不逐条请求、也少吃私聊限流。
+    let _ = tg_retry(|| {
+        state
+            .bot
+            .delete_messages(state.review_chat.clone(), message_ids.iter().copied())
+    })
+    .await;
 }
 
 /// 启动清理:① 删超期未审 pending(消息+文件+记录);② 删持久待审目录中
@@ -1924,6 +1933,12 @@ async fn finish_claimed(
         .await;
     }
 
+    // 频道帖已发出就删审批卡，不等入库和登记；丢弃仍在登记成功后删。
+    let review_ids: Vec<MessageId> = work.msg_ids.iter().copied().map(MessageId).collect();
+    if delete_review_messages && publish {
+        cleanup_review_messages(state, &review_ids).await;
+    }
+
     // 频道帖发出后立即登记评论任务。Telegram 通常会在约 1 秒内把频道帖
     // auto-forward 到讨论组。审批发布的原目录由 review_actions 持有，评论任务不得删除。
     if publish {
@@ -2002,13 +2017,8 @@ async fn finish_claimed(
             return Err(e).context("登记最近审批动作失败");
         }
     };
-    if delete_review_messages {
-        for mid in &work.msg_ids {
-            let _ = state
-                .bot
-                .delete_message(state.review_chat.clone(), MessageId(*mid))
-                .await;
-        }
+    if delete_review_messages && !publish {
+        cleanup_review_messages(state, &review_ids).await;
     }
     // 新动作覆盖旧的可撤销记录后，旧文件不再有恢复价值；事务提交后再清理。
     for paths in replaced_files {
@@ -2755,6 +2765,7 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
         return Ok(());
     }
     let data = q.data.clone().unwrap_or_default();
+    let card = q.message.as_ref().map(|message| message.id());
     if data.starts_with("image:") || data.starts_with("similar:") {
         state
             .bot
@@ -2823,12 +2834,31 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
     // /approve 也不选它,直到重启),此处兜底恢复为 pending。
     let state = state.clone();
     tokio::spawn(async move {
+        // 审批串行执行，排队可能要等前面几条发完：先把按钮换成状态，点击立刻有反应。
+        // 按钮保留原 callback，再点只会得到"已在发布中"。
+        if let Some(card) = card {
+            let busy = if archive {
+                "⏳ 排队发布并入库…"
+            } else if publish {
+                "⏳ 排队发布…"
+            } else {
+                "⏳ 丢弃中…"
+            };
+            let _ = state
+                .bot
+                .edit_message_reply_markup(state.review_chat.clone(), card)
+                .reply_markup(InlineKeyboardMarkup::new(vec![vec![
+                    InlineKeyboardButton::callback(busy, data),
+                ]]))
+                .await;
+        }
         let _guard = state.review_gate.lock().await;
         {
             let db = state.db.lock().await;
             if image_review::needs_recovery(&db).unwrap_or(true) {
                 let _ = restore_pending(&db, token);
                 drop(db);
+                restore_review_card(&state, card, token).await;
                 let _ = state
                     .bot
                     .send_message(
@@ -2847,6 +2877,7 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, token, "审批操作失败,pending 保留可重试");
+                restore_review_card(&state, card, token).await;
                 if publish {
                     let _ = state
                         .bot
@@ -2859,12 +2890,38 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
             }
             Err(join_err) => {
                 tracing::error!(error = %join_err, token, "审批任务异常退出,恢复待审状态");
-                let db = state.db.lock().await;
-                let _ = restore_pending(&db, token);
+                {
+                    let db = state.db.lock().await;
+                    let _ = restore_pending(&db, token);
+                }
+                restore_review_card(&state, card, token).await;
             }
         }
     });
     Ok(())
+}
+
+/// 审批失败、记录已恢复为 pending 时把原按钮放回去，让这张卡可以直接重试。
+async fn restore_review_card(state: &ReviewState, card: Option<MessageId>, token: i64) {
+    let Some(card) = card else {
+        return;
+    };
+    let pending = {
+        let db = state.db.lock().await;
+        db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pending WHERE token=?1 AND state='pending')",
+            [token],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+    };
+    if pending {
+        let _ = state
+            .bot
+            .edit_message_reply_markup(state.review_chat.clone(), card)
+            .reply_markup(review_keyboard(token, state.gallery.is_some()))
+            .await;
+    }
 }
 
 fn is_idempotent_delete_error(message: &str) -> bool {
@@ -2979,6 +3036,8 @@ mod tests {
                     serde_json::json!({"ok":true})
                 } else if route.ends_with("DeleteMessage")
                     || route.ends_with("deleteMessage")
+                    || route.ends_with("DeleteMessages")
+                    || route.ends_with("deleteMessages")
                     || route.to_lowercase().ends_with("answercallbackquery")
                 {
                     serde_json::json!({"ok":true,"result":true})
@@ -3101,6 +3160,30 @@ mod tests {
         assert!(command_menu(false)
             .iter()
             .any(|cmd| cmd.command == "douyin"));
+    }
+
+    #[tokio::test]
+    async fn superseded_files_wait_for_an_unfinished_comment_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = TelegramSink::new(
+            "123:test".into(),
+            "42".into(),
+            "-100123".into(),
+            dir.path().join("test.db").to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let work = dir.path().join("hanabi_x_1");
+        std::fs::create_dir(&work).unwrap();
+        let original = work.join("00.jpg");
+        std::fs::write(&original, b"x").unwrap();
+        register_comment(&sink.state, 7, std::slice::from_ref(&original), true).await;
+
+        image_review::cleanup_unreferenced(&sink.state, std::slice::from_ref(&original)).await;
+
+        assert!(original.is_file());
+        let comments = sink.state.pending_comments.lock().await;
+        assert!(!comments[&7].retain_dir);
     }
 
     #[tokio::test]

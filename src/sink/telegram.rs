@@ -1429,16 +1429,21 @@ fn cleanup(files: &[PathBuf]) {
 }
 
 async fn cleanup_review_messages(state: &Arc<ReviewState>, message_ids: &[MessageId]) {
-    if message_ids.is_empty() {
-        return;
+    // 不用 deleteMessages：teloxide-core 0.10 把 message_ids 序列化成 [{"message_id":n}]，
+    // Telegram 会拒绝整个请求。
+    for message_id in message_ids {
+        if let Err(error) = tg_retry(|| {
+            state
+                .bot
+                .delete_message(state.review_chat.clone(), *message_id)
+        })
+        .await
+        {
+            if !is_idempotent_delete_error(&error.to_string()) {
+                tracing::warn!(error = %error, message_id = message_id.0, "删除审批消息失败");
+            }
+        }
     }
-    // 一次 deleteMessages 删整组，不逐条请求、也少吃私聊限流。
-    let _ = tg_retry(|| {
-        state
-            .bot
-            .delete_messages(state.review_chat.clone(), message_ids.iter().copied())
-    })
-    .await;
 }
 
 /// 启动清理:① 删超期未审 pending(消息+文件+记录);② 删持久待审目录中
@@ -3036,8 +3041,6 @@ mod tests {
                     serde_json::json!({"ok":true})
                 } else if route.ends_with("DeleteMessage")
                     || route.ends_with("deleteMessage")
-                    || route.ends_with("DeleteMessages")
-                    || route.ends_with("deleteMessages")
                     || route.to_lowercase().ends_with("answercallbackquery")
                 {
                     serde_json::json!({"ok":true,"result":true})
@@ -3160,6 +3163,39 @@ mod tests {
         assert!(command_menu(false)
             .iter()
             .any(|cmd| cmd.command == "douyin"));
+    }
+
+    #[tokio::test]
+    async fn review_cards_are_deleted_with_plain_message_ids() {
+        let (base, stop, calls, server) = review_mock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = TelegramSink::new(
+            "123:test".into(),
+            "42".into(),
+            "-100123".into(),
+            dir.path().join("test.db").to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        Arc::get_mut(&mut sink.state).unwrap().bot =
+            Bot::new("123:test").set_api_url(reqwest::Url::parse(&base).unwrap());
+
+        cleanup_review_messages(&sink.state, &[MessageId(5), MessageId(6)]).await;
+
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let deleted: Vec<serde_json::Value> = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(route, _)| route.ends_with("DeleteMessage"))
+            .map(|(_, body)| serde_json::from_slice(body).unwrap())
+            .collect();
+        let ids: Vec<_> = deleted
+            .iter()
+            .map(|body| body["message_id"].clone())
+            .collect();
+        assert_eq!(ids, [serde_json::json!(5), serde_json::json!(6)]);
     }
 
     #[tokio::test]

@@ -196,6 +196,8 @@ impl GalleryClient {
                     Ok((filename, ct, bytes))
                 })
                 .collect::<std::result::Result<Vec<_>, GalleryIngestError>>()?;
+            // The gallery gets strips joined back into the picture; Telegram keeps the pages.
+            let payloads = crate::stitch::stitch_pages(payloads);
             // Vitrine keeps the best copy of strict duplicates using these fingerprints.
             let files: Vec<serde_json::Value> = payloads
                 .par_iter()

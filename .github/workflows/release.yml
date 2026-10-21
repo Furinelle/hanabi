@@ -20,6 +20,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup component add clippy rustfmt
+      # jpegtran/djpeg let the strip-join tests cover the lossless JPEG path.
+      - run: sudo apt-get install -y --no-install-recommends libjpeg-turbo-progs
       - name: Format check
         run: cargo fmt --check
       - name: Test

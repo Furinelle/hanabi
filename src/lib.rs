@@ -10,5 +10,6 @@ pub mod pipeline;
 pub mod similar_review;
 pub mod sink;
 pub mod source;
+pub mod stitch;
 pub mod store;
 pub mod util;

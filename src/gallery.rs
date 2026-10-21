@@ -359,7 +359,7 @@ struct CatalogRetractRequest<'a> {
     work_id: &'a str,
 }
 
-fn fingerprint_json(fp: &crate::image_dedup::ImageFingerprint) -> serde_json::Value {
+pub fn fingerprint_json(fp: &crate::image_dedup::ImageFingerprint) -> serde_json::Value {
     let hash = |value: u64| format!("{value:016x}");
     serde_json::json!({
         "solid_color": fp.solid_color,

@@ -138,15 +138,15 @@ pub struct GalleryDl {
 }
 
 impl GalleryDl {
-    /// `-j` 拉元数据(不下载),返回顶层 JSON。
-    pub fn probe(&self, target: &str) -> Result<Value> {
+    /// `-j` 拉元数据(不下载),返回顶层 JSON。`range` 为空时用全局 `probe_range`。
+    pub fn probe(&self, target: &str, range: Option<&str>) -> Result<Value> {
         let out = Command::new("gallery-dl")
             .args([
                 "--config",
                 &self.config_path,
                 "-j",
                 "--range",
-                &self.probe_range,
+                range.unwrap_or(&self.probe_range),
                 target,
             ])
             .output()
@@ -160,7 +160,7 @@ impl GalleryDl {
         }
         let val: Value =
             serde_json::from_slice(&out.stdout).context("解析 gallery-dl JSON 失败")?;
-        Ok(val)
+        reject_error_only(val)
     }
 
     /// 下载指定作品到 dir,返回该次落地的文件路径。
@@ -187,6 +187,22 @@ impl GalleryDl {
         let after = list_files(dir);
         Ok(after.into_iter().filter(|p| !before.contains(p)).collect())
     }
+}
+
+/// gallery-dl 认证失败(含 Pixiv 维护期 token 接口 503,被报成 Invalid refresh token)时仍以 0 退出,
+/// 只在 JSON 里留 `[-1, {error, message}]`;
+/// 不拦下会被当成"没有新作",整个源静默停摆。取到部分作品时保留结果,只告警。
+fn reject_error_only(val: Value) -> Result<Value> {
+    let entries = val.as_array().map(Vec::as_slice).unwrap_or_default();
+    let kind = |e: &Value| e.get(0).and_then(Value::as_i64);
+    if let Some(err) = entries.iter().find(|e| kind(e) == Some(-1)) {
+        let detail = err.get(1).map(Value::to_string).unwrap_or_default();
+        if !entries.iter().any(|e| kind(e) == Some(3)) {
+            anyhow::bail!("gallery-dl 报错: {detail}");
+        }
+        tracing::warn!(error = %detail, "gallery-dl 部分失败,保留已取到的作品");
+    }
+    Ok(val)
 }
 
 fn list_files(dir: &std::path::Path) -> Vec<PathBuf> {
@@ -228,6 +244,17 @@ mod tests {
         let b = items.iter().find(|i| i.source_id == "124").unwrap();
         assert_eq!(b.pixiv_type, Some(PixivType::Manga));
         assert!(b.is_r18);
+    }
+
+    #[test]
+    fn error_only_output_is_a_failure() {
+        let auth = serde_json::json!([[-1, {"error": "AuthenticationError", "message": "Invalid refresh token"}]]);
+        let err = reject_error_only(auth).unwrap_err().to_string();
+        assert!(err.contains("Invalid refresh token"), "{err}");
+
+        let partial = serde_json::json!([[3, "https://i.pximg.net/a.png", {"id": 1}], [-1, {"error": "HttpError"}]]);
+        assert!(reject_error_only(partial).is_ok());
+        assert!(reject_error_only(serde_json::json!([])).is_ok());
     }
 
     #[test]

@@ -132,6 +132,10 @@ pub struct SourceCfg {
     /// pixiv_user | pixiv_bookmarks | pixiv_ranking | x_list | x_foryou | douyin_user
     pub kind: String,
     pub targets: Vec<String>,
+    /// 覆盖全局 `gallery_dl.probe_range`。按时间排序的流(X list、Pixiv 关注新作)每轮
+    /// 更新量远超全局窗口时设大,否则窗口外的作品永远不会再被看到。
+    #[serde(default)]
+    pub probe_range: Option<String>,
     #[serde(default)]
     pub filters: SourceFilterCfg,
 }
@@ -181,6 +185,7 @@ filters = { r18 = false }
 name = "my_bookmarks"
 kind = "pixiv_bookmarks"
 targets = ["https://www.pixiv.net/users/0/bookmarks/artworks"]
+probe_range = "1-300"
 filters = { r18 = false, min_bookmarks = 500, tags = ["原神"], illust_only = true, max_pages = 5 }
 "#;
 
@@ -195,6 +200,8 @@ filters = { r18 = false, min_bookmarks = 500, tags = ["原神"], illust_only = t
         assert_eq!(cfg.sources.len(), 2);
         let bm = &cfg.sources[1];
         assert_eq!(bm.kind, "pixiv_bookmarks");
+        assert_eq!(bm.probe_range.as_deref(), Some("1-300"));
+        assert_eq!(cfg.sources[0].probe_range, None);
         assert_eq!(bm.filters.min_bookmarks, Some(500));
         assert_eq!(bm.filters.tags.as_deref(), Some(&["原神".to_string()][..]));
         assert!(bm.filters.illust_only);

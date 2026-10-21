@@ -49,6 +49,9 @@ filters = { r18 = false, min_bookmarks = 1000, tags = ["原神"], illust_only = 
 name = "x_artists_list"
 kind = "x_list"
 targets = ["https://x.com/i/lists/0000000000000000000"]
+# 按时间排序的流要覆盖两轮之间的全部更新(按文件计数,不是按作品);
+# 窗口外的作品之后不会再被看到。
+probe_range = "1-400"
 filters = { r18 = false, min_likes = 1000 }
 
 [[source]]

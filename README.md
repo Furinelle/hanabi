@@ -130,6 +130,7 @@ filters = { r18 = true, illust_only = true, max_pages = 5, min_bookmarks = 2000,
 name = "x_artists_list"
 kind = "x_list"
 targets = ["https://x.com/i/lists/<id>"]
+probe_range = "1-400"           # 可选：覆盖全局窗口，需覆盖两轮间全部更新（按文件计数）
 filters = { r18 = true, min_likes = 50 }
 
 # 抖音作者主页/作者短链；纯视频跳过，图集和 Live Photo 的静态图片进入审批。

@@ -179,7 +179,9 @@ impl Source for XSource {
         for target in self.cfg.targets.clone() {
             let gdl = self.gdl.clone();
             let origin = self.cfg.name.clone();
-            let val = tokio::task::spawn_blocking(move || gdl.probe(&target)).await??;
+            let range = self.cfg.probe_range.clone();
+            let val =
+                tokio::task::spawn_blocking(move || gdl.probe(&target, range.as_deref())).await??;
             out.extend(parse_twitter(&val, &origin));
         }
         Ok(out)

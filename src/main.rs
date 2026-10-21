@@ -339,6 +339,7 @@ fn build_sources(
             ),
             kind: "douyin_user".into(),
             targets: vec![profile_url],
+            probe_range: None,
             filters: hanabi::config::SourceFilterCfg {
                 require_media: true,
                 ..Default::default()
@@ -394,7 +395,7 @@ async fn handle_link(
     };
     let g = gdl.clone();
     let u = probe_url;
-    let val = tokio::task::spawn_blocking(move || g.probe(&u)).await??;
+    let val = tokio::task::spawn_blocking(move || g.probe(&u, None)).await??;
     let items = if is_pixiv {
         hanabi::gallerydl::parse_pixiv(&val, "manual")
     } else {
@@ -935,6 +936,7 @@ targets = []
             name: "configured_artist".into(),
             kind: "douyin_user".into(),
             targets: vec!["https://www.iesdouyin.com/share/user/MS4wTEST/?share=2".into()],
+            probe_range: None,
             filters: Default::default(),
         });
         assert_eq!(build_sources(&cfg, &gdl, &store).unwrap().len(), 5);

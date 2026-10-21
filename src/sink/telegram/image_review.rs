@@ -411,9 +411,17 @@ pub(super) async fn cleanup_unreferenced(state: &Arc<ReviewState>, paths: &[Path
         Ok(false)
     })().unwrap_or(true);
     drop(db);
-    if !referenced {
-        cleanup(paths);
+    if referenced {
+        return;
     }
+    // 评论区原图还没发完：清理交给评论任务，发完再删，避免上传中途 ENOENT。
+    let mut comments = state.pending_comments.lock().await;
+    if let Some(job) = comments.values_mut().find(|job| job.temp_dir == parent) {
+        job.retain_dir = false;
+        return;
+    }
+    drop(comments);
+    cleanup(paths);
 }
 
 pub(super) async fn collect_retired(state: &Arc<ReviewState>) {

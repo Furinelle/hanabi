@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
 use crate::model::MediaItem;
@@ -170,28 +171,34 @@ impl GalleryClient {
             GalleryIngestError::permanent(format!("序列化图库元数据失败: {error}"))
         })?;
 
-        let mut payloads = Vec::with_capacity(files.len());
-        for (i, path) in files.iter().enumerate() {
-            let path = path.as_ref();
-            let bytes = std::fs::read(path).map_err(|error| {
-                GalleryIngestError::permanent(format!(
-                    "读入库文件失败: {}: {error}",
-                    path.display()
-                ))
-            })?;
-            let filename = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("p{i:02}.jpg"));
-            let ct = content_type_for(&filename);
-            payloads.push((filename, ct, bytes));
-        }
-        let key = idempotency_key_from_bytes(item, &meta_str, &payloads);
-        // Vitrine keeps the best copy of strict duplicates using these fingerprints.
+        let paths: Vec<std::path::PathBuf> = files
+            .iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect();
+        // Reading and decoding originals is blocking CPU/IO work; keep it off the runtime.
         let (payloads, files) = tokio::task::spawn_blocking(move || {
+            let payloads = paths
+                .par_iter()
+                .enumerate()
+                .map(|(i, path)| {
+                    let bytes = std::fs::read(path).map_err(|error| {
+                        GalleryIngestError::permanent(format!(
+                            "读入库文件失败: {}: {error}",
+                            path.display()
+                        ))
+                    })?;
+                    let filename = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("p{i:02}.jpg"));
+                    let ct = content_type_for(&filename);
+                    Ok((filename, ct, bytes))
+                })
+                .collect::<std::result::Result<Vec<_>, GalleryIngestError>>()?;
+            // Vitrine keeps the best copy of strict duplicates using these fingerprints.
             let files: Vec<serde_json::Value> = payloads
-                .iter()
+                .par_iter()
                 .map(|(name, content_type, bytes)| {
                     serde_json::json!({
                         "name": name,
@@ -204,10 +211,11 @@ impl GalleryClient {
                     })
                 })
                 .collect();
-            (payloads, files)
+            Ok::<_, GalleryIngestError>((payloads, files))
         })
         .await
-        .map_err(|error| GalleryIngestError::permanent(format!("计算图库指纹失败: {error}")))?;
+        .map_err(|error| GalleryIngestError::permanent(format!("计算图库指纹失败: {error}")))??;
+        let key = idempotency_key_from_bytes(item, &meta_str, &payloads);
         let mut manifest = serde_json::json!({ "meta": meta_str, "files": files });
 
         // Originals go straight to R2 via presigned URLs; Vitrine only signs and
@@ -229,6 +237,8 @@ impl GalleryClient {
                 payloads.len()
             )));
         }
+        // Pages upload concurrently; R2 bills per PUT, not per connection.
+        let mut puts = tokio::task::JoinSet::new();
         for (upload, (_, _, bytes)) in uploads.iter().zip(payloads) {
             let url = upload["url"]
                 .as_str()
@@ -237,19 +247,27 @@ impl GalleryClient {
             for (name, value) in upload["headers"].as_object().into_iter().flatten() {
                 request = request.header(name, value.as_str().unwrap_or_default());
             }
-            let response = request.send().await.map_err(|error| {
-                GalleryIngestError::transient(format!("图库原图直传 R2 失败: {error}"))
-            })?;
-            let status = response.status();
-            if !status.is_success() {
+            puts.spawn(async move {
+                let response = request.send().await.map_err(|error| {
+                    GalleryIngestError::transient(format!("图库原图直传 R2 失败: {error}"))
+                })?;
+                let status = response.status();
+                if status.is_success() {
+                    return Ok(());
+                }
                 let body = response.text().await.unwrap_or_default();
                 let message = format!("图库原图直传 R2 HTTP {status}: {body}");
-                return Err(if retryable_status(status) {
+                Err(if retryable_status(status) {
                     GalleryIngestError::transient(message)
                 } else {
                     GalleryIngestError::permanent(message)
-                });
-            }
+                })
+            });
+        }
+        while let Some(result) = puts.join_next().await {
+            result.map_err(|error| {
+                GalleryIngestError::transient(format!("图库原图直传任务异常: {error}"))
+            })??;
         }
 
         manifest["ingest_id"] = prepared["ingest_id"].clone();
@@ -341,7 +359,7 @@ struct CatalogRetractRequest<'a> {
     work_id: &'a str,
 }
 
-fn fingerprint_json(fp: &crate::image_dedup::ImageFingerprint) -> serde_json::Value {
+pub fn fingerprint_json(fp: &crate::image_dedup::ImageFingerprint) -> serde_json::Value {
     let hash = |value: u64| format!("{value:016x}");
     serde_json::json!({
         "solid_color": fp.solid_color,

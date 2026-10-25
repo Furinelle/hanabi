@@ -20,6 +20,8 @@ LABEL org.opencontainers.image.source="https://github.com/Furinelle/hanabi" \
 RUN apk add --no-cache ca-certificates libjpeg-turbo-utils py3-pip py3-aiohttp py3-yaml \
     && apk add --no-cache --virtual .douyin-build-deps git py3-setuptools py3-wheel \
     && pip install --no-cache-dir --break-system-packages gallery-dl==1.32.9 gmssl==3.2.2 \
+    # Alpine 3.20 的 py3-brotli 1.1.0 有 CVE-2026-111497；urllib3/aiohttp 会自动用它解压 br 响应
+    && pip install --no-cache-dir --break-system-packages --only-binary=:all: Brotli==1.2.1 \
     && pip install --no-cache-dir --break-system-packages --no-build-isolation --no-deps \
        "git+https://github.com/jiji262/douyin-downloader.git@${DOUYIN_DOWNLOADER_COMMIT}" \
     && apk del .douyin-build-deps \

@@ -28,3 +28,22 @@ services:
       options:
         max-size: 10m
         max-file: "5"
+
+  # 抖音作者主页的 CDP 浏览器（HANABI_DOUYIN_CDP_URL=ws://browser:3000/...）。
+  # 只在 compose 内部网络提供 3000 端口，不映射到宿主机；Chrome 沙箱需要 SYS_ADMIN。
+  browser:
+    image: dgtlmoon/sockpuppetbrowser@sha256:1d8f72d2ce2085faed4232e5ae1e65c02efe5b831a18e127829b267c260b4fb2
+    container_name: hanabi-browser
+    restart: unless-stopped
+    cap_add:
+      - SYS_ADMIN
+    environment:
+      SCREEN_WIDTH: "1920"
+      SCREEN_HEIGHT: "1024"
+      SCREEN_DEPTH: "16"
+      MAX_CONCURRENT_CHROME_PROCESSES: "2"
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

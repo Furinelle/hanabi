@@ -121,13 +121,30 @@ async fn main() -> Result<()> {
         None
     };
     // Arc 包裹:手动链接处理移入独立 task 时需克隆共享。
-    let sink = Arc::new(TelegramSink::new(
-        token,
-        cfg.telegram.channel_id.clone(),
-        cfg.telegram.publish_channel.clone(),
-        "hanabi.db",
-        gallery,
-    )?);
+    let author_removal = hanabi::sink::telegram::AuthorRemoval {
+        python_command: cfg.gallery_dl.python_command.clone(),
+        helper_path: std::env::var("HANABI_REMOVE_AUTHOR_HELPER")
+            .unwrap_or_else(|_| "tools/remove_author.py".into()),
+        pixiv_config: cfg.gallery_dl.config_path.clone(),
+        x_owner_config: cfg.gallery_dl.x_list_owner_config.clone(),
+        x_lists: cfg
+            .sources
+            .iter()
+            .filter(|source| source.kind == "x_list")
+            .flat_map(|source| &source.targets)
+            .filter_map(|target| x_list_id(target))
+            .collect(),
+    };
+    let sink = Arc::new(
+        TelegramSink::new(
+            token,
+            cfg.telegram.channel_id.clone(),
+            cfg.telegram.publish_channel.clone(),
+            "hanabi.db",
+            gallery,
+        )?
+        .with_author_removal(author_removal),
+    );
     // 手动触发通道:/run 命令经此通知抓取循环立即跑一轮。
     let (trigger_tx, mut trigger_rx) = tokio::sync::mpsc::channel::<()>(8);
     // 手动链接通道:发来的 Pixiv/X 作品链接(含消息 id)经此交抓取循环直发频道。
@@ -527,6 +544,14 @@ fn douyin_download_complete(downloaded: usize, failed: usize) -> bool {
     downloaded > 0 && failed == 0
 }
 
+/// `https://x.com/i/lists/<id>` → `<id>`。
+fn x_list_id(target: &str) -> Option<String> {
+    let path = target.split(['?', '#']).next()?.trim_end_matches('/');
+    let (prefix, id) = path.rsplit_once('/')?;
+    (prefix.ends_with("/i/lists") && !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| id.to_string())
+}
+
 fn failure_notice(message: &str, original_url: &str) -> String {
     format!("{message}\n原链接: {original_url}")
 }
@@ -824,6 +849,16 @@ async fn handle_douyin(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn x_list_id_accepts_only_list_urls() {
+        assert_eq!(
+            x_list_id("https://x.com/i/lists/2038823556235268425/?s=20").as_deref(),
+            Some("2038823556235268425")
+        );
+        assert_eq!(x_list_id("https://x.com/someone"), None);
+        assert_eq!(x_list_id("https://x.com/i/lists/abc"), None);
+    }
 
     #[test]
     fn slot_aligns_to_interval_in_local_tz() {

@@ -13,6 +13,11 @@ publish_channel = "@your_channel" # 必填:批准后发布的频道(@username �
 [gallery_dl]
 config_path = "gallery-dl.conf"
 probe_range = "1-20"
+# 排除作者时自动在账号侧移除：Pixiv 用上面配置的 refresh-token 取消关注；
+# X 需要 List 所有者账号的 cookie（只填 extractor.twitter.cookies，chmod 600，不提交）。
+# python_command 必须能 import gallery_dl（Docker 镜像默认 python3 即可）。
+# python_command = "python3"
+# x_list_owner_config = "gallery-dl-x-owner.conf"
 
 # 抖音作者主页抓取：桥接 jiji262/douyin-downloader 的签名、游标与可选浏览器兜底。
 # Cookie 不写进配置，使用 HANABI_DOUYIN_COOKIE 或 HANABI_DOUYIN_COOKIE_FILE。

@@ -15,7 +15,10 @@ use teloxide::types::{
 };
 use tokio::sync::Mutex;
 
+mod blocked_authors;
 mod douyin_monitor;
+
+pub use blocked_authors::AuthorRemoval;
 mod image_review;
 
 use crate::gallery::{GalleryClient, GalleryIngestError, GalleryPublication, GalleryPublishState};
@@ -167,7 +170,7 @@ pub struct ReviewState {
     owner: i64,                 // 审批私聊数字 id;仅响应本人的命令/链接
     publish_channel: Recipient, // 批准后发布频道
     db: Mutex<rusqlite::Connection>,
-    douyin_store: Mutex<crate::store::Store>,
+    store: Mutex<crate::store::Store>,
     // ponytail: serialize review mutations; use per-session locks if review throughput matters.
     review_gate: Arc<Mutex<()>>,
     counter: AtomicU64,
@@ -177,6 +180,8 @@ pub struct ReviewState {
     gallery: Option<GalleryClient>,
     /// 图库失败补偿队列。与 gallery 同时启用，副本独立于 pending/评论目录。
     gallery_outbox: Option<GalleryOutbox>,
+    /// 排除作者时在 Pixiv/X 账号侧移除。None 时只在 Hanabi 内排除（抖音监控仍会停掉）。
+    author_removal: Option<AuthorRemoval>,
 }
 
 impl ReviewState {
@@ -353,14 +358,23 @@ impl TelegramSink {
                 owner,
                 publish_channel: to_recipient(publish_channel_id),
                 db: Mutex::new(conn),
-                douyin_store: Mutex::new(crate::store::Store::open(db_path)?),
+                store: Mutex::new(crate::store::Store::open(db_path)?),
                 review_gate: Arc::new(Mutex::new(())),
                 counter: AtomicU64::new((max_token as u64 + 1).max(now_secs() as u64 * 1_000_000)),
                 pending_comments: Mutex::new(std::collections::HashMap::new()),
                 gallery,
                 gallery_outbox,
+                author_removal: None,
             }),
         })
+    }
+
+    /// 启用排除作者时的账号侧移除。须在共享 state 之前调用。
+    pub fn with_author_removal(mut self, removal: AuthorRemoval) -> Self {
+        Arc::get_mut(&mut self.state)
+            .expect("with_author_removal 须在共享 state 之前调用")
+            .author_removal = Some(removal);
+        self
     }
 
     /// 供 main 启动 callback 轮询任务(与抓取循环并发)。
@@ -953,6 +967,7 @@ fn command_menu(gallery_enabled: bool) -> Vec<BotCommand> {
         BotCommand::new("undo", "撤销最近一次审批动作"),
         BotCommand::new("status", "查看待审数和运行状态"),
         BotCommand::new("douyin", "查看和删除抖音作者监控"),
+        BotCommand::new("blocked", "查看和解除已排除的作者"),
         BotCommand::new("ping", "存活测试"),
         BotCommand::new("help", "查看命令列表"),
     ]);
@@ -1664,23 +1679,23 @@ async fn non_solid_images(files: &[PathBuf]) -> Result<Vec<PathBuf>> {
 }
 
 fn review_keyboard(token: i64, has_gallery: bool) -> InlineKeyboardMarkup {
+    let mut publish = vec![InlineKeyboardButton::callback(
+        "✅ 发送到频道",
+        format!("ok:{token}"),
+    )];
     if has_gallery {
-        InlineKeyboardMarkup::new(vec![
-            vec![
-                InlineKeyboardButton::callback("✅ 发送到频道", format!("ok:{token}")),
-                InlineKeyboardButton::callback("📦 发送并入库", format!("ok_lib:{token}")),
-            ],
-            vec![InlineKeyboardButton::callback(
-                "❌ 丢弃",
-                format!("no:{token}"),
-            )],
-        ])
-    } else {
-        InlineKeyboardMarkup::new(vec![vec![
-            InlineKeyboardButton::callback("✅ 发送到频道", format!("ok:{token}")),
-            InlineKeyboardButton::callback("❌ 丢弃", format!("no:{token}")),
-        ]])
+        publish.push(InlineKeyboardButton::callback(
+            "📦 发送并入库",
+            format!("ok_lib:{token}"),
+        ));
     }
+    InlineKeyboardMarkup::new(vec![
+        publish,
+        vec![
+            InlineKeyboardButton::callback("❌ 丢弃", format!("no:{token}")),
+            InlineKeyboardButton::callback("🚫 排除作者", format!("block:{token}")),
+        ],
+    ])
 }
 
 #[async_trait]
@@ -2464,6 +2479,9 @@ async fn handle_command(
     if cmd == "/douyin" && state.owner > 0 {
         return douyin_monitor::send(state).await;
     }
+    if cmd == "/blocked" && state.owner > 0 {
+        return blocked_authors::send(state).await;
+    }
     if cmd == "/undo" {
         let publishing = {
             let db = state.db.lock().await;
@@ -2687,7 +2705,7 @@ async fn handle_command(
                 ""
             };
             format!(
-                "命令列表:\n/run — 立即抓取一轮\n/approve — 批准并发布全部剩余待审(仅频道,不入库){archive_help}\n/undo — 撤销最近一次审批动作并恢复审批卡片\n/douyin — 查看和删除抖音作者监控\n/status — 待审数+运行状态\n/ping — 存活测试\n/help — 本帮助\n\n💡 审批按钮:✅ 发送到频道 / 📦 发送并入库 / ❌ 丢弃\n💡 误点发送、入库或丢弃后立即发 /undo 可撤回上一步并恢复审批卡片\n💡 先逐条点 ❌ 丢弃不想推送的图片，再发 /approve 或 /approve_archive 一键处理其余图片\n💡 直接发 Pixiv/X 作品链接 → 自动抓取并发布到频道(配置图库后同步入库)\n💡 发抖音作者名片 → 自动订阅，立即抓取送审，之后随 Pixiv/X 定时抓取"
+                "命令列表:\n/run — 立即抓取一轮\n/approve — 批准并发布全部剩余待审(仅频道,不入库){archive_help}\n/undo — 撤销最近一次审批动作并恢复审批卡片\n/douyin — 查看和删除抖音作者监控\n/blocked — 查看和解除已排除的作者\n/status — 待审数+运行状态\n/ping — 存活测试\n/help — 本帮助\n\n💡 审批按钮:✅ 发送到频道 / 📦 发送并入库 / ❌ 丢弃 / 🚫 排除作者(丢弃该作者全部待审，之后定时抓取不再送审)\n💡 误点发送、入库或丢弃后立即发 /undo 可撤回上一步并恢复审批卡片\n💡 先逐条点 ❌ 丢弃不想推送的图片，再发 /approve 或 /approve_archive 一键处理其余图片\n💡 直接发 Pixiv/X 作品链接 → 自动抓取并发布到频道(配置图库后同步入库)\n💡 发抖音作者名片 → 自动订阅，立即抓取送审，之后随 Pixiv/X 定时抓取"
             )
         }
         _ => return Ok(()),
@@ -2761,6 +2779,12 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
     {
         return douyin_monitor::callback(state, q).await;
     }
+    if q.data
+        .as_deref()
+        .is_some_and(|data| data.starts_with("bl:"))
+    {
+        return blocked_authors::callback(state, q).await;
+    }
     // 权限校验:仅审批人本人可操作按钮(纵深防御,防 review_chat 被误配成可多人
     // 触达的会话时他人代批直发频道)。只在 owner 为正(私聊形态,chat_id==user_id,
     // 二者同值可比)时启用;owner 为负(群组 id)或 0(非数字降级形态)时用户 id
@@ -2782,7 +2806,7 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
     let (action, token_str) = data.split_once(':').unwrap_or(("", ""));
     let token: i64 = token_str.parse().unwrap_or(-1);
 
-    if action != "ok" && action != "ok_lib" && action != "no" {
+    if !matches!(action, "ok" | "ok_lib" | "no" | "block") {
         let _ = state
             .bot
             .answer_callback_query(q.id)
@@ -2818,20 +2842,49 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
     };
     let publish = action == "ok" || action == "ok_lib";
     let archive = action == "ok_lib";
+    let blocking = action == "block";
+    // 排除作者 = 记入排除表 + 丢弃该作者全部待审。点中的这条按普通丢弃最后处理，/undo 能恢复它。
+    let mut same_author = Vec::new();
+    let mut answer = if archive {
+        "⏳ 发布并入库中…".to_string()
+    } else if publish {
+        "⏳ 发布中…".to_string()
+    } else {
+        "❌ 已丢弃".to_string()
+    };
+    if blocking {
+        match blocked_authors::block(state, &row.5, token).await {
+            Ok(Some((item, tokens))) => {
+                answer = format!(
+                    "🚫 已排除 {}，丢弃 {} 条待审",
+                    item.author.name,
+                    tokens.len() + 1
+                );
+                same_author = tokens;
+                tokio::spawn(blocked_authors::remove_from_source(state.clone(), item));
+            }
+            outcome => {
+                {
+                    let db = state.db.lock().await;
+                    let _ = restore_pending(&db, token);
+                }
+                let _ = state
+                    .bot
+                    .answer_callback_query(q.id)
+                    .text(if outcome.is_ok() {
+                        "该作品缺少作者信息，无法排除"
+                    } else {
+                        "排除作者失败，请重试"
+                    })
+                    .await;
+                return outcome.map(|_| ());
+            }
+        }
+    }
 
     // 立即应答,停止按钮转圈(必须 3 秒内,否则 callback query 过期)。
     // 发图/删消息这些耗时操作放后台,不让你盯着转圈等上传。
-    let _ = state
-        .bot
-        .answer_callback_query(q.id)
-        .text(if archive {
-            "⏳ 发布并入库中…"
-        } else if publish {
-            "⏳ 发布中…"
-        } else {
-            "❌ 已丢弃"
-        })
-        .await;
+    let _ = state.bot.answer_callback_query(q.id).text(answer).await;
 
     // 后台执行:批准→发频道(+可选入库);然后删私聊整组 + 清文件 + 删 pending。
     // 失败(如限流)恢复 pending,发提示可重试。内层再包一个 task 检查 JoinError:
@@ -2846,6 +2899,8 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
                 "⏳ 排队发布并入库…"
             } else if publish {
                 "⏳ 排队发布…"
+            } else if blocking {
+                "⏳ 排除中…"
             } else {
                 "⏳ 丢弃中…"
             };
@@ -2876,7 +2931,23 @@ async fn handle_callback(state: &Arc<ReviewState>, q: CallbackQuery) -> Result<(
         }
         let inner = tokio::spawn({
             let state = state.clone();
-            async move { finish_claimed(&state, token, row, publish, archive, true).await }
+            async move {
+                for other in same_author {
+                    let claim = {
+                        let db = state.db.lock().await;
+                        claim_pending(&db, other)
+                    };
+                    // 失败的那条由 finish_claimed 恢复为待审，卡片原样保留，可再点。
+                    if let Ok(PendingClaim::Claimed(other_row)) = claim {
+                        if let Err(e) =
+                            finish_claimed(&state, other, other_row, false, false, true).await
+                        {
+                            tracing::warn!(error = %e, token = other, "排除作者时丢弃同作者待审失败");
+                        }
+                    }
+                }
+                finish_claimed(&state, token, row, publish, archive, true).await
+            }
         });
         match inner.await {
             Ok(Ok(_)) => {}
@@ -3069,7 +3140,7 @@ mod tests {
         Arc::get_mut(&mut sink.state).unwrap().bot =
             Bot::new("123:test").set_api_url(reqwest::Url::parse(&base).unwrap());
         let id = {
-            let store = sink.state.douyin_store.lock().await;
+            let store = sink.state.store.lock().await;
             store
                 .subscribe_douyin(
                     "https://www.douyin.com/user/MS4wTEST",
@@ -3112,7 +3183,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 sink.state
-                    .douyin_store
+                    .store
                     .lock()
                     .await
                     .list_douyin_monitors()
@@ -3126,7 +3197,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sink.state
-                .douyin_store
+                .store
                 .lock()
                 .await
                 .list_douyin_monitors()
@@ -3141,7 +3212,7 @@ mod tests {
         }
         assert!(sink
             .state
-            .douyin_store
+            .store
             .lock()
             .await
             .list_douyin_monitors()
@@ -3163,6 +3234,224 @@ mod tests {
         assert!(command_menu(false)
             .iter()
             .any(|cmd| cmd.command == "douyin"));
+    }
+
+    #[tokio::test]
+    async fn block_author_discards_their_pending_cards_and_keeps_others() {
+        let (base, stop, calls, server) = review_mock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = TelegramSink::new(
+            "123:test".into(),
+            "42".into(),
+            "-100123".into(),
+            dir.path().join("test.db").to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        Arc::get_mut(&mut sink.state).unwrap().bot =
+            Bot::new("123:test").set_api_url(reqwest::Url::parse(&base).unwrap());
+        let item = |id: &str, author: &str| crate::model::MediaItem {
+            source: crate::model::SourceKind::X,
+            source_id: id.into(),
+            author: crate::model::Author {
+                name: "高产画师".into(),
+                url: author.into(),
+            },
+            title: None,
+            url: format!("{author}/status/{id}"),
+            tags: vec![],
+            bookmark_count: None,
+            is_r18: false,
+            pixiv_type: None,
+            page_count: 1,
+            images: vec![],
+            origin: "test".into(),
+        };
+        {
+            let db = sink.state.db.lock().await;
+            for (token, meta) in [
+                (
+                    1,
+                    serde_json::to_string(&item("1", "https://x.com/a")).unwrap(),
+                ),
+                (
+                    2,
+                    serde_json::to_string(&item("2", "https://x.com/a")).unwrap(),
+                ),
+                (
+                    3,
+                    serde_json::to_string(&item("3", "https://x.com/b")).unwrap(),
+                ),
+                (4, "{}".to_string()),
+            ] {
+                db.execute(
+                    "INSERT INTO pending(token,files,caption,msg_ids,originals,created_at,state,is_r18,item_meta)
+                     VALUES(?1,'[]','c',?2,'[]',1,'pending',0,?3)",
+                    rusqlite::params![token, format!("[{token}]"), meta],
+                )
+                .unwrap();
+            }
+        }
+        let callback = |data: &str| {
+            serde_json::from_value::<CallbackQuery>(serde_json::json!({
+                "id": "query", "from": {"id":42,"is_bot":false,"first_name":"Owner"},
+                "chat_instance":"test", "data":data,
+                "message": {"message_id": 9, "date": 1,
+                    "chat": {"id": 42,"type": "private","first_name": "Owner"}, "text": "card"}
+            }))
+            .unwrap()
+        };
+        let pending = |state: Arc<ReviewState>| async move {
+            let db = state.db.lock().await;
+            let mut statement = db
+                .prepare("SELECT token FROM pending ORDER BY token")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+
+        // 缺作者信息的旧记录不能排除，保持待审。
+        handle_callback(&sink.state, callback("block:4"))
+            .await
+            .unwrap();
+        assert_eq!(pending(sink.state.clone()).await, vec![1, 2, 3, 4]);
+
+        handle_callback(&sink.state, callback("block:2"))
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            if pending(sink.state.clone()).await == vec![3, 4] {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(pending(sink.state.clone()).await, vec![3, 4]);
+        let unsettled: i64 = sink
+            .state
+            .db
+            .lock()
+            .await
+            .query_row(
+                "SELECT COUNT(*) FROM pending WHERE state<>'pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unsettled, 0);
+        assert!(sink
+            .state
+            .store
+            .lock()
+            .await
+            .is_author_blocked(&item("9", "https://x.com/a"))
+            .unwrap());
+        // 点中的那条最后丢弃，/undo 恢复的是它。
+        let undo_token: i64 = sink
+            .state
+            .db
+            .lock()
+            .await
+            .query_row(
+                "SELECT token FROM review_actions WHERE state='available' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(undo_token, 2);
+
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let answers: Vec<String> = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(route, _)| route.to_lowercase().ends_with("answercallbackquery"))
+            .map(|(_, body)| {
+                serde_json::from_slice::<serde_json::Value>(body).unwrap()["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            answers,
+            vec![
+                "该作品缺少作者信息，无法排除".to_string(),
+                "🚫 已排除 高产画师，丢弃 2 条待审".to_string()
+            ]
+        );
+        assert!(command_menu(false)
+            .iter()
+            .any(|cmd| cmd.command == "blocked"));
+    }
+
+    #[tokio::test]
+    async fn author_removal_reports_success_and_failure_per_list() {
+        let (base, stop, calls, server) = review_mock();
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("remove_author.py");
+        std::fs::write(
+            &helper,
+            "import json, sys\nif sys.argv[3] == '2':\n    print('RuntimeError: boom', file=sys.stderr)\n    sys.exit(1)\nprint(json.dumps({'removed': sys.argv[3] == '1'}))\n",
+        )
+        .unwrap();
+        let mut sink = TelegramSink::new(
+            "123:test".into(),
+            "42".into(),
+            "-100123".into(),
+            dir.path().join("test.db").to_str().unwrap(),
+            None,
+        )
+        .unwrap()
+        .with_author_removal(AuthorRemoval {
+            python_command: "python3".into(),
+            helper_path: helper.to_string_lossy().into_owned(),
+            pixiv_config: "unused.conf".into(),
+            x_owner_config: "owner.conf".into(),
+            x_lists: vec!["1".into(), "2".into(), "3".into()],
+        });
+        Arc::get_mut(&mut sink.state).unwrap().bot =
+            Bot::new("123:test").set_api_url(reqwest::Url::parse(&base).unwrap());
+        let item = crate::model::MediaItem {
+            source: crate::model::SourceKind::X,
+            source_id: "1".into(),
+            author: crate::model::Author {
+                name: "高产画师".into(),
+                url: "https://x.com/a".into(),
+            },
+            title: None,
+            url: String::new(),
+            tags: vec![],
+            bookmark_count: None,
+            is_r18: false,
+            pixiv_type: None,
+            page_count: 1,
+            images: vec![],
+            origin: "test".into(),
+        };
+        blocked_authors::remove_from_source(sink.state.clone(), item).await;
+
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let calls = calls.lock().unwrap();
+        let sent: Vec<String> = calls
+            .iter()
+            .filter(|(route, _)| route.to_lowercase().ends_with("sendmessage"))
+            .map(|(_, body)| {
+                serde_json::from_slice::<serde_json::Value>(body).unwrap()["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        // 列表 3 不含该作者（removed=false），不出现在通知里。
+        assert_eq!(
+            sent,
+            vec!["🚫 已把 @a 移出 X List 1\n⚠️ 把 @a 移出 X List 2失败：RuntimeError: boom\n作者仍在 Hanabi 排除列表，不会再送审".to_string()]
+        );
     }
 
     #[tokio::test]

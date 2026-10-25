@@ -72,7 +72,7 @@ fn page(store: &Store, requested: usize) -> Result<(String, InlineKeyboardMarkup
 }
 
 pub(super) async fn send(state: &ReviewState) -> Result<()> {
-    let (text, keyboard) = page(&*state.douyin_store.lock().await, 0)?;
+    let (text, keyboard) = page(&*state.store.lock().await, 0)?;
     state
         .bot
         .send_message(state.review_chat.clone(), text)
@@ -95,7 +95,7 @@ pub(super) async fn callback(state: &ReviewState, q: CallbackQuery) -> Result<()
     let data = q.data.as_deref().unwrap_or("");
     let parts: Vec<_> = data.split(':').collect();
     let (requested, removed) = {
-        let store = state.douyin_store.lock().await;
+        let store = state.store.lock().await;
         match parts.as_slice() {
             ["dy", "list", page] => (page.parse::<usize>().ok(), None),
             ["dy", "remove", id, page] => match (id.parse::<i64>(), page.parse::<usize>()) {
@@ -122,7 +122,7 @@ pub(super) async fn callback(state: &ReviewState, q: CallbackQuery) -> Result<()
             None => "已刷新",
         })
         .await?;
-    let (text, keyboard) = page(&*state.douyin_store.lock().await, requested)?;
+    let (text, keyboard) = page(&*state.store.lock().await, requested)?;
     let message = q.message.unwrap();
     if let Err(error) = state
         .bot

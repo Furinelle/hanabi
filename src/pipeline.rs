@@ -41,6 +41,9 @@ where
                     continue;
                 }
             }
+            if store.is_author_blocked(&item)? {
+                continue;
+            }
             if store.already_pushed(&item)? {
                 continue;
             }

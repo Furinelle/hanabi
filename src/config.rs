@@ -63,6 +63,13 @@ pub struct GalleryDlCfg {
     pub config_path: String,
     #[serde(default = "default_range")]
     pub probe_range: String,
+    /// 能 import gallery_dl 的 Python。排除作者时用它取消 Pixiv 关注、把作者移出 X List。
+    #[serde(default = "default_python_command")]
+    pub python_command: String,
+    /// 可选：X List 所有者账号的 gallery-dl 配置（只需 twitter cookies），排除作者时用来移出 List。
+    /// 抓取账号不是 List 所有者时必须单独提供；为空则不改动 X List。
+    #[serde(default)]
+    pub x_list_owner_config: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

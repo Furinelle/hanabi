@@ -15,6 +15,14 @@ pub struct DouyinSubscription {
     pub display_name: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct BlockedAuthor {
+    pub id: i64,
+    pub source: String,
+    pub author_url: String,
+    pub display_name: String,
+}
+
 fn douyin_monitor_target(raw: &str) -> Option<String> {
     if let Some(profile) = crate::source::douyin::canonical_user_profile(raw) {
         return Some(profile);
@@ -77,7 +85,13 @@ impl Store {
                  profile_url TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS douyin_shared_works_author
-                 ON douyin_shared_works(profile_url);",
+                 ON douyin_shared_works(profile_url);
+             CREATE TABLE IF NOT EXISTS blocked_authors (
+                 source TEXT NOT NULL,
+                 author_url TEXT NOT NULL,
+                 display_name TEXT NOT NULL DEFAULT '',
+                 PRIMARY KEY (source, author_url)
+             );",
         )?;
         let migration = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
         let columns = migration
@@ -266,6 +280,23 @@ impl Store {
         Ok(removed)
     }
 
+    /// 按作者主页停止监控，配置里的短链条目也能命中。返回是否有在监控的条目被停掉。
+    pub fn unsubscribe_douyin_profile(&self, profile_url: &str) -> Result<bool> {
+        let id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT rowid FROM douyin_subscriptions
+                 WHERE enabled = 1 AND (profile_url = ?1 OR shared_url = ?1) ORDER BY rowid",
+                params![profile_url],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match id {
+            Some(id) => self.unsubscribe_douyin(id),
+            None => Ok(false),
+        }
+    }
+
     pub fn remember_douyin_author(&self, profile_url: &str, display_name: &str) -> Result<()> {
         let Some(profile) = crate::source::douyin::canonical_user_profile(profile_url) else {
             return Ok(());
@@ -343,6 +374,45 @@ impl Store {
         Ok(subscribed)
     }
 
+    /// 排除作者：定时抓取不再把该作者的作品送审。返回是否新加入。
+    pub fn block_author(&self, item: &MediaItem) -> Result<bool> {
+        anyhow::ensure!(!item.author.url.is_empty(), "作品缺少作者链接");
+        Ok(self.conn.execute(
+            "INSERT OR IGNORE INTO blocked_authors (source, author_url, display_name) VALUES (?1, ?2, ?3)",
+            params![item.source.as_str(), item.author.url, item.author.name],
+        )? > 0)
+    }
+
+    pub fn is_author_blocked(&self, item: &MediaItem) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM blocked_authors WHERE source = ?1 AND author_url = ?2)",
+            params![item.source.as_str(), item.author.url],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn list_blocked_authors(&self) -> Result<Vec<BlockedAuthor>> {
+        let mut statement = self.conn.prepare(
+            "SELECT rowid, source, author_url, display_name FROM blocked_authors ORDER BY rowid",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(BlockedAuthor {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                author_url: row.get(2)?,
+                display_name: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn unblock_author(&self, id: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM blocked_authors WHERE rowid = ?1", [id])?
+            > 0)
+    }
+
     pub fn already_pushed(&self, item: &MediaItem) -> Result<bool> {
         let (kind, id) = item.dedup_key();
         self.already_pushed_key(&kind, &id)
@@ -414,6 +484,52 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
             .unwrap();
         assert_eq!(busy, 5000);
+    }
+
+    #[test]
+    fn blocked_author_is_scoped_to_source_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.db");
+        let path = path.to_str().unwrap();
+        let blocked = item("1");
+        {
+            let store = Store::open(path).unwrap();
+            assert!(store.block_author(&blocked).unwrap());
+            assert!(!store.block_author(&item("2")).unwrap());
+        }
+        let store = Store::open(path).unwrap();
+        assert!(store.is_author_blocked(&item("3")).unwrap());
+        let mut other_source = item("3");
+        other_source.source = SourceKind::X;
+        assert!(!store.is_author_blocked(&other_source).unwrap());
+        let mut anonymous = item("4");
+        anonymous.author.url.clear();
+        assert!(store.block_author(&anonymous).is_err());
+
+        let listed = store.list_blocked_authors().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            (listed[0].source.as_str(), listed[0].author_url.as_str()),
+            ("pixiv", "u")
+        );
+        assert!(store.unblock_author(listed[0].id).unwrap());
+        assert!(!store.unblock_author(listed[0].id).unwrap());
+        assert!(!store.is_author_blocked(&blocked).unwrap());
+    }
+
+    #[test]
+    fn douyin_profile_unsubscribe_matches_profile_or_resolved_short_link() {
+        let store = Store::open_in_memory().unwrap();
+        let profile = "https://www.douyin.com/user/MS4wTEST";
+        store
+            .subscribe_douyin(profile, "https://v.douyin.com/card/")
+            .unwrap();
+        assert!(store.unsubscribe_douyin_profile(profile).unwrap());
+        assert!(!store.unsubscribe_douyin_profile(profile).unwrap());
+        assert!(store.is_douyin_disabled(profile).unwrap());
+        assert!(!store
+            .unsubscribe_douyin_profile("https://www.douyin.com/user/MS4wOTHER")
+            .unwrap());
     }
 
     #[test]

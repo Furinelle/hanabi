@@ -188,3 +188,43 @@ async fn removed_douyin_author_is_not_downloaded_or_marked_pushed() {
     assert_eq!(*sink.delivered.lock().unwrap(), vec!["keep"]);
     assert!(!store.already_pushed(&removed).unwrap());
 }
+
+#[tokio::test]
+async fn blocked_author_is_skipped_until_unblocked() {
+    let store = Store::open_in_memory().unwrap();
+    let mut blocked = item("blocked", 100);
+    blocked.author.url = "https://www.pixiv.net/users/1".into();
+    store.block_author(&blocked).unwrap();
+    let sources: Vec<Box<dyn Source>> = vec![Box::new(MockSource {
+        items: vec![blocked.clone(), item("keep", 100)],
+        cfg: Default::default(),
+    })];
+    let sink = MockSink::default();
+    run_once(
+        &store,
+        &sources,
+        &FilterChain::standard(),
+        &sink,
+        |work| async move {
+            assert_ne!(work.source_id, "blocked");
+            Vec::<PathBuf>::new()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(*sink.delivered.lock().unwrap(), vec!["keep"]);
+    assert!(!store.already_pushed(&blocked).unwrap());
+
+    let id = store.list_blocked_authors().unwrap()[0].id;
+    store.unblock_author(id).unwrap();
+    run_once(
+        &store,
+        &sources,
+        &FilterChain::standard(),
+        &sink,
+        |_| async { vec![] },
+    )
+    .await
+    .unwrap();
+    assert_eq!(*sink.delivered.lock().unwrap(), vec!["keep", "blocked"]);
+}

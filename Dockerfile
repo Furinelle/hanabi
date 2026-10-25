@@ -30,10 +30,12 @@ COPY --from=builder /hanabi /usr/local/bin/hanabi
 COPY --from=builder /gallery_repair /usr/local/bin/gallery_repair
 COPY --from=builder /restore_pending /usr/local/bin/restore_pending
 COPY tools/douyin_user_feed.py /usr/local/lib/hanabi/douyin_user_feed.py
+COPY tools/remove_author.py /usr/local/lib/hanabi/remove_author.py
 WORKDIR /data
 # config.toml / gallery-dl.conf 经 volume 挂到 /data; token 经 -e 注入。
 ENV HANABI_CONFIG=/data/config.toml
 ENV HANABI_DOUYIN_HELPER=/usr/local/lib/hanabi/douyin_user_feed.py
+ENV HANABI_REMOVE_AUTHOR_HELPER=/usr/local/lib/hanabi/remove_author.py
 ENV HOME=/home/hanabi
 USER hanabi:hanabi
 STOPSIGNAL SIGTERM

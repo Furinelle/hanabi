@@ -5,6 +5,7 @@
 *.sqlite
 config.toml
 gallery-dl.conf
+gallery-dl-*.conf
 .env
 .venv/
 .douyin-cookies.json

@@ -48,7 +48,7 @@ filters = { r18 = false, min_bookmarks = 500, tags = ["原神"], illust_only = t
 name = "pixiv_ranking"
 kind = "pixiv_ranking"
 targets = ["https://www.pixiv.net/ranking.php?mode=daily&content=illust"]
-filters = { r18 = false, min_bookmarks = 1000, tags = ["原神"], illust_only = true, max_pages = 5 }
+filters = { r18 = false, min_bookmarks = 1000, tags = ["原神"], illust_only = true, max_pages = 5, exclude_ai = true }
 
 [[source]]
 name = "x_artists_list"

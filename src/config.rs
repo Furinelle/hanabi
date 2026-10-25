@@ -164,6 +164,9 @@ pub struct SourceFilterCfg {
     pub max_pages: Option<u32>,
     #[serde(default)]
     pub require_media: bool,
+    /// 拦掉 Pixiv 申报为 AI 生成的作品。X、抖音没有对应标记，不受影响。
+    #[serde(default)]
+    pub exclude_ai: bool,
 }
 
 impl Config {

@@ -57,6 +57,15 @@ impl Filter for RequireMedia {
     }
 }
 
+/// exclude_ai → 拦 Pixiv 申报为 AI 生成的作品(解析时 illust_ai_type==2 已在 tag 首位插入
+/// 「AI生成」);作者自己打了同名标签的也一并拦。
+pub struct AiFilter;
+impl Filter for AiFilter {
+    fn keep(&self, item: &MediaItem, cfg: &SourceFilterCfg) -> bool {
+        !cfg.exclude_ai || !item.tags.iter().any(|t| t == "AI生成")
+    }
+}
+
 /// tag 白名单:作品 tag 与白名单有交集才留(精确匹配;ASCII 额外大小写不敏感,
 /// 中日文标签按精确匹配)。
 pub struct TagWhitelist;
@@ -100,6 +109,19 @@ mod tests {
             }],
             origin: "s".into(),
         }
+    }
+
+    #[test]
+    fn ai_filtered_only_when_enabled() {
+        let mut it = base();
+        it.tags.insert(0, "AI生成".into());
+        assert!(AiFilter.keep(&it, &SourceFilterCfg::default()));
+        let cfg = SourceFilterCfg {
+            exclude_ai: true,
+            ..Default::default()
+        };
+        assert!(!AiFilter.keep(&it, &cfg));
+        assert!(AiFilter.keep(&base(), &cfg));
     }
 
     #[test]

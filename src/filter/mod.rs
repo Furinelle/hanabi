@@ -25,6 +25,7 @@ impl FilterChain {
             Box::new(PageCountFilter),
             Box::new(ScoreThreshold),
             Box::new(RequireMedia),
+            Box::new(AiFilter),
             Box::new(TagWhitelist),
         ])
     }

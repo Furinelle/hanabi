@@ -22,7 +22,7 @@
 - ♻️ **图库自动去重**：Hanabi 不拦截重复图，入库时随原图上传图片指纹；Vitrine 发现跨作品的严格同图后只保留画质最高的一份（像素数、文件大小依次比较，相同则保留先入库的），并删除其余副本的频道消息。相似图在图库 admin 人工审批。
 - 🔞 **R18 处理**：敏感内容（Pixiv `x_restrict` / X `sensitive`）进审批标 🔞 由你人工决定；发布到频道时图片加**剧透遮罩**（spoiler，点开才显示），审批私聊不打码便于审
 - 🤖 **AI 生成标签**：Pixiv `illust_ai_type==2` 的作品 caption 标签首位自动加 `#AI生成`
-- 🎯 **分源过滤**：R18 / 收藏数 / 点赞数 / 标签白名单 / 只插画 / 页数上限
+- 🎯 **分源过滤**：R18 / 收藏数 / 点赞数 / 标签白名单 / 只插画 / 页数上限 / 排除 Pixiv AI 生成作品（`exclude_ai`）
 - 🧯 **失败可见**：手动链接抓取/发布失败时，「抓取中」提示会改写成具体原因（解析为空、下载 0 张、部分批次失败、队列已满），不静默装成功；超 10 张的作品审批与发布自动按 10 分批
 - 💾 **待审图片跨重启保留**：下载文件默认保存在工作目录的 `pending/`，不再依赖会被系统重启清空的 `/tmp`；可用 `HANABI_PENDING_ROOT` 指向单独的持久卷
 - ↩️ **上一步可撤销**：`/undo` 撤回最近一次审批动作（发送到频道 / 发送并入库 / 丢弃），删掉刚发的频道帖和图库记录，并重新生成审批卡片；无本地文件的旧发布记录仍不可撤
@@ -124,7 +124,7 @@ filters = { r18 = true, illust_only = true, max_pages = 5 }
 name = "pixiv_ranking_tagged"
 kind = "pixiv_ranking"
 targets = ["https://www.pixiv.net/ranking.php?mode=weekly&content=illust"]
-filters = { r18 = true, illust_only = true, max_pages = 5, min_bookmarks = 2000, tags = ["フリーナ", "原神", "..."] }
+filters = { r18 = true, illust_only = true, max_pages = 5, min_bookmarks = 2000, exclude_ai = true, tags = ["フリーナ", "原神", "..."] }
 
 # X List
 [[source]]

@@ -3361,6 +3361,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(undo_token, 2);
+        // 卡片删除在登记之后才发：等两张卡都删完再停 mock，否则阻塞的 join 会卡住还没写完请求的后台任务。
+        let deleted = || {
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(route, _)| route.to_lowercase().ends_with("deletemessage"))
+                .count()
+        };
+        for _ in 0..500 {
+            if deleted() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(deleted(), 2);
 
         stop.store(true, Ordering::SeqCst);
         server.join().unwrap();

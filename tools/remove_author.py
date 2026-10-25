@@ -62,10 +62,13 @@ def remove_from_x_list(list_id: str, screen_name: str) -> bool:
         data = response.json()
     except ValueError:
         data = {}
-    if response.status_code >= 400 or data.get("errors") or "data" not in data:
-        errors = "; ".join(e.get("message", "") for e in data.get("errors", ()))
-        raise RuntimeError(f"ListRemoveMember {response.status_code}: {errors}")
-    return True
+    if response.status_code < 400 and "data" in data and not data.get("errors"):
+        return True
+    # X 有时已经移除成功，却在生成返回结果时报 DecodeException；以成员列表为准。
+    if user_id not in x_list_members(api, list_id):
+        return True
+    errors = "; ".join(e.get("message", "") for e in data.get("errors", ()))
+    raise RuntimeError(f"ListRemoveMember {response.status_code}: {errors}")
 
 
 def unfollow_pixiv(user_id: str) -> bool:

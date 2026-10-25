@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [0.12.3] - 2026-10-25
+
+### 安全
+- Docker 镜像在 Alpine 3.20 自带的 py3-brotli 1.1.0 之上安装 Brotli 1.2.1，修复 CVE-2026-111497。gallery-dl（urllib3）和 aiohttp 会自动用它解压 br 响应。
+
 ## [0.12.2] - 2026-10-25
 
 ### 修复

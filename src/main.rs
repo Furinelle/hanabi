@@ -557,9 +557,18 @@ fn failure_notice(message: &str, original_url: &str) -> String {
 }
 
 /// 抖音作者主页属于多作品链接：逐条下载后进入审批，与 Pixiv/X 主页一致。
+fn subscription_status(added: bool) -> &'static str {
+    if added {
+        "✅ 作者已加入定时抓取"
+    } else {
+        "✅ 作者已在定时抓取中"
+    }
+}
+
 async fn handle_douyin_user(
     job: hanabi::sink::telegram::LinkJob,
     items: Vec<MediaItem>,
+    added: bool,
     store: Store,
     client: &reqwest::Client,
     sink: &TelegramSink,
@@ -607,13 +616,19 @@ async fn handle_douyin_user(
     if failed > 0 {
         sink.edit_review_text(
             job.notice_msg_id,
-            &format!("✅ 作者已加入定时抓取；本次送审 {delivered} 个，失败 {failed} 个，下轮重试"),
+            &format!(
+                "{}；本次送审 {delivered} 个，失败 {failed} 个，下轮重试",
+                subscription_status(added)
+            ),
         )
         .await;
     } else {
         sink.edit_review_text(
             job.notice_msg_id,
-            &format!("✅ 作者已加入定时抓取；本次送审 {delivered} 个作品"),
+            &format!(
+                "{}；本次送审 {delivered} 个作品",
+                subscription_status(added)
+            ),
         )
         .await;
     }
@@ -645,18 +660,18 @@ async fn handle_douyin(
     // 明确落到作者主页时直接走作者桥；既避免 note 页三次无效解析，也避免 Python
     // 再解析一遍短链时遇到偶发超时。
     if let Some(profile_url) = douyin::canonical_user_profile(resolved_target) {
-        store.subscribe_douyin(&profile_url, &job.url)?;
+        let added = store.subscribe_douyin(&profile_url, &job.url)?;
         match douyin::fetch_user_feed(runtime, &profile_url, "manual").await {
             Ok(feed) if !feed.items.is_empty() => {
                 let items = feed.items;
                 tracing::info!(items = items.len(), "手动抖音作者主页解析成功,进入批量审批");
-                return handle_douyin_user(job, items, store, &client, sink).await;
+                return handle_douyin_user(job, items, added, store, &client, sink).await;
             }
             Ok(_) => {
                 sink.delete_review_messages(&[job.user_msg_id]).await;
                 sink.edit_review_text(
                     job.notice_msg_id,
-                    "✅ 作者已加入定时抓取；本次没有新的图文作品",
+                    &format!("{}；本次没有新的图文作品", subscription_status(added)),
                 )
                 .await;
                 return Ok(());
@@ -666,7 +681,10 @@ async fn handle_douyin(
                 sink.delete_review_messages(&[job.user_msg_id]).await;
                 sink.edit_review_text(
                     job.notice_msg_id,
-                    &failure_notice("✅ 作者已加入定时抓取；本次抓取失败，下轮重试", &job.url),
+                    &failure_notice(
+                        &format!("{}；本次抓取失败，下轮重试", subscription_status(added)),
+                        &job.url,
+                    ),
                 )
                 .await;
                 return Ok(());
@@ -816,18 +834,18 @@ async fn handle_douyin(
             // 作者短链若预解析失败,再判一次主页桥。
             match douyin::fetch_user_feed(runtime, &job.url, "manual").await {
                 Ok(feed) if !feed.items.is_empty() => {
-                    store.subscribe_douyin(&feed.profile_url, &job.url)?;
+                    let added = store.subscribe_douyin(&feed.profile_url, &job.url)?;
                     let items = feed.items;
                     tracing::info!(items = items.len(), "手动抖音作者主页解析成功,进入批量审批");
-                    handle_douyin_user(job, items, store, &client, sink).await?;
+                    handle_douyin_user(job, items, added, store, &client, sink).await?;
                 }
                 Ok(feed) => {
-                    store.subscribe_douyin(&feed.profile_url, &job.url)?;
+                    let added = store.subscribe_douyin(&feed.profile_url, &job.url)?;
                     tracing::warn!(error = %note_error, "抖音作者主页没有可用图文作品");
                     sink.delete_review_messages(&[job.user_msg_id]).await;
                     sink.edit_review_text(
                         job.notice_msg_id,
-                        "✅ 作者已加入定时抓取；本次没有新的图文作品",
+                        &format!("{}；本次没有新的图文作品", subscription_status(added)),
                     )
                     .await;
                 }

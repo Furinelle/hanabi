@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+## [0.12.6] - 2026-10-28
+
+### 修复
+- 抖音 CDP 浏览器抓取不再把 UA 伪装成 Windows Chrome 139，改用浏览器真实的 UA，避免 UA 与 navigator/Client Hints 矛盾导致作品接口偶发 403。
+
 ## [0.12.5] - 2026-10-28
 
 ### 修复

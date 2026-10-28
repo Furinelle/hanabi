@@ -8,7 +8,7 @@
 
 二次元图片 Telegram 推送 bot，带**人工审批制**。从 Pixiv（关注画师新作 / 排行榜）、X（List）和抖音作者主页抓取插画，先发到你的私聊等审批，你点按钮决定是否发布到频道。
 
-当前版本：**v0.12.5**。升级变更见 [CHANGELOG](CHANGELOG.md)。
+当前版本：**v0.12.6**。升级变更见 [CHANGELOG](CHANGELOG.md)。
 
 ## 特性
 

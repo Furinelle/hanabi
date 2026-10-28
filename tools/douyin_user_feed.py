@@ -394,7 +394,6 @@ async def _browser_detail(
     cdp_url: str,
     aweme_id: str,
     cookies: dict[str, Any],
-    user_agent: str,
 ) -> dict[str, Any]:
     import aiohttp
 
@@ -465,11 +464,6 @@ async def _browser_detail(
                 )["sessionId"]
                 await command("Network.enable", session_id=target_session)
                 await command("Page.enable", session_id=target_session)
-                await command(
-                    "Emulation.setUserAgentOverride",
-                    {"userAgent": user_agent, "acceptLanguage": "zh-CN,zh;q=0.9"},
-                    target_session,
-                )
                 await command(
                     "Network.setCookies",
                     {
@@ -638,9 +632,9 @@ async def _browser_feed(
     cdp_url: str,
     sec_user_id: str,
     cookies: dict[str, Any],
-    user_agent: str,
     max_pages: int = 3,
 ) -> list[dict[str, Any]]:
+    # 不覆盖 UA：伪装的 UA 与浏览器真实的 navigator/Client Hints 矛盾，会触发作品接口 403。
     import aiohttp
 
     pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
@@ -711,11 +705,6 @@ async def _browser_feed(
                 )["sessionId"]
                 await command("Network.enable", session_id=target_session)
                 await command("Page.enable", session_id=target_session)
-                await command(
-                    "Emulation.setUserAgentOverride",
-                    {"userAgent": user_agent, "acceptLanguage": "zh-CN,zh;q=0.9"},
-                    target_session,
-                )
                 await command(
                     "Network.setCookies",
                     {
@@ -976,7 +965,6 @@ async def _run(request: dict[str, Any]) -> dict[str, Any]:
                     cdp_url,
                     aweme_id,
                     cookies,
-                    str(getattr(client, "headers", {}).get("User-Agent", "")),
                 )
                 browser_used = True
 
@@ -1044,7 +1032,6 @@ async def _run(request: dict[str, Any]) -> dict[str, Any]:
                             cdp_url,
                             sec_user_id,
                             cookies,
-                            str(getattr(client, "headers", {}).get("User-Agent", "")),
                             max_pages=max_pages,
                         )
                         if captured:

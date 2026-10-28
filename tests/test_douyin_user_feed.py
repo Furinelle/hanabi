@@ -151,7 +151,7 @@ class BrowserFeedTest(unittest.IsolatedAsyncioTestCase):
         with patch.dict(sys.modules, aiohttp=aiohttp), patch.object(
             MODULE, "time", socket.clock
         ), patch.object(MODULE, "asyncio", async_api), patch.object(MODULE, "_persist_browser_cookies") as persist:
-            items = await MODULE._browser_feed("ws://fake", "fake_author", {}, "fake_UA", max_pages=max_pages)
+            items = await MODULE._browser_feed("ws://fake", "fake_author", {}, max_pages=max_pages)
             if items:
                 persist.assert_called_once_with({"ttwid": "fake_ttwid"})
             else:
@@ -332,7 +332,7 @@ class BridgeDetailTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result["item"], valid)
         self.assertTrue(result["browser_fallback_used"])
         self.client.get_video_detail.assert_awaited_once_with("2")
-        self.browser.assert_awaited_once_with("ws://fake", "2", {}, "fake_UA")
+        self.browser.assert_awaited_once_with("ws://fake", "2", {})
 
     async def test_real_video_author_identity_returns_without_gallery_images(self):
         for author_key, id_key in (("author", "sec_uid"), ("authorInfo", "secUid")):
@@ -391,7 +391,7 @@ class BrowserDetailTest(unittest.IsolatedAsyncioTestCase):
         ), patch.object(MODULE, "asyncio", async_api), patch.object(
             MODULE, "extract_aweme_from_html", return_value=skeleton
         ) as html, patch.object(MODULE, "_persist_browser_cookies") as persist:
-            result = await MODULE._browser_detail("ws://fake", "2", {}, "fake_UA")
+            result = await MODULE._browser_detail("ws://fake", "2", {})
         self.assertIsNotNone(html.call_args)
         self.assertEqual(result, valid)
         self.assertEqual(socket.body_reads, ["skeleton", "valid"])
@@ -426,7 +426,7 @@ class BridgeFeedTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(factory.call_args_list, [call(cookies), call({})])
         main.resolve_short_url.assert_not_awaited()
         resolver.resolve_short_url.assert_awaited_once_with(short_url)
-        browser.assert_awaited_once_with("ws://fake", "fake_author", cookies, "fake_UA", max_pages=3)
+        browser.assert_awaited_once_with("ws://fake", "fake_author", cookies, max_pages=3)
         self.assertIs(browser.await_args.args[2], cookies)
         for client in (main, resolver):
             client.__aexit__.assert_awaited_once()
@@ -473,7 +473,7 @@ class BridgeFeedTest(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaisesRegex(RuntimeError, "浏览器兜底没有取得作品"):
                         await MODULE._run(request)
                 self.assertEqual(browser.await_count, len(responses))
-                browser.assert_has_awaits([call("ws://fake", "fake_author", {}, "fake_UA", max_pages=3)] * len(responses))
+                browser.assert_has_awaits([call("ws://fake", "fake_author", {}, max_pages=3)] * len(responses))
                 self.assertEqual(http_calls, [])
 
     async def test_without_cdp_api_paginates_and_403_is_not_success(self):

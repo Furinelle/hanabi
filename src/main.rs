@@ -657,10 +657,31 @@ async fn handle_douyin(
         .map(reqwest::Url::as_str)
         .unwrap_or(&job.url);
 
+    // 已在监控的作者交给定时抓取，不再手动访问主页；预解析失败时只能按当初的分享链接认出。
+    let profile_url = douyin::canonical_user_profile(resolved_target);
+    let added = match &profile_url {
+        Some(profile_url) => store.subscribe_douyin(profile_url, &job.url)?,
+        None => {
+            resolved_url.is_some()
+                || !store
+                    .douyin_subscriptions()?
+                    .iter()
+                    .any(|(_, shared_url)| shared_url == &job.url)
+        }
+    };
+    if !added {
+        sink.delete_review_messages(&[job.user_msg_id]).await;
+        sink.edit_review_text(
+            job.notice_msg_id,
+            &format!("{}，新作品等定时抓取送审", subscription_status(false)),
+        )
+        .await;
+        return Ok(());
+    }
+
     // 明确落到作者主页时直接走作者桥；既避免 note 页三次无效解析，也避免 Python
     // 再解析一遍短链时遇到偶发超时。
-    if let Some(profile_url) = douyin::canonical_user_profile(resolved_target) {
-        let added = store.subscribe_douyin(&profile_url, &job.url)?;
+    if let Some(profile_url) = profile_url {
         match douyin::fetch_user_feed(runtime, &profile_url, "manual").await {
             Ok(feed) if !feed.items.is_empty() => {
                 let items = feed.items;

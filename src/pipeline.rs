@@ -32,22 +32,36 @@ where
                 continue;
             }
         };
+        let mut candidates = Vec::new();
         for item in items {
-            // 手动链接可能正在处理同一作品:持锁后再查重,避免重复交付。
-            let _work = crate::util::work_lock(item.source.as_str(), &item.source_id).await;
             if item.source == SourceKind::Douyin {
                 store.remember_douyin_author(&item.author.url, &item.author.name)?;
                 if store.is_douyin_disabled(&item.author.url)? {
                     continue;
                 }
             }
-            if store.is_author_blocked(&item)? {
+            if store.is_author_blocked(&item)?
+                || store.already_pushed(&item)?
+                || store.is_quota_dropped(&item)?
+                || !chain.keep(&item, cfg)
+            {
                 continue;
             }
+            candidates.push(item);
+        }
+        if let Some(max) = cfg.max_per_poll {
+            if candidates.len() > max {
+                // 稳定排序:分数高的在前,None 最小;同分保持抓取顺序。
+                candidates.sort_by_key(|i| std::cmp::Reverse(i.bookmark_count));
+                for item in candidates.split_off(max) {
+                    store.defer_over_quota(&item)?;
+                }
+            }
+        }
+        for item in candidates {
+            // 手动链接可能正在处理同一作品:持锁后再查重,避免重复交付。
+            let _work = crate::util::work_lock(item.source.as_str(), &item.source_id).await;
             if store.already_pushed(&item)? {
-                continue;
-            }
-            if !chain.keep(&item, cfg) {
                 continue;
             }
             let files = download(item.clone()).await;

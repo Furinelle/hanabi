@@ -91,6 +91,12 @@ impl Store {
                  author_url TEXT NOT NULL,
                  display_name TEXT NOT NULL DEFAULT '',
                  PRIMARY KEY (source, author_url)
+             );
+             CREATE TABLE IF NOT EXISTS quota_deferred (
+                 source_kind TEXT NOT NULL,
+                 source_id   TEXT NOT NULL,
+                 dropped     INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (source_kind, source_id)
              );",
         )?;
         let migration = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
@@ -435,6 +441,28 @@ impl Store {
         self.conn.execute(
             "INSERT OR IGNORE INTO pushed (source_kind, source_id, pushed_at) VALUES (?1, ?2, ?3)",
             params![kind, id, ts],
+        )?;
+        Ok(())
+    }
+
+    /// 超出每轮配额被彻底舍弃的作品;只影响定时抓取,手动链接不查这里。
+    pub fn is_quota_dropped(&self, item: &MediaItem) -> Result<bool> {
+        let (kind, id) = item.dedup_key();
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM quota_deferred WHERE source_kind = ?1 AND source_id = ?2 AND dropped = 1",
+            params![kind, id],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 第一次超出配额只记暂缓;已暂缓过的再次超出则彻底舍弃。
+    pub fn defer_over_quota(&self, item: &MediaItem) -> Result<()> {
+        let (kind, id) = item.dedup_key();
+        self.conn.execute(
+            "INSERT INTO quota_deferred (source_kind, source_id) VALUES (?1, ?2)
+             ON CONFLICT (source_kind, source_id) DO UPDATE SET dropped = 1",
+            params![kind, id],
         )?;
         Ok(())
     }

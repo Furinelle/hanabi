@@ -57,7 +57,8 @@ targets = ["https://x.com/i/lists/0000000000000000000"]
 # 按时间排序的流要覆盖两轮之间的全部更新(按文件计数,不是按作品);
 # 窗口外的作品之后不会再被看到。
 probe_range = "1-400"
-filters = { r18 = false, min_likes = 1000 }
+# max_per_poll:每轮最多送审 N 条,超出的低点赞作品先暂缓,下一轮仍在配额外就舍弃。
+filters = { r18 = false, max_per_poll = 30 }
 
 [[source]]
 name = "x_foryou"

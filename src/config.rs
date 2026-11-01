@@ -167,6 +167,10 @@ pub struct SourceFilterCfg {
     /// 拦掉 Pixiv 申报为 AI 生成的作品。X、抖音没有对应标记，不受影响。
     #[serde(default)]
     pub exclude_ai: bool,
+    /// 每轮最多送审的作品数。超出部分按收藏/点赞数从低到高暂缓,下一轮仍落在
+    /// 配额外就彻底舍弃。没有分数的作品(抖音)排在最后,同分保持抓取顺序。
+    #[serde(default)]
+    pub max_per_poll: Option<usize>,
 }
 
 impl Config {

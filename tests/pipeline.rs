@@ -228,3 +228,38 @@ async fn blocked_author_is_skipped_until_unblocked() {
     .unwrap();
     assert_eq!(*sink.delivered.lock().unwrap(), vec!["keep", "blocked"]);
 }
+
+/// 每轮配额:超出的低分作品先暂缓,下一轮刷新分数后仍在配额外才彻底舍弃。
+#[tokio::test]
+async fn over_quota_items_deferred_once_then_dropped() {
+    let store = Store::open_in_memory().unwrap();
+    let sink = MockSink::default();
+    let round = |items: Vec<MediaItem>| -> Vec<Box<dyn Source>> {
+        vec![Box::new(MockSource {
+            items,
+            cfg: SourceFilterCfg {
+                max_per_poll: Some(1),
+                ..Default::default()
+            },
+        })]
+    };
+    for items in [
+        vec![item("b", 100), item("a", 900), item("c", 50)],
+        // b 涨上来进配额;c 第二次落在配额外被舍弃;d 新出现只暂缓。
+        vec![item("b", 2000), item("c", 60), item("d", 500)],
+        // c 即使分数暴涨也不再送审;d 这轮进配额。
+        vec![item("c", 5000), item("d", 10)],
+    ] {
+        run_once(
+            &store,
+            &round(items),
+            &FilterChain::standard(),
+            &sink,
+            |_| async { vec![] },
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(*sink.delivered.lock().unwrap(), vec!["a", "b", "d"]);
+    assert!(store.is_quota_dropped(&item("c", 0)).unwrap());
+}

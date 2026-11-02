@@ -8,7 +8,7 @@
 
 二次元图片 Telegram 推送 bot，带**人工审批制**。从 Pixiv（关注画师新作 / 排行榜）、X（List）和抖音作者主页抓取插画，先发到你的私聊等审批，你点按钮决定是否发布到频道。
 
-当前版本：**v0.13.0**。升级变更见 [CHANGELOG](CHANGELOG.md)。
+当前版本：**v0.14.0**。升级变更见 [CHANGELOG](CHANGELOG.md)。
 
 ## 特性
 
@@ -107,6 +107,7 @@ max_pages = 3                 # 每页 20 条
 cookie_file = ".douyin-cookies.json" # 仅路径；Cookie 文件 chmod 600 且不提交
 browser_fallback = false      # 作者 feed 翻页受限时可启用本机 Playwright 兜底
 browser_headless = false
+author_interval_secs = 180     # 定时抓取时每抓完一个作者等这么久再抓下一个
 
 # 可选：X 图片下载画质。download 阶段以 -o extractor.twitter.size=orig 追加；
 # 与 gallery-dl.conf 里的 "size" 各管一段（probe 用 conf、download 用这里），两处都设才稳。

@@ -428,6 +428,10 @@ pub struct UserFeed {
 /// 粒度是单次调用(一个作者 feed 或一个作品详情),手动链接最多等定时抓取当前这一个作者。
 static BRIDGE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// 定时抓取上一个作者完成的时刻。各作者是独立的 Source,间隔靠这里跨实例共享。
+static SCHEDULED_FEED_DONE: tokio::sync::Mutex<Option<tokio::time::Instant>> =
+    tokio::sync::Mutex::const_new(None);
+
 /// 定时来源与手动作者名片共用的 douyin-downloader 抓取桥。
 pub async fn fetch_user_feed(runtime: &DouyinCfg, target: &str, origin: &str) -> Result<UserFeed> {
     let _bridge = BRIDGE_GATE.lock().await;
@@ -503,12 +507,19 @@ impl Source for DouyinUserSource {
     async fn fetch(&self, _store: &Store) -> Result<Vec<MediaItem>> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
+        let interval = std::time::Duration::from_secs(self.runtime.author_interval_secs);
         for target in &self.cfg.targets {
+            // 等待期间不持 BRIDGE_GATE,手动链接照常立即处理。
+            let mut done = SCHEDULED_FEED_DONE.lock().await;
+            if let Some(at) = *done {
+                tokio::time::sleep_until(at + interval).await;
+            }
+            let feed = fetch_user_feed(&self.runtime, target, &self.cfg.name).await;
+            // 失败也算一次请求,同样计入间隔。
+            *done = Some(tokio::time::Instant::now());
+            drop(done);
             // 最终增量幂等由 pipeline 的 SQLite already_pushed 统一完成。
-            for item in fetch_user_feed(&self.runtime, target, &self.cfg.name)
-                .await?
-                .items
-            {
+            for item in feed?.items {
                 if seen.insert(item.source_id.clone()) {
                     out.push(item);
                 }

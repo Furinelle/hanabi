@@ -92,6 +92,9 @@ pub struct DouyinCfg {
     /// 浏览器兜底是否无头运行。需要人工过验证码时应设为 false。
     #[serde(default)]
     pub browser_headless: bool,
+    /// 定时抓取时相邻两个作者之间的间隔秒数，避免短时间连续请求触发风控。手动链接不受影响。
+    #[serde(default = "default_douyin_author_interval_secs")]
+    pub author_interval_secs: u64,
 }
 
 impl Default for DouyinCfg {
@@ -103,6 +106,7 @@ impl Default for DouyinCfg {
             cookie_file: String::new(),
             browser_fallback: false,
             browser_headless: false,
+            author_interval_secs: default_douyin_author_interval_secs(),
         }
     }
 }
@@ -117,6 +121,10 @@ fn default_douyin_helper_path() -> String {
 
 fn default_douyin_max_pages() -> u32 {
     3
+}
+
+fn default_douyin_author_interval_secs() -> u64 {
+    180
 }
 
 fn default_range() -> String {
@@ -211,6 +219,7 @@ filters = { r18 = false, min_bookmarks = 500, tags = ["原神"], illust_only = t
         assert_eq!(cfg.gallery_dl.probe_range, "1-20"); // default
         assert_eq!(cfg.douyin.max_pages, 3);
         assert_eq!(cfg.douyin.helper_path, "tools/douyin_user_feed.py");
+        assert_eq!(cfg.douyin.author_interval_secs, 180);
         assert_eq!(cfg.sources.len(), 2);
         let bm = &cfg.sources[1];
         assert_eq!(bm.kind, "pixiv_bookmarks");

@@ -967,6 +967,7 @@ targets = []
         cfg.douyin.python_command = "python3".into();
         cfg.douyin.helper_path = helper.to_string_lossy().into_owned();
         cfg.douyin.cookie_file.clear();
+        cfg.douyin.author_interval_secs = 0;
         let gdl = Arc::new(GalleryDl {
             config_path: "unused".into(),
             probe_range: "1-20".into(),

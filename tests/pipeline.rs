@@ -263,3 +263,63 @@ async fn over_quota_items_deferred_once_then_dropped() {
     assert_eq!(*sink.delivered.lock().unwrap(), vec!["a", "b", "d"]);
     assert!(store.is_quota_dropped(&item("c", 0)).unwrap());
 }
+
+/// 首次 fetch 失败,之后成功;记录每次 fetch 的源名以检查顺序。
+struct FlakySource {
+    name: &'static str,
+    fails_left: Mutex<u32>,
+    items: Vec<MediaItem>,
+    log: std::sync::Arc<Mutex<Vec<&'static str>>>,
+    cfg: SourceFilterCfg,
+}
+#[async_trait]
+impl Source for FlakySource {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn filter_cfg(&self) -> &SourceFilterCfg {
+        &self.cfg
+    }
+    async fn fetch(&self, _: &Store) -> anyhow::Result<Vec<MediaItem>> {
+        self.log.lock().unwrap().push(self.name);
+        let mut fails = self.fails_left.lock().unwrap();
+        if *fails > 0 {
+            *fails -= 1;
+            anyhow::bail!("mock 403");
+        }
+        Ok(self.items.clone())
+    }
+}
+
+#[tokio::test]
+async fn failed_fetch_retried_once_at_end_of_round() {
+    let store = Store::open_in_memory().unwrap();
+    let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let source = |name, fails, id| FlakySource {
+        name,
+        fails_left: Mutex::new(fails),
+        items: vec![item(id, 800)],
+        log: log.clone(),
+        cfg: SourceFilterCfg::default(),
+    };
+    let sources: Vec<Box<dyn Source>> = vec![
+        Box::new(source("flaky", 1, "f")),
+        Box::new(source("ok", 0, "o")),
+        Box::new(source("dead", 2, "d")),
+    ];
+    let sink = MockSink::default();
+    run_once(
+        &store,
+        &sources,
+        &FilterChain::standard(),
+        &sink,
+        |_| async { Vec::<PathBuf>::new() },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec!["flaky", "ok", "dead", "flaky", "dead"]
+    );
+    assert_eq!(*sink.delivered.lock().unwrap(), vec!["o", "f"]);
+}

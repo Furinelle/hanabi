@@ -23,12 +23,19 @@ where
     F: Fn(MediaItem) -> Fut,
     Fut: std::future::Future<Output = Vec<PathBuf>>,
 {
-    for src in sources {
+    // 抓取失败的源排到本轮末尾再试一次(多为抖音偶发风控 403),仍失败才等下一轮。
+    let mut queue: std::collections::VecDeque<_> = sources.iter().map(|s| (s, false)).collect();
+    while let Some((src, retried)) = queue.pop_front() {
         let cfg = src.filter_cfg();
         let items = match src.fetch(store).await {
             Ok(v) => v,
+            Err(e) if !retried => {
+                tracing::warn!(source = src.name(), error = %e, "fetch 失败,本轮末尾重试");
+                queue.push_back((src, true));
+                continue;
+            }
             Err(e) => {
-                tracing::warn!(source = src.name(), error = %e, "fetch 失败,跳过该源");
+                tracing::warn!(source = src.name(), error = %e, "fetch 重试仍失败,跳过该源");
                 continue;
             }
         };

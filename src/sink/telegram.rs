@@ -20,6 +20,7 @@ mod douyin_monitor;
 
 pub use blocked_authors::AuthorRemoval;
 mod image_review;
+mod same_work;
 
 use crate::gallery::{GalleryClient, GalleryIngestError, GalleryPublication, GalleryPublishState};
 use crate::gallery_outbox::{GalleryOutbox, QueuedGalleryWork};
@@ -262,6 +263,7 @@ impl TelegramSink {
         .context("初始化 pending 表失败")?;
         init_similar_review_schema(&conn).context("初始化相似图审批表失败")?;
         image_review::init_schema(&conn)?;
+        same_work::init_schema(&conn).context("初始化同作品指纹表失败")?;
         // 兼容旧库:补列,已存在则忽略报错。
         let _ = conn.execute(
             "ALTER TABLE pending ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
@@ -395,7 +397,7 @@ impl TelegramSink {
         if files.is_empty() {
             anyhow::bail!("无图片可发: {}", item.source_id);
         }
-        let kept_files = non_solid_images(files).await?;
+        let (kept_files, prints) = non_solid_images(files).await?;
         if kept_files.is_empty() {
             cleanup(files);
             return Ok(PublishResult {
@@ -403,12 +405,30 @@ impl TelegramSink {
                 publication: empty_publication(),
             });
         }
-        let files = kept_files.as_slice();
+        self.publish_kept(item, &kept_files, &prints, true, None)
+            .await
+    }
+
+    /// 发布已滤掉纯色页的文件。`archive=false` 时只发频道,不入库。
+    /// `replaced` 是被这次发布顶替的低画质重复作品。
+    async fn publish_kept(
+        &self,
+        item: &MediaItem,
+        files: &[PathBuf],
+        prints: &[same_work::PagePrint],
+        archive: bool,
+        replaced: Option<&same_work::Twin>,
+    ) -> Result<PublishResult> {
+        let archive = archive && self.state.gallery.is_some();
         let caption = render_caption(item);
         let files_owned: Vec<PathBuf> = files.to_vec();
         let prepared = tokio::task::spawn_blocking(move || prepare_all(&files_owned)).await??;
         // 在任何频道副作用前准备独立图库副本，避免 auto-forward 评论任务先清理原目录。
-        let gallery_staged = self.stage_gallery(item, files);
+        let gallery_staged = if archive {
+            self.stage_gallery(item, files)
+        } else {
+            None
+        };
         let mut sent: Vec<MessageId> = Vec::new();
         let mut publication_builder = TelegramPublicationBuilder::default();
         let mut activate_on_first = || {
@@ -450,19 +470,27 @@ impl TelegramSink {
         if let Some(mid) = sent.first() {
             register_comment(&self.state, mid.0, files, false).await;
         }
+        // 新帖已进频道,这时才撤掉被它顶替的低画质版本(须在入库之前)。
+        if let Some(twin) = replaced {
+            self.retire_twin(twin).await;
+        }
         if let Some(e) = send_error {
             // 部分成功:整条重发会造成频道重复内容,按已发布收尾,转人工检查。
             tracing::warn!(error = %e, id = %item.source_id, "直发部分成功,后续批次失败");
             let publication = publication_builder.finish(false)?;
             let gallery_publication = to_gallery_publication(&publication);
+            self.record_published(item, prints, &gallery_publication, archive)
+                .await;
             // 部分成功也尝试入库(已有文件仍有意义)
-            self.maybe_ingest(
-                item,
-                files,
-                gallery_staged.as_ref(),
-                Some(&gallery_publication),
-            )
-            .await;
+            if archive {
+                self.maybe_ingest(
+                    item,
+                    files,
+                    gallery_staged.as_ref(),
+                    Some(&gallery_publication),
+                )
+                .await;
+            }
             return Ok(PublishResult {
                 outcome: PublishOutcome::Partial,
                 publication,
@@ -470,18 +498,278 @@ impl TelegramSink {
         }
         let publication = publication_builder.finish(true)?;
         let gallery_publication = to_gallery_publication(&publication);
+        self.record_published(item, prints, &gallery_publication, archive)
+            .await;
         // 手动链接直发成功:同步入库(帖子自带标签)
-        self.maybe_ingest(
-            item,
-            files,
-            gallery_staged.as_ref(),
-            Some(&gallery_publication),
-        )
-        .await;
+        if archive {
+            self.maybe_ingest(
+                item,
+                files,
+                gallery_staged.as_ref(),
+                Some(&gallery_publication),
+            )
+            .await;
+        }
         Ok(PublishResult {
             outcome: PublishOutcome::Full,
             publication,
         })
+    }
+
+    /// 直发的作品也登记指纹,之后抓到重复的作品才能比对。
+    async fn record_published(
+        &self,
+        item: &MediaItem,
+        prints: &[same_work::PagePrint],
+        publication: &GalleryPublication,
+        archived: bool,
+    ) {
+        let db = self.state.db.lock().await;
+        if let Err(error) = same_work::record(&db, item, prints, Some(publication), archived) {
+            tracing::warn!(id = %item.source_id, %error, "登记同作品指纹失败");
+        }
+    }
+
+    /// 送审前处理重复作品(不论来源):已有的画质不低就跳过新的;新的画质更高则
+    /// 撤掉旧的审批卡片(未审批),或直接发布新的并删掉旧的频道帖(已发布)。
+    async fn settle_twin(
+        &self,
+        item: &MediaItem,
+        prints: &[same_work::PagePrint],
+    ) -> Result<TwinAction> {
+        let state = &self.state;
+        let twin = {
+            let db = state.db.lock().await;
+            same_work::find_twin(&db, item, prints)?
+        };
+        let Some(twin) = twin else {
+            return Ok(TwinAction::Review);
+        };
+        tracing::info!(
+            source = item.source.as_str(),
+            id = %item.source_id,
+            twin_source = %twin.source_kind,
+            twin_id = %twin.source_id,
+            verdict = ?twin.verdict,
+            status = ?twin.status,
+            "抓到重复作品"
+        );
+        if twin.verdict == same_work::Verdict::KeepOld {
+            return Ok(TwinAction::Skip);
+        }
+        match twin.status {
+            // 那份已被丢弃:同一作品不再送审第二次。
+            same_work::TwinStatus::Discarded => Ok(TwinAction::Skip),
+            same_work::TwinStatus::Pending(token) => {
+                if !drop_pending_card(state, token).await? {
+                    anyhow::bail!("重复的另一份作品正在发布,下轮再处理");
+                }
+                Ok(TwinAction::Review)
+            }
+            // 旧帖等新帖发出后再撤(retire_twin),发送失败不会丢掉已过审的帖子。
+            same_work::TwinStatus::Published { .. } => Ok(TwinAction::Replace(twin)),
+        }
+    }
+
+    /// 撤掉被高画质版本顶替的已发布作品:删频道帖、撤回图库记录、删指纹。
+    async fn retire_twin(&self, twin: &same_work::Twin) {
+        let state = &self.state;
+        let same_work::TwinStatus::Published {
+            publication,
+            archived,
+        } = &twin.status
+        else {
+            return;
+        };
+        // 超过 48 小时的频道消息 bot 删不掉,保留即可。
+        for id in &publication.message_ids {
+            let chat = ChatId(publication.chat_id);
+            if let Err(error) = tg_retry(|| state.bot.delete_message(chat, MessageId(*id))).await {
+                tracing::debug!(%error, message_id = id, "低画质版本的频道消息未删除");
+            }
+        }
+        // 先撤回图库里的低画质作品再入库新的,图库就不会把两份列为相似图。
+        if *archived {
+            if let Some(outbox) = state.gallery_outbox.as_ref() {
+                let _ = outbox.cancel_retries(&twin.source_kind, &twin.source_id);
+            }
+            if let Some(gallery) = state.gallery.as_ref() {
+                let work_id = format!("{}:{}", twin.source_kind, twin.source_id);
+                let decision = format!("hanabi-twin-{}-{}", twin.source_kind, twin.source_id);
+                if let Err(error) = gallery.retract_work(&decision, &work_id).await {
+                    tracing::warn!(%error, work_id, "撤回图库里的低画质版本失败,交给图库去重");
+                }
+            }
+        }
+        let db = state.db.lock().await;
+        if let Err(error) = same_work::forget(&db, &twin.source_kind, &twin.source_id) {
+            tracing::warn!(%error, id = %twin.source_id, "删除被顶替作品的指纹失败");
+        }
+    }
+
+    /// 发到审批私聊:**全套图**(单图=sendPhoto+按钮;多图=图组+一条带按钮的控制消息)。
+    /// 发送成功后把 pending 持久化到 sqlite;文件保留到审批结束才清理。
+    /// `dedupe=false` 用于 /undo 恢复卡片:用户明确要回这一条,不做同作品排除。
+    async fn deliver_for_review(
+        &self,
+        item: &MediaItem,
+        files: &[PathBuf],
+        dedupe: bool,
+    ) -> Result<()> {
+        if files.is_empty() {
+            anyhow::bail!("无图片可发: {}", item.source_id);
+        }
+        let (kept_files, prints) = non_solid_images(files).await?;
+        if kept_files.is_empty() {
+            cleanup(files);
+            return Ok(());
+        }
+        if dedupe {
+            // 与审批、/undo 串行:取舍依据的是另一份此刻的审批状态。
+            let _guard = self.state.review_gate.lock().await;
+            match self.settle_twin(item, &prints).await? {
+                TwinAction::Review => {}
+                TwinAction::Skip => {
+                    cleanup(files);
+                    return Ok(());
+                }
+                TwinAction::Replace(twin) => {
+                    let archive = matches!(
+                        twin.status,
+                        same_work::TwinStatus::Published { archived: true, .. }
+                    );
+                    let result = self
+                        .publish_kept(item, &kept_files, &prints, archive, Some(&twin))
+                        .await?;
+                    if result == PublishOutcome::Partial {
+                        let _ = self
+                            .state
+                            .bot
+                            .send_message(
+                                self.state.review_chat.clone(),
+                                "⚠️ 替换低画质版本时仅部分图片发布成功(后续批次失败),已按已发布处理;请检查频道帖,必要时手动补发缺图",
+                            )
+                            .await;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        let files = kept_files.as_slice();
+        let originals = files.to_vec();
+        let effective_item = item.clone();
+        let caption = render_caption(&effective_item);
+        let files_owned = originals.clone();
+        // 原始(缩放前)路径:审批通过后发原画质 document 进频道帖评论区(发 photo 用缩放版)。
+        // 全套图缩放(CPU 阻塞,放 blocking 线程);审批需要看到全部,批准后直接复用。
+        let prepared = tokio::task::spawn_blocking(move || prepare_all(&files_owned)).await??;
+
+        let token = self.state.next_token();
+        let keyboard = review_keyboard(token as i64, self.state.gallery.is_some());
+
+        let n = prepared.len();
+        let bot = &self.state.bot;
+        let chat = self.state.review_chat.clone();
+        let mut review_ids: Vec<MessageId> = Vec::new();
+        // 缩放后仍超 Telegram photo 硬上限:审批消息也退化为 document,否则 sendPhoto 直接
+        // 报错、投递卡死重试(批准后 send_group 复用同一批 prepared 文件,同样会退化,一致)。
+        let oversized = any_oversized_for_photo(&prepared);
+
+        let send_result: Result<()> = async {
+            if n == 1 {
+                let msg = if oversized {
+                    tg_retry(|| {
+                        bot.send_document(chat.clone(), InputFile::file(&prepared[0]))
+                            .caption(format!("【待审】\n{caption}"))
+                            .parse_mode(ParseMode::Html)
+                            .reply_markup(keyboard.clone())
+                    })
+                    .await?
+                } else {
+                    tg_retry(|| {
+                        bot.send_photo(chat.clone(), InputFile::file(&prepared[0]))
+                            .caption(format!("【待审】\n{caption}"))
+                            .parse_mode(ParseMode::Html)
+                            .reply_markup(keyboard.clone())
+                    })
+                    .await?
+                };
+                review_ids.push(msg.id);
+            } else {
+                // 与发布侧同一套分批逻辑:sendMediaGroup 硬限 10,超 10 张的作品不分批
+                // 必收 400 → 不入库 → 每轮重下重发的死循环。
+                let first_cap = format!("【待审 · 共 {n} 张】\n{caption}");
+                let mode = if oversized {
+                    MediaMode::Document
+                } else {
+                    MediaMode::Photo { spoiler: false }
+                };
+                let mut review_publication = TelegramPublicationBuilder::default();
+                send_batches(
+                    bot,
+                    &chat,
+                    &prepared,
+                    &first_cap,
+                    &mode,
+                    &mut review_ids,
+                    &mut review_publication,
+                    &mut || {},
+                )
+                .await?;
+                let ctrl = tg_retry(|| {
+                    bot.send_message(chat.clone(), format!("👆 上面 {n} 张,请审批"))
+                        .reply_markup(keyboard.clone())
+                })
+                .await?;
+                review_ids.push(ctrl.id);
+            }
+            Ok(())
+        }
+        .await;
+
+        // 持久化 pending(发送成功后才写,保证按钮一定对得上)。
+        let insert_result: Result<()> = if send_result.is_ok() {
+            async {
+                let files_str: Vec<String> = prepared
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                let msg_ids: Vec<i32> = review_ids.iter().map(|m| m.0).collect();
+                let originals_str: Vec<String> = originals
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                let files_json = serde_json::to_string(&files_str)?;
+                let msg_json = serde_json::to_string(&msg_ids)?;
+                let originals_json = serde_json::to_string(&originals_str)?;
+                let item_meta = serde_json::to_string(&effective_item)?;
+                let db = self.state.db.lock().await;
+                let tx = db.unchecked_transaction()?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO pending(token, files, caption, msg_ids, originals, created_at, state, is_r18, item_meta) VALUES(?1,?2,?3,?4,?5,?6,'pending',?7,?8)",
+                    rusqlite::params![token as i64, files_json, caption, msg_json, originals_json, now_secs(), effective_item.is_r18, item_meta],
+                )?;
+                same_work::record(&tx, &effective_item, &prints, None, false)?;
+                tx.commit()?;
+                Ok(())
+            }
+            .await
+        } else {
+            Ok(())
+        };
+
+        // 发送或写库任一步失败:补偿删除已发出的消息,否则留下无 pending 记录的
+        // 孤儿审批组(按钮永远"该条已失效"),且 pipeline 不 mark_pushed、下轮重投
+        // 同一作品,私聊出现重复。
+        if let Err(e) = send_result.and(insert_result) {
+            // 补偿也带限流重试:触发补偿的最常见原因正是严重限流(tg_retry 5 次耗尽),
+            // 裸调用几乎必然再吃 429,补偿等于没做。
+            for mid in &review_ids {
+                let _ = tg_retry(|| bot.delete_message(chat.clone(), *mid)).await;
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// 维护入口：只处理显式指定的待审 token，复用正常审批的原子抢占、频道发布、
@@ -1561,9 +1849,15 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
             cleanup(&paths);
         }
         let db = state.db.lock().await;
+        // 没审批就过期的作品不算处理过,之后抓到的重复作品照常送审。
+        // 指纹没删掉就留着 pending 行下次再清,否则这件作品会被当成丢弃过。
+        if same_work::forget_pending(&db, *token).is_err() {
+            continue;
+        }
         let _ = db.execute("DELETE FROM pending WHERE token=?1", [*token]);
         let _ = remove_pending_candidate_reviews(&db, *token);
     }
+    let _ = same_work::prune(&*state.db.lock().await);
     if !expired.is_empty() {
         tracing::info!(count = expired.len(), "清理超期 pending");
     }
@@ -1657,25 +1951,72 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
 }
 
 /// Drop solid-color and near-black filler pages; duplicates are Vitrine's job.
-async fn non_solid_images(files: &[PathBuf]) -> Result<Vec<PathBuf>> {
+/// 同时返回保留页的指纹,供重复作品比对。
+async fn non_solid_images(files: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<same_work::PagePrint>)> {
     let files = files.to_vec();
     tokio::task::spawn_blocking(move || {
-        let solid = files
+        let fingerprints = files
             .par_iter()
-            .map(|path| inspect_image(path).map(|fingerprint| fingerprint.solid_color))
+            .map(|path| inspect_image(path))
             .collect::<Result<Vec<_>>>()?;
         Ok(files
             .into_iter()
-            .zip(solid)
-            .filter_map(|(file, solid)| {
-                if solid {
+            .zip(fingerprints)
+            .filter_map(|(file, fingerprint)| {
+                if fingerprint.solid_color {
                     tracing::info!(path = %file.display(), "跳过纯色图片");
+                    return None;
                 }
-                (!solid).then_some(file)
+                Some((file, same_work::PagePrint::from(&fingerprint)))
             })
-            .collect())
+            .unzip())
     })
     .await?
+}
+
+enum TwinAction {
+    Review,
+    Skip,
+    /// 另一份已发布且画质更低:直接发布新的并撤掉它。
+    Replace(same_work::Twin),
+}
+
+/// 撤掉一条仍待审的审批:删卡片、文件和记录,不记入 /undo。已在发布中的返回 false。
+async fn drop_pending_card(state: &Arc<ReviewState>, token: i64) -> Result<bool> {
+    let row: Option<(String, String)> = {
+        let db = state.db.lock().await;
+        let tx = db.unchecked_transaction()?;
+        let row = tx
+            .query_row(
+                "SELECT files, msg_ids FROM pending WHERE token=?1 AND state='pending'",
+                [token],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if row.is_some() {
+            same_work::forget_pending(&tx, token)?;
+            tx.execute("DELETE FROM pending WHERE token=?1", [token])?;
+            remove_pending_candidate_reviews(&tx, token)?;
+        }
+        tx.commit()?;
+        row
+    };
+    let Some((files_json, msg_json)) = row else {
+        return Ok(false);
+    };
+    let ids: Vec<MessageId> = serde_json::from_str::<Vec<i32>>(&msg_json)
+        .unwrap_or_default()
+        .into_iter()
+        .map(MessageId)
+        .collect();
+    cleanup_review_messages(state, &ids).await;
+    let files: Vec<PathBuf> = serde_json::from_str::<Vec<String>>(&files_json)
+        .unwrap_or_default()
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    cleanup(&files);
+    Ok(true)
 }
 
 fn review_keyboard(token: i64, has_gallery: bool) -> InlineKeyboardMarkup {
@@ -1700,131 +2041,8 @@ fn review_keyboard(token: i64, has_gallery: bool) -> InlineKeyboardMarkup {
 
 #[async_trait]
 impl Sink for TelegramSink {
-    /// 发到审批私聊:**全套图**(单图=sendPhoto+按钮;多图=图组+一条带按钮的控制消息)。
-    /// 发送成功后把 pending 持久化到 sqlite;文件保留到审批结束才清理。
     async fn deliver(&self, item: &MediaItem, files: &[PathBuf]) -> Result<()> {
-        if files.is_empty() {
-            anyhow::bail!("无图片可发: {}", item.source_id);
-        }
-        let kept_files = non_solid_images(files).await?;
-        if kept_files.is_empty() {
-            cleanup(files);
-            return Ok(());
-        }
-        let files = kept_files.as_slice();
-        let originals = files.to_vec();
-        let effective_item = item.clone();
-        let caption = render_caption(&effective_item);
-        let files_owned = originals.clone();
-        // 原始(缩放前)路径:审批通过后发原画质 document 进频道帖评论区(发 photo 用缩放版)。
-        // 全套图缩放(CPU 阻塞,放 blocking 线程);审批需要看到全部,批准后直接复用。
-        let prepared = tokio::task::spawn_blocking(move || prepare_all(&files_owned)).await??;
-
-        let token = self.state.next_token();
-        let keyboard = review_keyboard(token as i64, self.state.gallery.is_some());
-
-        let n = prepared.len();
-        let bot = &self.state.bot;
-        let chat = self.state.review_chat.clone();
-        let mut review_ids: Vec<MessageId> = Vec::new();
-        // 缩放后仍超 Telegram photo 硬上限:审批消息也退化为 document,否则 sendPhoto 直接
-        // 报错、投递卡死重试(批准后 send_group 复用同一批 prepared 文件,同样会退化,一致)。
-        let oversized = any_oversized_for_photo(&prepared);
-
-        let send_result: Result<()> = async {
-            if n == 1 {
-                let msg = if oversized {
-                    tg_retry(|| {
-                        bot.send_document(chat.clone(), InputFile::file(&prepared[0]))
-                            .caption(format!("【待审】\n{caption}"))
-                            .parse_mode(ParseMode::Html)
-                            .reply_markup(keyboard.clone())
-                    })
-                    .await?
-                } else {
-                    tg_retry(|| {
-                        bot.send_photo(chat.clone(), InputFile::file(&prepared[0]))
-                            .caption(format!("【待审】\n{caption}"))
-                            .parse_mode(ParseMode::Html)
-                            .reply_markup(keyboard.clone())
-                    })
-                    .await?
-                };
-                review_ids.push(msg.id);
-            } else {
-                // 与发布侧同一套分批逻辑:sendMediaGroup 硬限 10,超 10 张的作品不分批
-                // 必收 400 → 不入库 → 每轮重下重发的死循环。
-                let first_cap = format!("【待审 · 共 {n} 张】\n{caption}");
-                let mode = if oversized {
-                    MediaMode::Document
-                } else {
-                    MediaMode::Photo { spoiler: false }
-                };
-                let mut review_publication = TelegramPublicationBuilder::default();
-                send_batches(
-                    bot,
-                    &chat,
-                    &prepared,
-                    &first_cap,
-                    &mode,
-                    &mut review_ids,
-                    &mut review_publication,
-                    &mut || {},
-                )
-                .await?;
-                let ctrl = tg_retry(|| {
-                    bot.send_message(chat.clone(), format!("👆 上面 {n} 张,请审批"))
-                        .reply_markup(keyboard.clone())
-                })
-                .await?;
-                review_ids.push(ctrl.id);
-            }
-            Ok(())
-        }
-        .await;
-
-        // 持久化 pending(发送成功后才写,保证按钮一定对得上)。
-        let insert_result: Result<()> = if send_result.is_ok() {
-            async {
-                let files_str: Vec<String> = prepared
-                    .iter()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect();
-                let msg_ids: Vec<i32> = review_ids.iter().map(|m| m.0).collect();
-                let originals_str: Vec<String> = originals
-                    .iter()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect();
-                let files_json = serde_json::to_string(&files_str)?;
-                let msg_json = serde_json::to_string(&msg_ids)?;
-                let originals_json = serde_json::to_string(&originals_str)?;
-                let item_meta = serde_json::to_string(&effective_item)?;
-                let db = self.state.db.lock().await;
-                let tx = db.unchecked_transaction()?;
-                tx.execute(
-                    "INSERT OR REPLACE INTO pending(token, files, caption, msg_ids, originals, created_at, state, is_r18, item_meta) VALUES(?1,?2,?3,?4,?5,?6,'pending',?7,?8)",
-                    rusqlite::params![token as i64, files_json, caption, msg_json, originals_json, now_secs(), effective_item.is_r18, item_meta],
-                )?;
-                tx.commit()?;
-                Ok(())
-            }
-            .await
-        } else {
-            Ok(())
-        };
-
-        // 发送或写库任一步失败:补偿删除已发出的消息,否则留下无 pending 记录的
-        // 孤儿审批组(按钮永远"该条已失效"),且 pipeline 不 mark_pushed、下轮重投
-        // 同一作品,私聊出现重复。
-        if let Err(e) = send_result.and(insert_result) {
-            // 补偿也带限流重试:触发补偿的最常见原因正是严重限流(tg_retry 5 次耗尽),
-            // 裸调用几乎必然再吃 429,补偿等于没做。
-            for mid in &review_ids {
-                let _ = tg_retry(|| bot.delete_message(chat.clone(), *mid)).await;
-            }
-            return Err(e);
-        }
-        Ok(())
+        self.deliver_for_review(item, files, true).await
     }
 }
 
@@ -2008,6 +2226,16 @@ async fn finish_claimed(
         }
     }
 
+    // 记下审批结果,之后抓到重复的作品时据此取舍。须在删 pending 行之前:
+    // 两者之间若无待审行也无发布记录,同作品会被当成已丢弃。
+    if let Ok(item) = serde_json::from_str::<MediaItem>(&work.item_meta) {
+        let db = state.db.lock().await;
+        if let Err(error) =
+            same_work::set_outcome(&db, &item, gallery_publication.as_ref(), publish && archive)
+        {
+            tracing::warn!(%error, token, "记录同作品审批结果失败");
+        }
+    }
     // pending 删除与“最近一次动作”登记放在同一事务。丢弃和发布都保留完整行与文件，
     // 让 /undo 能撤回上一步并重新生成审批卡片。
     let action = if !publish {
@@ -2579,7 +2807,7 @@ async fn handle_command(
                     TelegramSink {
                         state: state.clone(),
                     }
-                    .deliver(&item, &originals)
+                    .deliver_for_review(&item, &originals, false)
                     .await
                 }
                 .await;
@@ -3528,7 +3756,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_images_are_left_to_the_gallery() {
+    async fn an_exact_duplicate_is_reviewed_only_once() {
         let (base, stop, calls, server) = review_mock();
         let dir = tempfile::tempdir().unwrap();
         let mut sink = TelegramSink::new(
@@ -3572,6 +3800,7 @@ mod tests {
             image.save(&file).unwrap();
             file
         };
+        // 第二件与第一件除作品 ID 外完全相同:不再送审。手动直发不做排除。
         for id in ["1", "2"] {
             sink.deliver(&item(id), &[copy(id)]).await.unwrap();
         }
@@ -3592,7 +3821,7 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.len(), 1);
         let calls = calls.lock().unwrap();
         assert_eq!(
             calls
@@ -3604,6 +3833,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_works_keep_only_the_higher_quality_copy() {
+        let (base, stop, calls, server) = review_mock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = TelegramSink::new(
+            "123:fake".into(),
+            "123".into(),
+            "-100123".into(),
+            dir.path().join("hanabi.db").to_str().unwrap(),
+            Some(GalleryClient::new(base.clone(), "fake".into()).unwrap()),
+        )
+        .unwrap();
+        let inner = Arc::get_mut(&mut sink.state).unwrap();
+        inner.bot = inner
+            .bot
+            .clone()
+            .set_api_url(reqwest::Url::parse(&base).unwrap());
+        let item = |source, id: &str| crate::model::MediaItem {
+            source,
+            source_id: id.into(),
+            author: crate::model::Author {
+                name: "画师".into(),
+                url: "https://example.test/a".into(),
+            },
+            title: Some("同一作品".into()),
+            url: format!("https://example.test/{id}"),
+            tags: vec![],
+            bookmark_count: None,
+            is_r18: false,
+            pixiv_type: None,
+            page_count: 1,
+            images: vec![],
+            origin: "test".into(),
+        };
+        // 同一张图的不同分辨率版本,各自放在独立下载目录。
+        let copy = |name: &str, side: u32, blue: u8| {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            let file = path.join("page.png");
+            image::RgbImage::from_fn(side, side, |x, y| {
+                image::Rgb([(x * 255 / side) as u8, (y * 255 / side) as u8, blue])
+            })
+            .save(&file)
+            .unwrap();
+            file
+        };
+        let count = |suffix: &str| {
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(route, _)| route.to_lowercase().ends_with(suffix))
+                .count()
+        };
+        let pending = |state: Arc<ReviewState>| async move {
+            let db = state.db.lock().await;
+            let rows: Vec<(i64, String)> = db
+                .prepare("SELECT token, json_extract(item_meta, '$.source') || ':' || json_extract(item_meta, '$.source_id') FROM pending ORDER BY token")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            rows
+        };
+        let prints = |state: Arc<ReviewState>| async move {
+            let db = state.db.lock().await;
+            let rows: Vec<(String, bool, bool)> = db
+                .prepare("SELECT source_kind || ':' || source_id, publication <> '', archived FROM work_prints ORDER BY 1")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            rows
+        };
+        use crate::model::SourceKind::{Pixiv, X};
+
+        // 未审批:X 低画质版先到,Pixiv 高画质版到达后顶掉它的审批卡片。
+        sink.deliver(&item(X, "1"), &[copy("x1", 64, 80)])
+            .await
+            .unwrap();
+        sink.deliver(&item(Pixiv, "10"), &[copy("p10", 128, 80)])
+            .await
+            .unwrap();
+        let rows = pending(sink.state()).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "pixiv:10");
+        assert_eq!((count("sendphoto"), count("deletemessage")), (2, 1));
+        assert!(!dir.path().join("x1").exists(), "被顶掉的待审文件应清理");
+
+        // 批准并入库后,再抓到的低画质版直接跳过,不再送审。
+        let token = rows[0].0;
+        let PendingClaim::Claimed(row) =
+            claim_pending(&*sink.state.db.lock().await, token).unwrap()
+        else {
+            panic!("pending should be claimable")
+        };
+        finish_claimed(&sink.state, token, row, true, true, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            prints(sink.state()).await,
+            vec![("pixiv:10".to_string(), true, true)]
+        );
+        let sent = count("sendphoto");
+        sink.deliver(&item(X, "2"), &[copy("x2", 64, 80)])
+            .await
+            .unwrap();
+        assert!(pending(sink.state()).await.is_empty());
+        assert_eq!(count("sendphoto"), sent);
+
+        // 已发布:更高画质的版本到达后删旧频道帖、撤回旧入库,直接发布并入库。
+        let deleted = count("deletemessage");
+        sink.deliver(&item(X, "3"), &[copy("x3", 256, 80)])
+            .await
+            .unwrap();
+        assert!(pending(sink.state()).await.is_empty());
+        assert_eq!(count("sendphoto"), sent + 1);
+        assert_eq!(count("deletemessage"), deleted + 1);
+        assert_eq!(count("/api/catalog/retract"), 1);
+        assert_eq!(
+            prints(sink.state()).await,
+            vec![("x:3".to_string(), true, true)]
+        );
+
+        // 丢弃过的作品,之后抓到的重复不再送审,不论来源。
+        sink.deliver(&item(X, "4"), &[copy("x4", 64, 200)])
+            .await
+            .unwrap();
+        let token = pending(sink.state()).await[0].0;
+        let PendingClaim::Claimed(row) =
+            claim_pending(&*sink.state.db.lock().await, token).unwrap()
+        else {
+            panic!("pending should be claimable")
+        };
+        finish_claimed(&sink.state, token, row, false, false, true)
+            .await
+            .unwrap();
+        sink.deliver(&item(Pixiv, "40"), &[copy("p40", 128, 200)])
+            .await
+            .unwrap();
+        assert!(pending(sink.state()).await.is_empty());
+        sink.deliver(&item(X, "5"), &[copy("x5", 64, 200)])
+            .await
+            .unwrap();
+        assert!(pending(sink.state()).await.is_empty());
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn solid_filter_preserves_order_and_handles_an_all_solid_work() {
         let dir = tempfile::tempdir().unwrap();
         let black = dir.path().join("black.png");
@@ -3612,11 +3992,12 @@ mod tests {
         image.save(&black).unwrap();
         image.put_pixel(10, 10, image::Rgb([200, 100, 50]));
         image.save(&detail).unwrap();
-        let files = non_solid_images(&[black.clone(), detail.clone()])
+        let (files, prints) = non_solid_images(&[black.clone(), detail.clone()])
             .await
             .unwrap();
         assert_eq!(files, vec![detail]);
-        assert!(non_solid_images(&[black]).await.unwrap().is_empty());
+        assert_eq!(prints.len(), 1);
+        assert!(non_solid_images(&[black]).await.unwrap().0.is_empty());
     }
 
     #[test]

@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 
 const HASH_SIDE: u32 = 8;
 const COLOR_SIDE: u32 = 4;
+const THUMB_SIDE: u32 = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegionFingerprint {
@@ -36,6 +37,9 @@ pub struct ImageFingerprint {
     pub format: String,
     #[serde(default)]
     pub regions: Vec<RegionFingerprint>,
+    /// 16×16 RGB 缩略图(行优先),用于重复作品比对:重压缩和缩放后仍逐格接近。
+    #[serde(default)]
+    pub thumb: Vec<u8>,
 }
 
 pub fn inspect_image(path: &Path) -> Result<ImageFingerprint> {
@@ -82,6 +86,7 @@ fn fingerprint_from_bytes(
         bytes: encoded.len() as u64,
         format,
         regions,
+        thumb: visual.4,
     })
 }
 
@@ -168,7 +173,7 @@ fn compact_visual_fingerprint(image: &image::DynamicImage) -> (u64, u64, String)
     )
 }
 
-fn visual_fingerprint(image: &image::DynamicImage) -> (u64, u64, String, String) {
+fn visual_fingerprint(image: &image::DynamicImage) -> (u64, u64, String, String, Vec<u8>) {
     let (average_hash, difference_hash) = luma_hashes(image);
     let rgb = image.to_rgb8();
     (
@@ -176,6 +181,7 @@ fn visual_fingerprint(image: &image::DynamicImage) -> (u64, u64, String, String)
         difference_hash,
         quantized_digest(&rgb, COLOR_SIDE),
         quantized_digest(&rgb, 32),
+        image::imageops::resize(&rgb, THUMB_SIDE, THUMB_SIDE, FilterType::Triangle).into_raw(),
     )
 }
 

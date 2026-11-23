@@ -185,8 +185,28 @@ impl GalleryDl {
             );
         }
         let after = list_files(dir);
-        Ok(after.into_iter().filter(|p| !before.contains(p)).collect())
+        let mut files: Vec<PathBuf> = after.into_iter().filter(|p| !before.contains(p)).collect();
+        // Directory order is arbitrary; pages go in their numbered order.
+        files.sort_by_cached_key(|path| page_order(path));
+        Ok(files)
     }
+}
+
+/// The file name with every number zero-padded, so page 2 sorts before page 10.
+fn page_order(path: &std::path::Path) -> String {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let mut key = String::with_capacity(name.len() + 40);
+    let mut rest = &*name;
+    while let Some(start) = rest.find(|c: char| c.is_ascii_digit()) {
+        key.push_str(&rest[..start]);
+        let digits = rest[start..]
+            .find(|c: char| !c.is_ascii_digit())
+            .map_or(rest.len(), |len| start + len);
+        key.push_str(&format!("{:0>20}", &rest[start..digits]));
+        rest = &rest[digits..];
+    }
+    key.push_str(rest);
+    key
 }
 
 /// gallery-dl 认证失败(含 Pixiv 维护期 token 接口 503,被报成 Invalid refresh token)时仍以 0 退出,
@@ -215,6 +235,36 @@ fn list_files(dir: &std::path::Path) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use crate::model::{PixivType, SourceKind};
+
+    #[test]
+    fn downloaded_pages_sort_by_page_number() {
+        let mut files: Vec<PathBuf> = [
+            "2124426457439175078_4.jpg",
+            "123_p10.png",
+            "2124426457439175078_1.jpg",
+            "123_p2.png",
+            "123_p0.png",
+            "2124426457439175078_2.png",
+        ]
+        .map(|name| PathBuf::from("/d").join(name))
+        .into();
+        files.sort_by_cached_key(|path| page_order(path));
+        let names: Vec<_> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "123_p0.png",
+                "123_p2.png",
+                "123_p10.png",
+                "2124426457439175078_1.jpg",
+                "2124426457439175078_2.png",
+                "2124426457439175078_4.jpg",
+            ]
+        );
+    }
 
     #[test]
     fn parse_pixiv_groups_by_id() {

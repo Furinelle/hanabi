@@ -1950,14 +1950,22 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
     .await;
 }
 
-/// Drop solid-color and near-black filler pages; duplicates are Vitrine's job.
-/// 同时返回保留页的指纹,供重复作品比对。
+/// Join strips back into the picture, then drop solid-color and near-black filler pages;
+/// duplicates are Vitrine's job. 同时返回保留页的指纹,供重复作品比对。
 async fn non_solid_images(files: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<same_work::PagePrint>)> {
     let files = files.to_vec();
     tokio::task::spawn_blocking(move || {
+        let (files, posted): (Vec<_>, Vec<_>) =
+            crate::stitch::stitch_files(&files).into_iter().unzip();
         let fingerprints = files
             .par_iter()
-            .map(|path| inspect_image(path))
+            .zip(&posted)
+            .map(|(path, posted)| {
+                let mut fingerprint = inspect_image(path)?;
+                // 拼接图按切片原文件计字节,与另一平台的整图比画质时不因无损重编码虚高。
+                fingerprint.bytes = posted.unwrap_or(fingerprint.bytes);
+                Ok(fingerprint)
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(files
             .into_iter()

@@ -1,5 +1,5 @@
-//! Gallery copies of works cut into strips: pages that continue each other across a cut are
-//! joined back into the picture before upload. Telegram keeps the pages as they were posted.
+//! Works cut into strips: pages that continue each other across a cut are joined back into
+//! the picture, on disk before Telegram review and again before gallery upload.
 //!
 //! Port of Vitrine's `tools/stitch_strips.py` with its calibrated thresholds. A true cut
 //! continues the fine structure of the last column into the next strip about as well as the
@@ -7,8 +7,9 @@
 //! chrome, card frames) also line up at their far edges, or jump in brightness at the would-be
 //! seam. Joins are lossless (jpegtran when the JPEG blocks line up, otherwise lossless WebP or
 //! PNG) and checked pixel for pixel. A page showing the same picture keeps whichever copy has
-//! more pixels, then more bytes; every other page stays. Anything unexpected leaves the pages
-//! as they were.
+//! more pixels, then more bytes as posted (a join weighs what its strips did, since a lossless
+//! re-encode is no better than they are); every other page stays. Anything unexpected leaves
+//! the pages as they were.
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -34,10 +35,12 @@ const OVERLAP_DIFF: f64 = 4.0;
 const SAME_ASPECT: f64 = 0.03;
 const SAME_PICTURE: f64 = 6.0;
 const WEBP_MAX: u32 = 16383;
+/// Telegram rejects photos more elongated than this.
+const MAX_PHOTO_RATIO: u32 = 20;
 
 /// The gallery's page list: strips joined, the better copy of a repeated whole picture kept.
 pub fn stitch_pages(pages: Vec<Page>) -> Vec<Page> {
-    match plan(&pages) {
+    match plan(&pages, true) {
         Ok(Some(plan)) => {
             let before = pages.len();
             let mut slots: Vec<Option<Page>> = pages.into_iter().map(Some).collect();
@@ -45,7 +48,7 @@ pub fn stitch_pages(pages: Vec<Page>) -> Vec<Page> {
                 .into_iter()
                 .map(|out| match out {
                     Out::Keep(i) => slots[i].take().expect("each page is placed once"),
-                    Out::New(page) => page,
+                    Out::New(page, _) => page,
                 })
                 .collect();
             tracing::info!(before, after = joined.len(), "图库切片已拼接");
@@ -59,9 +62,72 @@ pub fn stitch_pages(pages: Vec<Page>) -> Vec<Page> {
     }
 }
 
+/// A page on disk and, for a join, the bytes its strips were posted as.
+pub type FilePage = (PathBuf, Option<u64>);
+
+/// Telegram's page list: joined pictures are written next to the pages, each with the bytes its
+/// strips were posted as (a lossless re-encode is no better than its strips). Joins are JPEG or
+/// PNG (sendPhoto handles WebP badly); a join too elongated for a Telegram photo keeps its strips.
+pub fn stitch_files(files: &[PathBuf]) -> Vec<FilePage> {
+    match join_files(files) {
+        Ok(Some(joined)) => {
+            tracing::info!(before = files.len(), after = joined.len(), "切片已拼接");
+            joined
+        }
+        Ok(None) => files.iter().map(|path| (path.clone(), None)).collect(),
+        Err(error) => {
+            tracing::warn!("切片拼接失败，按原页发送: {error:#}");
+            files.iter().map(|path| (path.clone(), None)).collect()
+        }
+    }
+}
+
+fn join_files(files: &[PathBuf]) -> Result<Option<Vec<FilePage>>> {
+    let Some(dir) = files.first().and_then(|path| path.parent()) else {
+        return Ok(None);
+    };
+    let pages = files
+        .iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("文件名不是 UTF-8")?;
+            Ok((name.to_string(), "", std::fs::read(path)?))
+        })
+        .collect::<Result<Vec<Page>>>()?;
+    let Some(plan) = plan(&pages, false)? else {
+        return Ok(None);
+    };
+    for out in &plan {
+        if let Out::New((_, _, bytes), _) = out {
+            let (w, h) = ImageReader::new(Cursor::new(bytes))
+                .with_guessed_format()?
+                .into_dimensions()?;
+            if w.max(h) > MAX_PHOTO_RATIO * w.min(h) {
+                return Ok(None);
+            }
+        }
+    }
+    // A joined picture is named after its first strip, which it replaces.
+    plan.into_iter()
+        .map(|out| match out {
+            Out::Keep(i) => Ok((files[i].clone(), None)),
+            Out::New((name, _, bytes), posted) => {
+                let path = dir.join(name);
+                std::fs::write(&path, bytes)
+                    .with_context(|| format!("写入拼接图失败: {}", path.display()))?;
+                Ok((path, Some(posted)))
+            }
+        })
+        .collect::<Result<_>>()
+        .map(Some)
+}
+
 enum Out {
     Keep(usize),
-    New(Page),
+    /// A joined picture and the total bytes of its strips.
+    New(Page, u64),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -81,7 +147,8 @@ struct Group {
     joined: Option<Page>,
 }
 
-fn plan(pages: &[Page]) -> Result<Option<Vec<Out>>> {
+/// `webp` allows lossless WebP for joins jpegtran cannot make; otherwise they are PNG.
+fn plan(pages: &[Page], webp: bool) -> Result<Option<Vec<Out>>> {
     if pages.len() < 2 {
         return Ok(None);
     }
@@ -151,6 +218,7 @@ fn plan(pages: &[Page]) -> Result<Option<Vec<Out>>> {
             &group.overlaps,
             group.axis,
             icc[group.chain[0]].clone(),
+            webp,
         )?
         else {
             return Ok(None);
@@ -170,8 +238,8 @@ fn plan(pages: &[Page]) -> Result<Option<Vec<Out>>> {
         if let Some((i, _)) = best {
             used.insert(i);
             group.full = Some(i);
-            let mine = (pixels(&picture), bytes.len());
-            group.keep_full = mine <= (pixels(&images[i]), pages[i].2.len());
+            let mine = (pixels(&picture), posted(pages, &group.chain));
+            group.keep_full = mine <= (pixels(&images[i]), pages[i].2.len() as u64);
         }
         let stem = Path::new(&pages[group.chain[0]].0)
             .file_stem()
@@ -196,13 +264,21 @@ fn plan(pages: &[Page]) -> Result<Option<Vec<Out>>> {
                 let group = &mut groups[n];
                 out.push(match (group.keep_full, group.full) {
                     (true, Some(full)) => Out::Keep(full),
-                    _ => Out::New(group.joined.take().expect("every group is joined")),
+                    _ => Out::New(
+                        group.joined.take().expect("every group is joined"),
+                        posted(pages, &group.chain),
+                    ),
                 });
             }
             Some(_) => {}
         }
     }
     Ok(Some(out))
+}
+
+/// The bytes a chain of strips was posted as.
+fn posted(pages: &[Page], chain: &[usize]) -> u64 {
+    chain.iter().map(|&i| pages[i].2.len() as u64).sum()
 }
 
 fn pixels(image: &DynamicImage) -> u64 {
@@ -429,6 +505,7 @@ fn stitch(
     overlaps: &[usize],
     axis: Axis,
     icc: Option<Vec<u8>>,
+    webp: bool,
 ) -> Result<Option<Joined>> {
     if strips
         .iter()
@@ -456,7 +533,8 @@ fn stitch(
         }
     }
     let mut bytes = Vec::new();
-    let (content_type, ext, format) = if expected.width().max(expected.height()) <= WEBP_MAX {
+    let (content_type, ext, format) = if webp && expected.width().max(expected.height()) <= WEBP_MAX
+    {
         let mut encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut bytes);
         if let Some(icc) = icc {
             let _ = encoder.set_icc_profile(icc);

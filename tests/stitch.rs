@@ -4,7 +4,7 @@
 //! colourings, strips with missing columns, unrelated pages and pages sharing a layout stay.
 use std::io::Cursor;
 
-use hanabi::stitch::{stitch_pages, Page};
+use hanabi::stitch::{stitch_files, stitch_pages, Page};
 use image::imageops::FilterType;
 use image::{DynamicImage, ImageFormat, RgbImage};
 
@@ -245,4 +245,126 @@ fn single_pages_and_unequal_sizes_pass_through_undecoded() {
     ];
     assert_eq!(stitch_pages(broken.clone()), broken);
     let _ = DynamicImage::new_rgb8(1, 1);
+}
+
+fn write_pages(dir: &std::path::Path, input: &[Page]) -> Vec<std::path::PathBuf> {
+    input
+        .iter()
+        .map(|(name, _, bytes)| {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        })
+        .collect()
+}
+
+#[test]
+fn telegram_files_join_on_disk_without_webp() {
+    let dir = tempfile::tempdir().unwrap();
+    let whole = picture(1, 1440, 960);
+    let files = write_pages(
+        dir.path(),
+        &pages(
+            &[crop(&whole, 0, 0, 700, 960), crop(&whole, 697, 0, 743, 960)],
+            ImageFormat::Png,
+        ),
+    );
+    let posted: u64 = files.iter().map(|f| f.metadata().unwrap().len()).sum();
+    let out = stitch_files(&files);
+    assert_eq!(out, [(dir.path().join("p00.png"), Some(posted))]);
+    assert_eq!(image::open(&out[0].0).unwrap().to_rgb8(), whole);
+}
+
+#[test]
+fn telegram_files_keep_strips_too_long_for_a_photo() {
+    let dir = tempfile::tempdir().unwrap();
+    let whole = picture(1, 3360, 160);
+    let strips = [0, 1120, 2240].map(|x| crop(&whole, x, 0, 1120, 160));
+    let input = pages(&strips, ImageFormat::Png);
+    // The same strips do join for the gallery.
+    assert_eq!(stitch_pages(input.clone()).len(), 1);
+    let files = write_pages(dir.path(), &input);
+    let out = stitch_files(&files);
+    assert!(out.iter().map(|page| &page.0).eq(&files));
+    assert!(out.iter().all(|page| page.1.is_none()));
+}
+
+#[test]
+fn telegram_files_keep_one_copy_of_a_whole_picture_and_its_strips() {
+    let whole = picture(1, 1440, 960);
+    let big_strips = [0, 480, 960].map(|x| crop(&whole, x, 0, 480, 960));
+    let small = image::imageops::resize(&whole, 1080, 720, FilterType::Triangle);
+    let base = picture(2, 1080, 720);
+    let base_strips = [0, 360, 720].map(|x| crop(&base, x, 0, 360, 720));
+    let enlarged = image::imageops::resize(&base, 1440, 960, FilterType::CatmullRom);
+    let other = picture(7, 800, 600);
+    for (images, kept_full) in [
+        // The whole picture has more pixels than its strips: it stays, strips go.
+        (
+            vec![
+                other.clone(),
+                base_strips[1].clone(),
+                enlarged.clone(),
+                base_strips[0].clone(),
+                base_strips[2].clone(),
+            ],
+            true,
+        ),
+        // The strips have more pixels: their join takes the first of their places.
+        (
+            vec![
+                other.clone(),
+                big_strips[1].clone(),
+                small.clone(),
+                big_strips[0].clone(),
+                big_strips[2].clone(),
+            ],
+            false,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let files = write_pages(dir.path(), &pages(&images, ImageFormat::Jpeg));
+        let out = stitch_files(&files);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0], (files[0].clone(), None));
+        if kept_full {
+            assert_eq!(out[1], (files[2].clone(), None));
+        } else {
+            assert!(out[1].1.is_some());
+            let joined = image::open(&out[1].0).unwrap();
+            assert_eq!((joined.width(), joined.height()), (1440, 960));
+        }
+    }
+}
+
+#[test]
+fn a_whole_picture_and_its_strips_of_equal_size_compare_bytes_as_posted() {
+    let whole = picture(1, 1440, 960);
+    let jpeg = |image: &RgbImage, quality| {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, quality)
+            .encode_image(image)
+            .unwrap();
+        bytes
+    };
+    // A cut off the JPEG block grid makes the join a lossless re-encode about three times the
+    // size of its strips; the whole picture, posted with more bytes than they were, still wins.
+    let input: Vec<Page> = vec![
+        (
+            "p00.jpg".into(),
+            "image/jpeg",
+            jpeg(&crop(&whole, 0, 0, 700, 960), 92),
+        ),
+        ("p01.jpg".into(), "image/jpeg", jpeg(&whole, 100)),
+        (
+            "p02.jpg".into(),
+            "image/jpeg",
+            jpeg(&crop(&whole, 700, 0, 740, 960), 92),
+        ),
+    ];
+    let out = stitch_pages(input.clone());
+    assert_eq!(out, [input[1].clone()]);
+    let dir = tempfile::tempdir().unwrap();
+    let files = write_pages(dir.path(), &input);
+    assert_eq!(stitch_files(&files), [(files[1].clone(), None)]);
 }

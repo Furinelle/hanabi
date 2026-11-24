@@ -1952,11 +1952,27 @@ async fn cleanup_stale(state: &Arc<ReviewState>) {
 
 /// Join strips back into the picture, then drop solid-color and near-black filler pages;
 /// duplicates are Vitrine's job. 同时返回保留页的指纹,供重复作品比对。
+/// Vitrine 单文件上限(wrangler.jsonc 的 MAX_FILE_BYTES)。超过的图进不了图库,
+/// 直接丢弃,不送审也不发频道。
+const GALLERY_MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
+
+fn within_gallery_file_limit(path: &std::path::Path) -> bool {
+    // 读不到大小时放行,交给后面的解码报错。
+    let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if bytes > GALLERY_MAX_FILE_BYTES {
+        tracing::info!(path = %path.display(), bytes, "丢弃超过图库单文件上限的图片");
+        return false;
+    }
+    true
+}
+
 async fn non_solid_images(files: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<same_work::PagePrint>)> {
     let files = files.to_vec();
     tokio::task::spawn_blocking(move || {
-        let (files, posted): (Vec<_>, Vec<_>) =
-            crate::stitch::stitch_files(&files).into_iter().unzip();
+        let (files, posted): (Vec<_>, Vec<_>) = crate::stitch::stitch_files(&files)
+            .into_iter()
+            .filter(|(path, _)| within_gallery_file_limit(path))
+            .unzip();
         let fingerprints = files
             .par_iter()
             .zip(&posted)
@@ -4006,6 +4022,25 @@ mod tests {
         assert_eq!(files, vec![detail]);
         assert_eq!(prints.len(), 1);
         assert!(non_solid_images(&[black]).await.unwrap().0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn images_over_the_gallery_limit_are_dropped_before_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let huge = dir.path().join("huge.png");
+        std::fs::File::create(&huge)
+            .unwrap()
+            .set_len(GALLERY_MAX_FILE_BYTES + 1)
+            .unwrap();
+        let detail = dir.path().join("detail.png");
+        let mut image = image::RgbImage::new(20, 20);
+        image.put_pixel(10, 10, image::Rgb([200, 100, 50]));
+        image.save(&detail).unwrap();
+        let (files, _) = non_solid_images(&[huge.clone(), detail.clone()])
+            .await
+            .unwrap();
+        assert_eq!(files, vec![detail]);
+        assert!(non_solid_images(&[huge]).await.unwrap().0.is_empty());
     }
 
     #[test]

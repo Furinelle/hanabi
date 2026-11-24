@@ -44,6 +44,9 @@ impl Drop for InflightGuard {
 /// 同步阻塞(子进程等待可达数分钟),调用方必须放 spawn_blocking。
 fn download_work(gdl: &GalleryDl, item: &MediaItem, x_size: Option<&str>) -> Vec<PathBuf> {
     let dir = hanabi::util::pending_dir(item.source.as_str(), &item.source_id);
+    // 调用方已持作品锁并确认未推送,目录里只可能是上次失败留下的半份文件;
+    // 不清掉的话 gallery-dl 会跳过已有页,只交出新下的几页。
+    let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(&dir);
     hanabi::util::restrict_dir(&dir);
     let extra = match item.source {

@@ -250,8 +250,12 @@ impl GalleryClient {
                 request = request.header(name, value.as_str().unwrap_or_default());
             }
             puts.spawn(async move {
+                // 预签名 URL 带签名,不能进日志、outbox 和审批私聊。
                 let response = request.send().await.map_err(|error| {
-                    GalleryIngestError::transient(format!("图库原图直传 R2 失败: {error}"))
+                    GalleryIngestError::transient(format!(
+                        "图库原图直传 R2 失败: {}",
+                        error.without_url()
+                    ))
                 })?;
                 let status = response.status();
                 if status.is_success() {

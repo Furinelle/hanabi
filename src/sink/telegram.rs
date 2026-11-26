@@ -1421,6 +1421,25 @@ async fn sweep_expired_comments(state: &Arc<ReviewState>) {
 }
 
 /// 包装 Telegram 请求:遇限流 `RetryAfter` 自动等待后重试(最多 5 次)。
+/// Long poll (25s) plus slack. teloxide-core 0.10 ignores the long-poll timeout hint, so
+/// without this only the client's 300s upload timeout bounds a getUpdates stuck on a dead
+/// connection, and the review loop goes deaf for five minutes.
+const GET_UPDATES_DEADLINE: std::time::Duration = std::time::Duration::from_secs(40);
+
+/// One getUpdates call; `None` when it outlived `deadline` (dropping it closes the connection).
+async fn poll_updates(
+    bot: &Bot,
+    offset: i32,
+    deadline: std::time::Duration,
+) -> Option<std::result::Result<Vec<teloxide::types::Update>, teloxide::RequestError>> {
+    let request = bot
+        .get_updates()
+        .offset(offset)
+        .timeout(25)
+        .allowed_updates(vec![AllowedUpdate::CallbackQuery, AllowedUpdate::Message]);
+    tokio::time::timeout(deadline, request.send()).await.ok()
+}
+
 async fn tg_retry<F, R, T>(f: F) -> std::result::Result<T, teloxide::RequestError>
 where
     F: Fn() -> R,
@@ -2629,13 +2648,13 @@ pub async fn run_review_loop(
         }
         // 兜底:清理超时仍未等到 auto-forward 的评论任务(频道没绑讨论组/转发丢失)。
         sweep_expired_comments(&state).await;
-        let updates = state
-            .bot
-            .get_updates()
-            .offset(offset)
-            .timeout(25)
-            .allowed_updates(vec![AllowedUpdate::CallbackQuery, AllowedUpdate::Message])
-            .await;
+        let updates = match poll_updates(&state.bot, offset, GET_UPDATES_DEADLINE).await {
+            Some(updates) => updates,
+            None => {
+                tracing::warn!("get_updates 超过 40 秒无响应,放弃该连接后重新拉取");
+                continue;
+            }
+        };
         match updates {
             Ok(list) => {
                 for u in list {
@@ -3261,6 +3280,24 @@ fn is_idempotent_delete_error(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn get_updates_on_a_silent_connection_gives_up_at_the_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        // Accept and hold connections without ever answering, like a dead upstream.
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                held.push(stream);
+            }
+        });
+        let bot = Bot::new("123:test").set_api_url(reqwest::Url::parse(&base).unwrap());
+        let started = std::time::Instant::now();
+        let result = poll_updates(&bot, 0, std::time::Duration::from_millis(300)).await;
+        assert!(result.is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
 
     fn read_mock_request(socket: &mut std::net::TcpStream) -> (String, Vec<u8>) {
         use std::io::Read;

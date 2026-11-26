@@ -198,6 +198,71 @@ fn strips_missing_columns_or_unrelated_pages_are_left_alone() {
 }
 
 #[test]
+fn strips_a_pixel_apart_across_the_cut_lose_the_extra_row_and_join() {
+    // Side by side the right strip is a row taller; stacked the lower one a column wider.
+    let wide = picture(1, 1440, 961);
+    let tall = picture(2, 961, 960);
+    for (images, expected) in [
+        (
+            vec![crop(&wide, 720, 0, 720, 961), crop(&wide, 0, 0, 720, 960)],
+            crop(&wide, 0, 0, 1440, 960),
+        ),
+        (
+            vec![crop(&tall, 0, 0, 960, 480), crop(&tall, 0, 480, 961, 480)],
+            crop(&tall, 0, 0, 960, 960),
+        ),
+    ] {
+        let out = stitch_pages(pages(&images, ImageFormat::Png));
+        assert_eq!(out.len(), 1);
+        assert_eq!(decode(&out[0]), expected);
+    }
+    if !(have("jpegtran") && have("djpeg")) {
+        return;
+    }
+    // JPEG strips still join losslessly under the first strip's name.
+    let dir = tempfile::tempdir().unwrap();
+    let files = write_pages(
+        dir.path(),
+        &pages(
+            &[crop(&wide, 0, 0, 720, 960), crop(&wide, 720, 0, 720, 961)],
+            ImageFormat::Jpeg,
+        ),
+    );
+    let out = stitch_files(&files);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].0, files[0]);
+    let joined = image::open(&out[0].0).unwrap();
+    assert_eq!((joined.width(), joined.height()), (1440, 960));
+}
+
+#[test]
+fn strips_no_seam_is_found_between_give_way_to_their_whole_picture() {
+    let whole = picture(3, 1440, 960);
+    // Six columns are lost between the strips, so no seam joins them; both lie in the whole.
+    let strips = [crop(&whole, 0, 0, 700, 960), crop(&whole, 706, 0, 734, 960)];
+    let images = vec![
+        strips[0].clone(),
+        picture(7, 800, 600),
+        whole.clone(),
+        strips[1].clone(),
+    ];
+    let out = stitch_pages(pages(&images, ImageFormat::Png));
+    assert_eq!(names(&out), ["p02.png", "p01.png"]);
+    // Strips with more detail than a smaller whole picture stay, and so do flat pages that
+    // would fit anywhere in a flat one.
+    let small = image::imageops::resize(&whole, 1080, 720, FilterType::Triangle);
+    let flat = |w, h| RgbImage::from_pixel(w, h, image::Rgb([250; 3]));
+    for images in [
+        vec![strips[0].clone(), small, strips[1].clone()],
+        vec![flat(700, 960), flat(1440, 960), flat(734, 960)],
+    ] {
+        let input = pages(&images, ImageFormat::Png);
+        let before = names(&input).join(",");
+        assert_eq!(names(&stitch_pages(input)).join(","), before);
+    }
+}
+
+#[test]
 fn pages_sharing_a_layout_are_not_one_picture() {
     // Different pictures in one letterbox frame line up at every edge.
     let framed: Vec<RgbImage> = [5, 6]

@@ -1,4 +1,5 @@
 pub mod config;
+pub mod dns;
 pub mod filter;
 pub mod gallery;
 pub mod gallery_outbox;

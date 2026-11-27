@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+## [0.16.6] - 2026-11-27
+
+### 安全
+- teloxide 升到 0.17、reqwest 升到 0.12，去掉 reqwest 0.11 带来的 rustls 0.21、rustls-webpki 0.101、webpki-roots 0.25 和 h2 0.3，修复 RUSTSEC-2026-0346、-0349、-0098、-0099、-0104、-0382、-0381、-0258。
+- DNS 解析改用 hickory-resolver 0.26（修复 hickory 0.24 的 RUSTSEC-2026-0119、-0487、-0489、-0490、-0491、-0514 及 DNSSEC 相关公告）。仍是纯 Rust 解析、不走 musl 的 getaddrinfo，仍先查 A 记录。
+- rusqlite 升到 0.43，内置 SQLite 随 libsqlite3-sys 0.40 更新，修复 RUSTSEC-2026-0459。
+- 顺带更新 anyhow、rustix、tokio，消除 RUSTSEC-2026-0190、-0486、-0386 三条 unsound 警告。
+
 ## [0.16.5] - 2026-11-27
 
 ### 安全

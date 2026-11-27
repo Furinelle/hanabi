@@ -558,15 +558,14 @@ fn slides_id(url: &reqwest::Url) -> Option<&str> {
     Some(id)
 }
 
-/// 构造抖音抓取用的 reqwest client:移动端 UA + 跟随短链跳转 + trust_dns(musl 静态二进制
+/// 构造抖音抓取用的 reqwest client:移动端 UA + 跟随短链跳转 + 纯 Rust DNS(musl 静态二进制
 /// getaddrinfo 会失败,同 teloxide 客户端的处理)。
 pub fn build_client() -> Result<reqwest::Client> {
-    #[allow(deprecated)]
     reqwest::Client::builder()
         .user_agent(MOBILE_UA)
         .redirect(reqwest::redirect::Policy::limited(10))
         .timeout(std::time::Duration::from_secs(30))
-        .trust_dns(true)
+        .dns_resolver(crate::dns::resolver()?)
         .build()
         .context("构造 douyin reqwest client 失败")
 }

@@ -100,12 +100,11 @@ impl GalleryClient {
 
     pub fn new(endpoint: String, token: String) -> Result<Self> {
         let endpoint = endpoint.trim_end_matches('/').to_string();
-        #[allow(deprecated)]
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(180))
             .connect_timeout(std::time::Duration::from_secs(15))
             .user_agent(concat!("hanabi/", env!("CARGO_PKG_VERSION")))
-            .trust_dns(true)
+            .dns_resolver(crate::dns::resolver()?)
             .build()
             .context("构造 gallery http client 失败")?;
         Ok(Self {

@@ -1,7 +1,8 @@
 name: check
 
 # 发布镜像在实际部署主机上原生构建，只生成该主机的平台。
-# GitHub Actions 只做可重复的代码质量检查，不再构建 Release 二进制或多平台容器。
+# GitHub Actions 只做可重复的代码质量检查，不再构建 Release 二进制或多平台容器；
+# 推送 v* tag 且检查通过后，用 CHANGELOG 里对应版本的一节建 GitHub Release（不附产物）。
 on:
   push:
     branches: [master]
@@ -35,3 +36,23 @@ jobs:
           "$RUNNER_TEMP/hanabi-python-check/bin/python" -m py_compile tools/douyin_user_feed.py
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  release:
+    needs: check
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create release from CHANGELOG
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          awk -v v="${TAG#v}" '/^## \[/ { f = index($0, "## [" v "]") == 1; next } f' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md"; then
+            echo "::error::CHANGELOG.md has no section for ${TAG#v}"
+            exit 1
+          fi
+          gh release create "$TAG" --verify-tag --title "Hanabi $TAG" --notes-file "$RUNNER_TEMP/notes.md"
